@@ -6,6 +6,7 @@ executor_vlm_kind: openai
 executor_vlm_max_new_tokens: 2000
 executor_vlm_model: gpt-4o
 figure_skip_show: true
+harness_remote: https://github.com/DhananjayAshok/GameBoyWorlds-Harnesses.git
 image_embedding_model: random_patch
 image_embedding_model_kind: random_patch
 max_batch_size_api: 32
