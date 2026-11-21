@@ -17,7 +17,7 @@ Your notepad:
 The image is the current game screen. Here is what has been recognised on it:
 [SCREEN_TILES][GLOBAL_MAP][PEOPLE]
 
-Write one task for the player that moves them towards the goal. The player is competent but has no memory of anything before this moment, gets roughly [MAX_STEPS] actions, and can only walk, talk to people, use menus and fight battles. So the task must be something reachable from this screen in that budget: "walk into the Pokemon Center and heal your team", not "beat the next gym".
+Write one task for the player that moves them towards the goal. The player is competent but has no memory of anything before this moment, gets roughly [MAX_STEPS] actions, and can only walk, talk to people, use menus and fight battles. So the task must be something reachable from this screen in that budget: "walk into the Pokemon Center and heal your team", not "beat the next gym". Walking to a visible doorway, staircase or boundary exit mat automatically steps through or off it in a single move, so describe exiting or entering a room as one step rather than instructing the player to step onto an exit mat and then press a direction again.
 
 Then write the guidance: everything the player needs and could not work out from the screen. Where the thing they want is, what has already been tried and failed, what to avoid. Do not repeat the task in it.
 

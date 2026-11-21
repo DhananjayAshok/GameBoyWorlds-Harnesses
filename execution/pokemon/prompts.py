@@ -1,5 +1,5 @@
-PRIMITIVES = """1. MoveTo(description): walk to an object, entity, entrance, staircase or exit mat that is visible on the screen, e.g. MoveTo(wooden signpost at (2, -4)) or MoveTo(exit mat at (-4, -4)). Only works in free roam.
-2. MoveOff(direction description): walk to a walkable cell on the edge of the screen and step off it in that direction, e.g. MoveOff(up, through the gap in the ledge) or MoveOff(left). Only works in free roam when that edge of the screen has walkable cells listed; never use MoveOff towards a wall or boundary where that edge is listed as "none" (when already standing on an exit mat against a room boundary, use Free to press the direction that steps off the mat).
+PRIMITIVES = """1. MoveTo(description): walk to an object, entity, entrance, staircase or exit mat that is visible on the screen, e.g. MoveTo(wooden signpost at (2, -4)) or MoveTo(exit mat at (-4, -4)). Moving to a doorway, staircase or boundary exit mat automatically steps through it to leave or enter. Only works in free roam.
+2. MoveOff(direction description): walk to a walkable cell on the edge of the screen and step off it in that direction, e.g. MoveOff(up, through the gap in the ledge) or MoveOff(left). Only works in free roam when that edge of the screen has walkable cells listed; never use MoveOff towards a wall or boundary where that edge is listed as "none" (if already standing on a boundary exit mat at (0, 0), use Free to press the direction that steps off the mat).
 3. Interact(target): interact with the object or entity directly in front of the player, e.g. to talk to someone or read a sign. Name the target, e.g. Interact(wooden signpost). Only works in free roam.
 4. Battle(optional instructions): fight or advance the battle that is on screen (including battle intro or defeat text on the battle screen), optionally with instructions, e.g. Battle() or Battle(use Thundershock and do not switch Pokemon). Only works in battle.
 5. Menu(specific instruction): use the menu system to do something specific, e.g. Menu(use a Potion on Pikachu). Only works in the main menu opened with Start from free roam, or in a menu or choice box that is already open (in menu).
@@ -27,7 +27,7 @@ The image is the current game screen. Here is what has been recognised on it:
 These are the only things the player can be told to do:
 [PRIMITIVES]
 
-Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now. If a dialogue box or scripted cutscene is currently playing or about to continue (including when a text box at the bottom of the screen is blank, has only printed its first few characters, or is between consecutive lines), include finishing that dialogue/cutscene before any walking subgoal.
+Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now. Because MoveTo on a doorway, staircase or boundary exit mat automatically steps through or off it to warp into the next room or outside, write leaving or entering through a visible entrance or exit mat as a single subgoal (reaching the new room or outside) rather than splitting it into standing on the mat and stepping off it. If a dialogue box or scripted cutscene is currently playing or about to continue (including when a text box at the bottom of the screen is blank, has only printed its first few characters, or is between consecutive lines), include finishing that dialogue/cutscene before any walking subgoal.
 
 Respond in exactly this format:
 Reasoning: <what the screen shows and how you intend to get the task done>
@@ -65,12 +65,24 @@ What you already tried for this subgoal, and what came of it:
 [ATTEMPTS]
 """
 
+PLAYTHROUGH_REMAINING_SUBGOALS_BLOCK = """
+Later subgoals in your plan:
+[REMAINING_SUBGOALS]
+If this action also already achieved one or more of these later subgoals (for example, moving to an exit mat also stepped off it and exited the building, or walking down an aisle also triggered and cleared an NPC's dialogue), give the highest plan number that is now complete in `Reached subgoal:`.
+"""
+
+PLAYTHROUGH_REMAINING_SUBGOALS_LINE = """
+Reached subgoal: <the highest subgoal number from the plan that is now complete, or None>"""
+
 PLAYTHROUGH_JUDGE_PROMPT = """You are playing [GAME] and are checking what the player just did.
 
 Your task: "[TASK]"
 [GUIDANCE_BLOCK]
-You are working on this subgoal: "[SUBGOAL]"
+Your plan:
+[PLAN]
 
+You are working on subgoal [SUBGOAL_NUMBER]: "[SUBGOAL]"
+[REMAINING_SUBGOALS_BLOCK]
 You asked the player to: [REQUEST]
 
 The first image is the screen before, and the second image is the screen after. The player is always drawn in the centre of the screen, so when the player walks, the rest of the screen shifts the other way.
@@ -85,7 +97,7 @@ Say whether the subgoal is now finished, and write a short note for the log of t
 
 Respond in exactly this format:
 Reasoning: <compare the two screens and the text>
-Subgoal complete: <yes or no>
+Subgoal complete: <yes or no>[REMAINING_SUBGOALS_LINE]
 Summary: <one or two sentences for the log>
 [STOP]"""
 

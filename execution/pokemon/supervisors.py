@@ -22,11 +22,12 @@ from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUG
                                        PLAYTHROUGH_CLARIFY_TARGET_PROMPT, PLAYTHROUGH_GUIDANCE_BLOCK,
                                        PLAYTHROUGH_JUDGE_PROMPT, PLAYTHROUGH_LOG_BLOCK,
                                        PLAYTHROUGH_MENU_OBJECTIVE_PROMPT, PLAYTHROUGH_PLAN_PROMPT,
+                                       PLAYTHROUGH_REMAINING_SUBGOALS_BLOCK, PLAYTHROUGH_REMAINING_SUBGOALS_LINE,
                                        PLAYTHROUGH_SUBGOAL_DECISION_PROMPT, PLAYTHROUGH_TASK_CHECK_PROMPT,
                                        PLAYTHROUGH_TEXT_BLOCK, PRIMITIVES)
 from execution.report import ExecutorReport
 from execution.supervisors.base import Supervisor
-from utils import log_error, log_warn, parse_key_value, parse_list, parse_yes_no
+from utils import log_error, log_warn, parse_int, parse_key_value, parse_list, parse_yes_no
 
 ACTIONS: Dict[str, Tuple[str, bool, Optional[str]]] = {
     "MoveTo": ("on_screen_move", True, None),
@@ -302,7 +303,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             log_warn(f"Could not parse a decision from: {output!r}", self._parameters)
         return decision
 
-    def _judge(self, subgoal: str, request: str, result: Dict[str, Any]) -> Tuple[bool, str]:
+    def _judge(self, subgoal: str, request: str, result: Dict[str, Any],
+               subgoal_index: int = 0) -> Tuple[bool, str, int]:
         report = result["report"]
         before = report.initial_state["core"]["current_frame"]
         after = report.final_state["core"]["current_frame"]
@@ -324,8 +326,19 @@ class PokemonPlayThroughSupervisor(Supervisor):
         executor_report = f"{result['reason']} (code {result['code']})"
         if result.get("notes") and result.get("notes") != text:
             executor_report += f": {result['notes']}"
+        remaining = [f"{n + 1}. {sg}" for n, sg in enumerate(self.plan) if n > subgoal_index]
+        if remaining:
+            remaining_block = PLAYTHROUGH_REMAINING_SUBGOALS_BLOCK.replace(
+                "[REMAINING_SUBGOALS]", "\n".join(remaining))
+            remaining_line = PLAYTHROUGH_REMAINING_SUBGOALS_LINE
+        else:
+            remaining_block = ""
+            remaining_line = ""
         prompt = (self._fill_prompt(PLAYTHROUGH_JUDGE_PROMPT)
+                  .replace("[SUBGOAL_NUMBER]", str(subgoal_index + 1))
                   .replace("[SUBGOAL]", subgoal)
+                  .replace("[REMAINING_SUBGOALS_BLOCK]", remaining_block)
+                  .replace("[REMAINING_SUBGOALS_LINE]", remaining_line)
                   .replace("[REQUEST]", request)
                   .replace("[AFTER_BLOCK]", after_block)
                   .replace("[TEXT_BLOCK]", text_block)
@@ -334,7 +347,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
         summary = (parse_key_value(output, "Summary") or "").strip()
         if not summary:
             summary = f"{request} -> {executor_report}"
-        return bool(parse_yes_no(output, "Subgoal complete")), summary
+        complete = bool(parse_yes_no(output, "Subgoal complete"))
+        reached = parse_int(output, "Reached subgoal", lo=subgoal_index + 1, hi=len(self.plan)) if remaining else None
+        if not complete and reached is not None and reached > subgoal_index + 1:
+            complete = True
+        reached_index = (reached - 1) if (complete and reached is not None) else subgoal_index
+        return complete, summary, reached_index
 
     def _reconsider(self, subgoal: str, attempts: List[str], frame) -> Tuple[str, Optional[str], List[str]]:
         prompt = (self._fill_prompt(PLAYTHROUGH_ACHIEVABLE_PROMPT)
@@ -510,13 +528,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             attempts.append(note)
         return handled
 
-    def _pursue(self, subgoal: str) -> Tuple[str, List[str]]:
+    def _pursue(self, subgoal: str, subgoal_index: int = 0) -> Tuple[str, List[str], int]:
         attempts: List[str] = []
         for _ in range(self.MAX_SUBGOAL_ATTEMPTS):
             if self._env_done():
-                return "env_done", attempts
+                return "env_done", attempts, subgoal_index
             if self._out_of_calls():
-                return "out_of_calls", attempts
+                return "out_of_calls", attempts, subgoal_index
             if self._calls > 0:
                 self._settle_free_roam()
             if self._is_in_dialogue():
@@ -525,17 +543,18 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 handled = self._clear_pending_dialogue(attempts)
                 if self._battles_lost():
                     self._note("the player lost a battle and blacked out")
-                    return "lost_battle", attempts
+                    return "lost_battle", attempts, subgoal_index
                 if self._env_done():
-                    return "env_done", attempts
+                    return "env_done", attempts, subgoal_index
                 if handled and handled.get("succeeded"):
-                    complete, summary = self._judge(subgoal, "Dialogue(clear open dialogue)", handled)
+                    complete, summary, reached = self._judge(
+                        subgoal, "Dialogue(clear open dialogue)", handled, subgoal_index)
                     self._note(summary)
                     attempts.append(f"Dialogue(): {summary}")
                     if complete:
-                        return "complete", attempts
+                        return "complete", attempts, reached
                 if self._out_of_calls():
-                    return "out_of_calls", attempts
+                    return "out_of_calls", attempts, subgoal_index
             frame = self._current_frame()
             self._perceive(frame)
             decision = self._decide(subgoal, attempts, frame)
@@ -549,13 +568,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 note = f"{request}: the player lost a battle and blacked out"
                 self._note(note)
                 attempts.append(note)
-                return "lost_battle", attempts
+                return "lost_battle", attempts, subgoal_index
 
             if self._env_done():
                 note = f"{request} used up the last of the environment's steps"
                 self._note(note)
                 attempts.append(note)
-                return "env_done", attempts
+                return "env_done", attempts, subgoal_index
 
             if (result["succeeded"]
                     and self._is_in_dialogue()
@@ -581,13 +600,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 attempts.append(note)
                 if self._battles_lost():
                     self._note("the player lost a battle and blacked out")
-                    return "lost_battle", attempts
+                    return "lost_battle", attempts, subgoal_index
                 if handled.get("succeeded"):
-                    complete, summary = self._judge(subgoal, f"{request} (cleared {state})", handled)
+                    complete, summary, reached = self._judge(
+                        subgoal, f"{request} (cleared {state})", handled, subgoal_index)
                     self._note(summary)
                     attempts.append(f"{request}: {summary}")
                     if complete:
-                        return "complete", attempts
+                        return "complete", attempts, reached
                 continue
 
             if not result["succeeded"]:
@@ -597,12 +617,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 attempts.append(note)
                 continue
 
-            complete, summary = self._judge(subgoal, request, result)
+            complete, summary, reached = self._judge(subgoal, request, result, subgoal_index)
             self._note(summary)
             attempts.append(f"{request}: {summary}")
             if complete:
-                return "complete", attempts
-        return "stuck", attempts
+                return "complete", attempts, reached
+        return "stuck", attempts, subgoal_index
 
     def _digest(self, status: str, reason: Optional[str], summary: Optional[str]) -> str:
         lines = [f"Task: {self._task}"]
@@ -646,12 +666,24 @@ class PokemonPlayThroughSupervisor(Supervisor):
         index = 0
         while index < len(self.plan):
             subgoal = self.plan[index]
-            outcome, attempts = self._pursue(subgoal)
+            outcome, attempts, reached_index = self._pursue(subgoal, index)
 
             if outcome == "complete":
-                index += 1
+                index = max(index, reached_index) + 1
                 if index < len(self.plan):
-                    continue
+                    if not self._out_of_calls() and not self._env_done():
+                        continue
+                    self._settle_free_roam()
+                    frame = self._current_frame()
+                    self._perceive(frame)
+                    complete, summary = self._task_check(frame)
+                    if complete:
+                        return self._finish("completed", None, summary)
+                    if self._env_done():
+                        return self._finish("env_done",
+                                            "The environment ran out of steps before the plan was finished.",
+                                            summary)
+                    return self._finish("out_of_calls", f"Used all {self._max_steps} executor calls.", summary)
                 self._settle_free_roam()
                 if self._is_in_dialogue() and not self._out_of_calls() and not self._env_done():
                     self._clear_pending_dialogue()
