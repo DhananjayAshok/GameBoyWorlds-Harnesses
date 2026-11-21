@@ -97,7 +97,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                "free to walk again")
     MAX_CLARIFICATIONS = 2
     MAX_SUBGOAL_ATTEMPTS = 4
+    MAX_SUBGOAL_ITERATIONS = 12
     MAX_REPLANS = 2
+    MAX_TOTAL_EXECUTOR_CALLS = 30
+    MAX_INTERRUPTION_CHAIN = 6
 
     def __init__(self, task: str, env, game: str, max_steps: int,
                  tile_recognizer: TileRecognizer, episode_number: int, guidance: Optional[str] = None,
@@ -113,6 +116,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._screen_tiles: Optional[str] = None
         self._identified = None
         self._calls = 0
+        self._total_calls = 0
+        self._max_total_calls = max(self.MAX_TOTAL_EXECUTOR_CALLS, max_steps * 3)
         self._start_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self._leg_stops: List[Tuple[int, Tuple[int, int]]] = []
         self.last_executor = None
@@ -129,7 +134,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         config["tile_recognizer"] = self._tile_recognizer.name
         config["episode_number"] = self._episode_number
         config["max_executor_calls"] = self._max_steps
+        config["max_total_executor_calls"] = self._max_total_calls
         config["max_subgoal_attempts"] = self.MAX_SUBGOAL_ATTEMPTS
+        config["max_subgoal_iterations"] = self.MAX_SUBGOAL_ITERATIONS
         config["max_replans"] = self.MAX_REPLANS
         return config
 
@@ -420,7 +427,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def call_executor(self, tag: str, task: str, *, hint: Optional[str] = None,
                       allow_self_termination: bool = False,
-                      max_steps: Optional[int] = None, **executor_kwargs: Any) -> Any:
+                      max_steps: Optional[int] = None, counted: bool = True,
+                      **executor_kwargs: Any) -> Any:
         if tag not in self.EXECUTORS:
             log_error(f"Unknown executor tag {tag!r}. Options: {list(self.EXECUTORS)}",
                       self._parameters)
@@ -429,7 +437,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         run_kwargs["hint"] = hint
         run_kwargs["allow_self_termination"] = allow_self_termination
         self._current_tag = tag
-        self._calls += 1
+        self._total_calls += 1
+        if counted:
+            self._calls += 1
         try:
             executor = self.EXECUTORS[tag](
                 env=self._env,
@@ -645,9 +655,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return "win the current battle"
         return instructions
 
-    def _combat(self, instructions: str) -> Any:
+    def _combat(self, instructions: str, *, counted: bool = True) -> Any:
         task = instructions + (f"\nYour battle tips:\n{self._tips_text()}" if self._battle_tips else "")
-        return self.call_executor("combat", task)
+        return self.call_executor("combat", task, counted=counted)
 
     def _battles_lost(self) -> int:
         return self._env.get_info()["pokemon_core"].get("n_battles_lost", 0) - self._losses_at_start
@@ -656,7 +666,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         tag, _, default_task = ACTIONS[action]
         task = argument or default_task
         if tag in MOVE_TAGS:
-            result = self._move(tag, task)
+            result = self._move(tag, task, counted=True)
             clarifications = 0
             while (action == "MoveTo" and result.get("ambiguous")
                    and clarifications < self.MAX_CLARIFICATIONS):
@@ -665,7 +675,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     break
                 clarifications += 1
                 task = clarified
-                result = self._move(tag, task)
+                result = self._move(tag, task, counted=False)
         elif tag == "interaction":
             result = self.call_executor(tag, task, identified=self._identified)
         elif tag == "menu":
@@ -681,53 +691,79 @@ class PokemonPlayThroughSupervisor(Supervisor):
             result = self.call_executor(tag, task)
         return result, task
 
-    def _move(self, tag: str, task: str) -> Any:
+    def _move(self, tag: str, task: str, *, counted: bool = True) -> Any:
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), self._people_now())
-        return self.call_executor(tag, task, screen_tiles=self._screen_tiles,
+        return self.call_executor(tag, task, counted=counted, screen_tiles=self._screen_tiles,
                                   cell_kinds=kinds,
                                   identified=self._identified,
                                   people_fn=self._people_now)
 
-    def _handle_interruption(self) -> Tuple[str, Dict[str, Any]]:
-        frame = self._current_frame()
-        state = AgentState.IN_DIALOGUE if self._is_in_dialogue(frame) else self._agent_state()
-        if state == AgentState.IN_DIALOGUE:
-            handled = self.call_executor("dialogue", "clear the dialogue that interrupted what the player was doing")
-        elif state == AgentState.IN_BATTLE:
-            handled = self._combat(self._battle_instructions(frame))
-            if (handled.get("succeeded")
-                    and self._agent_state() == AgentState.IN_DIALOGUE
-                    and not self._out_of_calls()
-                    and not self._env_done()):
-                follow_up = self.call_executor("dialogue", "clear the dialogue that followed the battle")
-                combined_text = "\n".join(filter(None, [handled.get("dialogue"), follow_up.get("dialogue")]))
-                if combined_text:
-                    handled["dialogue"] = combined_text
-                handled["report"].final_state = follow_up["report"].final_state
-        elif state == AgentState.IN_MENU:
-            objective, is_start_menu = self._menu_objective(
-                "deal with the menu that opened while the player was doing something else", frame)
-            handled = self.call_executor("menu", objective, is_start_menu=is_start_menu)
-            if (handled.get("code") == MENU_LEFT_TO_DIALOGUE
-                    and self._agent_state() == AgentState.IN_DIALOGUE
-                    and not self._out_of_calls()
-                    and not self._env_done()):
-                follow_up = self.call_executor("dialogue", "clear the dialogue that followed the menu")
-                combined_text = "\n".join(filter(None, [handled.get("dialogue"), follow_up.get("dialogue")]))
-                if combined_text:
-                    follow_up["dialogue"] = combined_text
-                handled = follow_up
-        else:
+    @staticmethod
+    def _merge_handled(earlier: Optional[Dict[str, Any]], later: Dict[str, Any]) -> Dict[str, Any]:
+        if earlier is None:
+            return later
+        combined_text = "\n".join(filter(None, [earlier.get("dialogue"), later.get("dialogue")]))
+        if combined_text:
+            earlier["dialogue"] = combined_text
+            later["dialogue"] = combined_text
+        earlier["report"].final_state = later["report"].final_state
+        earlier["succeeded"] = bool(later.get("succeeded"))
+        earlier["code"] = later.get("code")
+        earlier["reason"] = later.get("reason")
+        if later.get("notes"):
+            earlier["notes"] = "\n".join(filter(None, [earlier.get("notes"), later.get("notes")]))
+        return earlier
+
+    def _handle_interruption(self, *, dialogue_task: str = "clear the dialogue that interrupted what the player was doing") -> Tuple[str, Dict[str, Any]]:
+        states_seen: List[str] = []
+        combined: Optional[Dict[str, Any]] = None
+        for step_idx in range(self.MAX_INTERRUPTION_CHAIN):
+            if self._env_done() or self._battles_lost() or self._total_calls >= self._max_total_calls:
+                break
+            frame = self._current_frame()
+            state = AgentState.IN_DIALOGUE if self._is_in_dialogue(frame) else self._agent_state()
+            if state == AgentState.FREE_ROAM and combined is not None:
+                break
+            state_label = state.name.lower()
+            if not states_seen or states_seen[-1] != state_label:
+                states_seen.append(state_label)
+            if state == AgentState.IN_DIALOGUE:
+                task = dialogue_task if step_idx == 0 else "clear the dialogue that followed"
+                handled = self.call_executor("dialogue", task, counted=False)
+            elif state == AgentState.IN_BATTLE:
+                handled = self._combat(self._battle_instructions(frame), counted=False)
+            elif state == AgentState.IN_MENU:
+                objective, is_start_menu = self._menu_objective(
+                    "deal with the menu that opened while the player was doing something else", frame)
+                handled = self.call_executor("menu", objective, is_start_menu=is_start_menu, counted=False)
+            else:
+                handled = self.call_executor("free", self.CLEAR_EVENT_INSTRUCTION,
+                                             termination=self.CLEAR_EVENT_TERMINATION, counted=False)
+            combined = self._merge_handled(combined, handled)
+            if self._env_done() or self._battles_lost():
+                break
+            if self._agent_state() == AgentState.FREE_ROAM:
+                self._settle_free_roam()
+            next_frame = self._current_frame()
+            next_state = AgentState.IN_DIALOGUE if self._is_in_dialogue(next_frame) else self._agent_state()
+            if next_state == AgentState.FREE_ROAM:
+                break
+            if not handled.get("succeeded") and next_state == state:
+                break
+        if combined is None:
+            frame = self._current_frame()
+            state = AgentState.IN_DIALOGUE if self._is_in_dialogue(frame) else self._agent_state()
             handled = self.call_executor("free", self.CLEAR_EVENT_INSTRUCTION,
-                                         termination=self.CLEAR_EVENT_TERMINATION)
-        return state.name.lower(), handled
+                                         termination=self.CLEAR_EVENT_TERMINATION, counted=False)
+            return state.name.lower(), handled
+        return " -> ".join(states_seen), combined
 
     def _note(self, entry: str) -> None:
         self.report.narrative.append(entry)
 
     def _out_of_calls(self) -> bool:
-        return self._calls >= self._max_steps
+        return self._calls >= self._max_steps or self._total_calls >= self._max_total_calls
 
     def _env_done(self) -> bool:
         return bool(self._env._emulator.check_if_done())
@@ -760,26 +796,59 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _clear_pending_dialogue(self, attempts: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         if not self._is_in_dialogue() or self._out_of_calls() or self._env_done():
             return None
-        handled = self.call_executor("dialogue", "clear the dialogue on screen")
-        note = f"Cleared open dialogue ({handled['reason']}){self._dialogue_snippet(handled)}"
+        state_chain, handled = self._handle_interruption(dialogue_task="clear the dialogue on screen")
+        label = "open dialogue" if state_chain == "in_dialogue" else f"open dialogue ({state_chain})"
+        note = f"Cleared {label} ({handled['reason']}){self._dialogue_snippet(handled)}"
         self._note(note)
         if attempts is not None:
             attempts.append(note)
         return handled
 
+    def _made_new_subgoal_progress(
+        self,
+        before_place: Optional[Tuple[int, Tuple[int, int]]],
+        after_place: Optional[Tuple[int, Tuple[int, int]]],
+        subgoal_places: List[Tuple[int, Tuple[int, int]]],
+    ) -> bool:
+        gmap = self._global_map()
+        if gmap is None or before_place is None or after_place is None:
+            return False
+        b_seg, b_pos = gmap.resolve(before_place[0], before_place[1])
+        a_seg, a_pos = gmap.resolve(after_place[0], after_place[1])
+        if b_seg != a_seg:
+            return True
+        if a_pos == b_pos:
+            return False
+        visited = {gmap.resolve(seg, pos) for seg, pos in subgoal_places}
+        return (a_seg, a_pos) not in visited
+
     def _pursue(self, subgoal: str, subgoal_index: int = 0) -> Tuple[str, List[str], int]:
         attempts: List[str] = []
-        for _ in range(self.MAX_SUBGOAL_ATTEMPTS):
+        subgoal_places: List[Tuple[int, Tuple[int, int]]] = []
+        start_subgoal_place = self._current_map_place()
+        if start_subgoal_place is not None:
+            subgoal_places.append(start_subgoal_place)
+        failed_attempts = 0
+        iterations = 0
+        while failed_attempts < self.MAX_SUBGOAL_ATTEMPTS and iterations < self.MAX_SUBGOAL_ITERATIONS:
             if self._env_done():
                 return "env_done", attempts, subgoal_index
             if self._out_of_calls():
                 return "out_of_calls", attempts, subgoal_index
-            if self._calls > 0:
+            if self._total_calls > 0:
                 self._settle_free_roam()
-            if self._is_in_dialogue():
+            if self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM:
                 before = self._current_frame()
                 self._perceive(before)
-                handled = self._clear_pending_dialogue(attempts)
+                if self._is_in_dialogue():
+                    handled = self._clear_pending_dialogue(attempts)
+                    request_label = "Dialogue(clear open dialogue)"
+                else:
+                    state_chain, handled = self._handle_interruption()
+                    note = f"Cleared pending {state_chain} ({handled['reason']}){self._dialogue_snippet(handled)}"
+                    self._note(note)
+                    attempts.append(note)
+                    request_label = f"Interrupt({state_chain})"
                 if self._battles_lost():
                     self._note("the player lost a battle and blacked out")
                     return "lost_battle", attempts, subgoal_index
@@ -787,20 +856,24 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     return "env_done", attempts, subgoal_index
                 if handled and handled.get("succeeded"):
                     complete, summary, reached = self._judge(
-                        subgoal, "Dialogue(clear open dialogue)", handled, subgoal_index)
+                        subgoal, request_label, handled, subgoal_index)
                     self._note(summary)
                     attempts.append(f"Dialogue(): {summary}")
                     if complete:
                         return "complete", attempts, reached
                 if self._out_of_calls():
                     return "out_of_calls", attempts, subgoal_index
+            iterations += 1
             frame = self._current_frame()
             self._perceive(frame)
             before_place = self._current_map_place()
+            if before_place is not None and (not subgoal_places or subgoal_places[-1] != before_place):
+                subgoal_places.append(before_place)
             prior_stops = list(self._leg_stops)
             decision = self._decide(subgoal, attempts, frame)
             if decision is None:
                 attempts.append("the reply could not be read, so nothing was done")
+                failed_attempts += 1
                 continue
             action, argument = decision
             is_move_action = ACTIONS[action][0] in MOVE_TAGS
@@ -821,10 +894,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 return "env_done", attempts, subgoal_index
 
             if (result["succeeded"]
-                    and self._is_in_dialogue()
-                    and not self._out_of_calls()
-                    and not self._env_done()):
-                follow_up = self.call_executor("dialogue", "clear the dialogue that followed the action")
+                    and (self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM)
+                    and not self._env_done()
+                    and self._total_calls < self._max_total_calls):
+                _, follow_up = self._handle_interruption(
+                    dialogue_task="clear the dialogue that followed the action")
                 combined_text = "\n".join(filter(None, [result.get("dialogue"), follow_up.get("dialogue")]))
                 if combined_text:
                     result["dialogue"] = combined_text
@@ -834,11 +908,23 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     if combined_text:
                         follow_up["dialogue"] = combined_text
                     result = follow_up
+                if self._battles_lost():
+                    note = f"{request}: the player lost a battle and blacked out"
+                    self._note(note)
+                    attempts.append(note)
+                    return "lost_battle", attempts, subgoal_index
+                if self._env_done():
+                    note = f"{request} used up the last of the environment's steps"
+                    self._note(note)
+                    attempts.append(note)
+                    return "env_done", attempts, subgoal_index
                 after_place = self._record_map_stop()
                 move_tag = self._format_leg_movement(
                     before_place, after_place, prior_stops, is_move_action=is_move_action)
 
             if not result["succeeded"] and (self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue()):
+                if is_move_action and self._calls > 0:
+                    self._calls -= 1
                 state, handled = self._handle_interruption()
                 handled["report"].initial_state = result["report"].initial_state
                 after_place = self._record_map_stop()
@@ -853,6 +939,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if self._battles_lost():
                     self._note("the player lost a battle and blacked out")
                     return "lost_battle", attempts, subgoal_index
+                if self._env_done():
+                    return "env_done", attempts, subgoal_index
                 if handled.get("succeeded"):
                     complete, summary, reached = self._judge(
                         subgoal, f"{request} (cleared {state})", handled, subgoal_index, move_tag=move_tag)
@@ -862,6 +950,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     attempts.append(f"{request}: {summary}")
                     if complete:
                         return "complete", attempts, reached
+                if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
+                    subgoal_places.append(after_place)
+                if not is_move_action or not handled.get("succeeded"):
+                    failed_attempts += 1
                 continue
 
             if not result["succeeded"]:
@@ -871,6 +963,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     note = f"{move_tag} {note}"
                 self._note(note)
                 attempts.append(note)
+                failed_attempts += 1
                 continue
 
             complete, summary, reached = self._judge(subgoal, request, result, subgoal_index, move_tag=move_tag)
@@ -880,6 +973,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
             attempts.append(f"{request}: {summary}")
             if complete:
                 return "complete", attempts, reached
+            made_progress = is_move_action and self._made_new_subgoal_progress(before_place, after_place, subgoal_places)
+            if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
+                subgoal_places.append(after_place)
+            if not made_progress:
+                failed_attempts += 1
         return "stuck", attempts, subgoal_index
 
     def _digest(self, status: str, reason: Optional[str], summary: Optional[str]) -> str:
@@ -900,6 +998,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
             lines += [f"- while doing \"{report.task}\": {report.notes.strip()}" for report in texts]
         return "\n".join(lines)
 
+    def _out_of_calls_reason(self) -> str:
+        if self._calls >= self._max_steps:
+            return f"Used all {self._max_steps} executor calls."
+        return f"Used all {self._max_total_calls} total executor calls."
+
     def _finish(self, status: str, reason: Optional[str] = None, summary: Optional[str] = None) -> dict:
         self.report.digest = self._digest(status, reason, summary)
         return {
@@ -909,6 +1012,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             "plan": list(self.plan),
             "narrative": list(self.report.narrative),
             "executor_calls": self._calls,
+            "total_executor_calls": self._total_calls,
         }
 
     def _evaluate(self) -> Optional[dict]:
@@ -941,7 +1045,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         return self._finish("env_done",
                                             "The environment ran out of steps before the plan was finished.",
                                             summary)
-                    return self._finish("out_of_calls", f"Used all {self._max_steps} executor calls.", summary)
+                    return self._finish("out_of_calls", self._out_of_calls_reason(), summary)
                 self._settle_free_roam()
                 if self._is_in_dialogue() and not self._out_of_calls() and not self._env_done():
                     self._clear_pending_dialogue()
@@ -984,7 +1088,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         complete, summary = self._task_check(frame)
                         if complete:
                             return self._finish("completed", None, summary)
-                return self._finish("out_of_calls", f"Used all {self._max_steps} executor calls.", summary)
+                return self._finish("out_of_calls", self._out_of_calls_reason(), summary)
 
             if outcome == "lost_battle":
                 return self._finish("lost_battle", "The player lost a battle and blacked out.")
