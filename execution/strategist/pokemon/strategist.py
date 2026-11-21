@@ -33,7 +33,8 @@ from execution.strategist.pokemon.global_map import (FAILURE_EPISODES, GlobalMap
                                                      name_segment, navigate_map, prompt_block, stuck_signs)
 from execution.perception.pokemon.navigation import cell_kinds, verbalize_edges
 from execution.strategist.report import (REPORT_DETAILS, EpisodeArchive, EpisodeRecord, StrategistReport,
-                                         StrategistVLMCallRecord, save_episode_report, trim_episode)
+                                         StrategistVLMCallRecord, load_episode_report, save_episode_report,
+                                         saved_episode_reports, trim_episode)
 from python_scripts.paths import playthrough_dir, playthrough_session_rel
 from utils import VLM, load_parameters, log_error, log_info, log_warn
 from utils.lm_inference import clean_value, parse_key_value
@@ -183,6 +184,7 @@ class PokemonStrategist:
             game=game,
             strategist_name=self.__class__.__name__,
             init_kwargs=self._run_config(),
+            episodes=self._load_prior_episodes(),
         )
         self._write_provenance()
         self.save_all(self.start_episode)
@@ -243,6 +245,19 @@ class PokemonStrategist:
                 artifact.last_written = None
             return artifact
         return factory()
+
+    def _load_prior_episodes(self) -> List[EpisodeRecord]:
+        if self.start_episode <= 0:
+            return []
+        prior_nums = [n for n in saved_episode_reports(self._resume_dir) if n < self.start_episode]
+        episodes: List[EpisodeRecord] = []
+        for n in prior_nums[-max(self.RECENT_EPISODES, self.MIN_NAMING_STEPS + 2):]:
+            try:
+                episodes.append(load_episode_report(self._resume_dir, n).episode)
+            except Exception as e:  # noqa: BLE001
+                log_warn(f"Strategist: could not load episode {n} report from {self._resume_dir!r}: {e}",
+                         self._parameters)
+        return episodes
 
     @property
     def _vlm(self) -> VLM:
