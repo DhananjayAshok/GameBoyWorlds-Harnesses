@@ -24,7 +24,7 @@ from execution.strategist.pokemon.goals import (GoalNode, GoalSubtree, PokemonGo
                                                 create_subgoals, frontier_text, goal_path_text)
 from execution.strategist.pokemon.guide import (StrategyGuide, battle_tips, guide_block, load_seeds, record_events,
                                                 record_new_town, reflect_on_defeat, town_question, update_guide)
-from execution.strategist.pokemon.knowledge import PokemonKnowledgeTree, remember
+from execution.strategist.pokemon.knowledge import PokemonKnowledgeTree, remember, remember_all
 from execution.strategist.pokemon.notepad import ThoughtNotepad
 from execution.strategist.pokemon.npc_map import with_people
 from execution.strategist.pokemon.npcs import PLACED_STATUS, STALE_EPISODES, NPCRegistry
@@ -70,7 +70,7 @@ class PokemonStrategist:
     MAX_DISPATCH_ATTEMPTS = 2
     MAX_EXTRACT_ATTEMPTS = 2
     MAX_NOTEPAD_ATTEMPTS = 3
-    MAX_FACTS = 5
+    MAX_FACTS = 3
     MIN_NAMING_STEPS = 3
     RETURN_EPISODES = 3
 
@@ -628,8 +628,7 @@ class PokemonStrategist:
                  self._parameters)
 
     def _remember_all(self, facts: List[str], n: int) -> None:
-        for fact in facts:
-            remember(self.knowledge, fact, self._vlm_caller("knowledge"), self._game, n, self._parameters)
+        remember_all(self.knowledge, facts, self._vlm_caller("knowledge"), self._game, n, self._parameters)
 
     def _update_notepad(self, digest: str, summary: str, n: int) -> None:
         prompt = (self._fill(P.NOTEPAD_UPDATE_PROMPT)
@@ -728,6 +727,9 @@ class PokemonStrategist:
         since = subtree.root.frontier_since
         if path != self.goals.frontier_path or since is None:
             self.goals.set_frontier(path, n, episode_number=n)
+            if subtree.root.source == "subgoal_creation":
+                self.goals.edit(path, achievable_without_subgoals=n, episode_number=n)
+                return
             unsuccessful_for = 0
         else:
             unsuccessful_for = n - since
@@ -806,13 +808,18 @@ class PokemonStrategist:
         town_event = record_new_town(self.guide, town, self._current_place(), n, self._parameters)
         if town_event is not None:
             events.append(town_event)
+        extracted = False
         if report.narrative or any(r.notes and r.notes.strip() for r in report.executor_reports):
             self._extract_knowledge(report.digest + self._conversation_digest(n), before, frame, n)
+            extracted = True
         self._update_notepad(report.digest, summary, n)
         if closed:
             if any(status == "complete" for _, status in closed):
                 self.guide.mark_goal_completed(self.global_map, episode_number=n)
-            self._absorb_notepad(closed, n)
+            if extracted:
+                self.notepad.clear(episode_number=n)
+            else:
+                self._absorb_notepad(closed, n)
         if events:
             update_guide(self.guide, events, report.digest, self._vlm_caller("guide_update"), self._game, n,
                          self._parameters)

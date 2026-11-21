@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from execution.artifact import StrategistArtifact, update
 from execution.strategist.pokemon import prompts as P
 from execution.strategist.pokemon.asking import Parser, ask, field_values, single_value
-from execution.strategist.pokemon.knowledge import KnowledgeTree, recall
+from execution.strategist.pokemon.knowledge import KnowledgeTree, recall, recall_queries
 from utils import log_error, log_warn
 from utils.lm_inference import clean_value
 
@@ -389,9 +389,8 @@ def create_subgoals(goals: GoalTree, knowledge: KnowledgeTree, current: str, exp
             lookups = ([], [])
         queries, requests = lookups
         found: Dict[Any, Dict[str, Any]] = {}
-        for query in queries:
-            for entry in recall(knowledge, query, vlm_caller("subgoal_recall"), game, parameters):
-                found.setdefault(entry["path"], entry)
+        for entry in recall_queries(knowledge, queries, vlm_caller("subgoal_recall"), game, parameters):
+            found.setdefault(entry["path"], entry)
         routes += [(request, navigator(request)) for request in requests]
 
         prompt = (_goal_prompt(P.SUBGOAL_CREATE_PROMPT, game, path, subtree, notepad)
@@ -413,7 +412,11 @@ def create_subgoals(goals: GoalTree, knowledge: KnowledgeTree, current: str, exp
         for subgoal in subgoals:
             goals.add_under(path, subgoal, episode_number=episode_number)
         goals.edit(path, achievable_without_subgoals=None, episode_number=episode_number)
-        goals.set_frontier(goals.path_to(goals.frontier()), episode_number, episode_number=episode_number)
+        new_frontier_path = goals.path_to(goals.frontier())
+        goals.set_frontier(new_frontier_path, episode_number, episode_number=episode_number)
+        if new_frontier_path is not None:
+            goals.edit(new_frontier_path, achievable_without_subgoals=episode_number, episode_number=episode_number)
+        return
 
 
 def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCaller, game: str,

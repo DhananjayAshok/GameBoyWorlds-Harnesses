@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from execution.artifact import StrategistArtifact, update
 from execution.strategist.pokemon import prompts as P
-from execution.strategist.pokemon.asking import Parser, ask
+from execution.strategist.pokemon.asking import Parser, ask, field_values
 from utils import log_error
 from utils.lm_inference import clean_value, parse_key_value
 
@@ -242,31 +242,183 @@ def _create(knowledge: KnowledgeTree, knowledge_text: str, path: KnowledgePath, 
 
 def remember(knowledge: KnowledgeTree, knowledge_text: str, vlm_call: Callable[..., str], game: str,
              episode_number: int, parameters: Optional[dict] = None) -> Dict[str, Any]:
-    node = knowledge.tree
-    path: KnowledgePath = (node.root.title,)
-    while node.leaves:
-        prompt = _node_prompt(P.KNOWLEDGE_NAVIGATE_PROMPT, game, knowledge_text, path, node)
-        choice = ask(vlm_call, prompt, _parse_navigation(node.leaves), "Knowledge navigation",
-                     KNOWLEDGE_ATTEMPTS, parameters)
+    outcomes = remember_all(knowledge, [knowledge_text], vlm_call, game, episode_number, parameters)
+    return outcomes[0] if outcomes else {"outcome": "known", "path": (knowledge.tree.root.title,)}
+
+
+DEFAULT_CATEGORY_DESCRIPTIONS = {
+    "What is currently happening and what the player is in the middle of.",
+    "Background world knowledge that does not change as the game is played.",
+    "Who has been met, what they said, and what they want.",
+    "Where places are, how they connect, and what is in them.",
+    "What has been found, what is available, and where.",
+    "What has been caught, trained, or fought, and how it performed.",
+    ("How to issue tasks and guidance to the player effectively: which kinds "
+     "of instructions worked or failed, and why, so later tasks are "
+     "phrased and scoped better."),
+}
+
+
+def tree_entries(knowledge: KnowledgeTree) -> List[Tuple[KnowledgePath, KnowledgeNode]]:
+    return list(knowledge.tree.paths().items())
+
+
+def render_knowledge_tree(knowledge: KnowledgeTree) -> str:
+    entries = tree_entries(knowledge)
+    return "\n".join(f"[{i}] {_path_text(path)}: {node.description}"
+                      for i, (path, node) in enumerate(entries))
+
+
+def has_recorded_knowledge(knowledge: KnowledgeTree) -> bool:
+    for path, node in tree_entries(knowledge):
+        if len(path) > 2:
+            return True
+        if len(path) == 2 and node.description.strip() not in DEFAULT_CATEGORY_DESCRIPTIONS:
+            return True
+    return False
+
+
+def _parse_entry_index(raw: str, entries: List[Tuple[KnowledgePath, KnowledgeNode]]) -> Optional[int]:
+    token = raw.strip().strip("[]").rstrip(".").strip()
+    if token.isdigit():
+        idx = int(token)
+        return idx if 0 <= idx < len(entries) else None
+    numbered = re.match(r"^\[?(\d+)\]?\s*[.):\-]?\s*(.*)$", token)
+    if numbered:
+        idx = int(numbered.group(1))
+        if 0 <= idx < len(entries):
+            return idx
+    lowered = token.lower()
+    matches = [i for i, (path, node) in enumerate(entries)
+               if _path_text(path).lower() == lowered or node.title.strip().lower() == lowered]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _parse_batch_changes(entries: List[Tuple[KnowledgePath, KnowledgeNode]],
+                         knowledge: KnowledgeTree) -> Parser:
+    def parse(output: str) -> Tuple[Any, Optional[str]]:
+        values = field_values(output, "Change")
+        if not values:
+            return None, "Write at least one `Change:` line, or the single line `Change: NONE`."
+        if len(values) == 1 and clean_value(values[0]) is None:
+            return [], None
+        changes = []
+        updated_indices = set()
+        added_under: Dict[KnowledgePath, set] = {}
+        for value in values:
+            if clean_value(value) is None:
+                continue
+            parts = [p.strip() for p in value.split("|")]
+            action = parts[0].upper()
+            if action == "UPDATE":
+                if len(parts) < 3:
+                    return None, f"`Change: {value}` must be `UPDATE | <entry number> | <new description>`."
+                idx = _parse_entry_index(parts[1], entries)
+                if idx is None or idx == 0:
+                    return None, f"`{parts[1]}` in `Change: {value}` is not a valid entry number (1 to {len(entries) - 1})."
+                description = clean_value(" ".join(parts[2:]))
+                if description is None:
+                    return None, f"`Change: {value}` has an empty description."
+                if idx in updated_indices:
+                    return None, f"Entry [{idx}] is updated more than once; combine updates to the same entry into one line."
+                updated_indices.add(idx)
+                changes.append(("UPDATE", entries[idx][0], description))
+            elif action == "ADD":
+                if len(parts) < 4:
+                    return None, f"`Change: {value}` must be `ADD | <parent entry number> | <entry title> | <entry description>`."
+                idx = _parse_entry_index(parts[1], entries)
+                if idx is None:
+                    return None, f"`{parts[1]}` in `Change: {value}` is not a valid parent entry number (0 to {len(entries) - 1})."
+                parent_path = entries[idx][0]
+                title = clean_value(parts[2])
+                description = clean_value(" ".join(parts[3:]))
+                if title is None or description is None:
+                    return None, f"`Change: {value}` must provide both a title and a description."
+                parent_subtree = knowledge.tree.at(parent_path)
+                existing_titles = {child.root.title.strip().lower() for child in (parent_subtree.leaves if parent_subtree else [])}
+                pending_titles = added_under.setdefault(parent_path, set())
+                if title.strip().lower() in existing_titles:
+                    for child in (parent_subtree.leaves if parent_subtree else []):
+                        if child.root.title.strip().lower() == title.strip().lower():
+                            child_path = parent_path + (child.root.title,)
+                            changes.append(("UPDATE", child_path, description))
+                            break
+                elif title.strip().lower() in pending_titles:
+                    return None, f"Title {title!r} is added twice under {_path_text(parent_path)!r}."
+                else:
+                    pending_titles.add(title.strip().lower())
+                    changes.append(("ADD", parent_path, KnowledgeNode(title=title, description=description)))
+            else:
+                return None, f"Each `Change:` line must start with UPDATE, ADD, or NONE, got {parts[0]!r}."
+        return changes, None
+    return parse
+
+
+def remember_all(knowledge: KnowledgeTree, facts: List[str], vlm_call: Callable[..., str], game: str,
+                 episode_number: int, parameters: Optional[dict] = None) -> List[Dict[str, Any]]:
+    cleaned = [f.strip() for f in facts if f and f.strip()]
+    if not cleaned:
+        return []
+    entries = tree_entries(knowledge)
+    prompt = (P.KNOWLEDGE_BATCH_UPDATE_PROMPT
+              .replace("[GAME]", game)
+              .replace("[TREE]", render_knowledge_tree(knowledge))
+              .replace("[FACTS]", "\n".join(f"- {fact}" for fact in cleaned)))
+    changes = ask(vlm_call, prompt, _parse_batch_changes(entries, knowledge), "Knowledge update",
+                  KNOWLEDGE_ATTEMPTS, parameters)
+    if changes is None:
+        return [{"outcome": "failed", "stage": "batch_update"}]
+    outcomes: List[Dict[str, Any]] = []
+    for action, path, payload in changes:
+        if action == "UPDATE":
+            knowledge.set_description(path, payload, episode_number=episode_number)
+            outcomes.append({"outcome": "updated", "path": path})
+        elif action == "ADD":
+            knowledge.add_under(path, KnowledgeSubtree(payload), episode_number=episode_number)
+            outcomes.append({"outcome": "added", "path": path + (payload.title,)})
+    return outcomes or [{"outcome": "known", "path": (knowledge.tree.root.title,)}]
+
+
+def _parse_batch_recall(entries: List[Tuple[KnowledgePath, KnowledgeNode]]) -> Parser:
+    valid = f"entry numbers from 1 to {len(entries) - 1} separated by commas, or NOT FOUND"
+
+    def parse(output: str) -> Tuple[Any, Optional[str]]:
+        choice = clean_value(parse_key_value(output, "Choice"))
         if choice is None:
-            return {"outcome": "failed", "stage": "navigation", "path": path}
-        if choice == "NEW":
-            return _create(knowledge, knowledge_text, path, vlm_call, game, episode_number, parameters)
-        node = node.leaves[choice]
-        path = path + (node.root.title,)
-    if len(path) == 1:
-        return _create(knowledge, knowledge_text, path, vlm_call, game, episode_number, parameters)
-    prompt = _node_prompt(P.KNOWLEDGE_LEAF_PROMPT, game, knowledge_text, path, node)
-    decision = ask(vlm_call, prompt, _parse_leaf, "Knowledge leaf", KNOWLEDGE_ATTEMPTS, parameters)
-    if decision is None:
-        return {"outcome": "failed", "stage": "leaf", "path": path}
-    choice, description = decision
-    if choice == "KNOWN":
-        return {"outcome": "known", "path": path}
-    if choice == "UPDATE":
-        knowledge.set_description(path, description, episode_number=episode_number)
-        return {"outcome": "updated", "path": path}
-    return _create(knowledge, knowledge_text, path[:-1], vlm_call, game, episode_number, parameters)
+            return [], None
+        if choice.upper().replace("_", " ") in ("NOT FOUND", "NONE"):
+            return [], None
+        indices: List[int] = []
+        for part in choice.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            idx = _parse_entry_index(part, entries)
+            if idx is None or idx == 0:
+                return None, f"{part!r} is not a valid entry. The choice must be {valid}."
+            if idx not in indices:
+                indices.append(idx)
+        return indices, None
+    return parse
+
+
+def recall_queries(knowledge: KnowledgeTree, queries: List[str], vlm_call: Callable[..., str], game: str,
+                   parameters: Optional[dict] = None) -> List[Dict[str, Any]]:
+    cleaned = [q.strip() for q in queries if q and q.strip()]
+    if not cleaned or not has_recorded_knowledge(knowledge):
+        return []
+    entries = tree_entries(knowledge)
+    prompt = (P.KNOWLEDGE_BATCH_RECALL_PROMPT
+              .replace("[GAME]", game)
+              .replace("[TREE]", render_knowledge_tree(knowledge))
+              .replace("[QUERIES]", "\n".join(f"- {q}" for q in cleaned)))
+    indices = ask(vlm_call, prompt, _parse_batch_recall(entries), "Knowledge recall",
+                  KNOWLEDGE_ATTEMPTS, parameters)
+    found: List[Dict[str, Any]] = []
+    for idx in indices or []:
+        path, node = entries[idx]
+        found.append({"path": path, "title": node.title, "description": node.description})
+    return found
 
 
 def _recall_at(node: KnowledgeSubtree, path: KnowledgePath, query: str, vlm_call: Callable[..., str],
@@ -288,4 +440,4 @@ def _recall_at(node: KnowledgeSubtree, path: KnowledgePath, query: str, vlm_call
 
 def recall(knowledge: KnowledgeTree, query: str, vlm_call: Callable[..., str], game: str,
            parameters: Optional[dict] = None) -> List[Dict[str, Any]]:
-    return _recall_at(knowledge.tree, (knowledge.tree.root.title,), query, vlm_call, game, parameters)
+    return recall_queries(knowledge, [query], vlm_call, game, parameters)

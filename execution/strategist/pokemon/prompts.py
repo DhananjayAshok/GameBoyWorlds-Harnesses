@@ -137,6 +137,43 @@ Reasoning: <which entries could be relevant and why>
 Choice: <the numbers of at most [MAX_BRANCHES] relevant entries, separated by commas, or NOT FOUND>
 [STOP]"""
 
+KNOWLEDGE_BATCH_UPDATE_PROMPT = """You are playing [GAME] and keep a database of what you know, organised as a tree of topics.
+
+Your database right now:
+[TREE]
+
+Here is the new knowledge you wish to remember:
+[FACTS]
+
+Decide how to update your database so all of this knowledge is stored without duplicating what is already there:
+- If an existing entry already covers a fact completely, leave it alone.
+- If an existing entry is about the same topic or heading and should be expanded or corrected, write:
+  Change: UPDATE | <entry number> | <the full rewritten description keeping everything still true>
+- If a fact needs a new entry under an existing entry, write:
+  Change: ADD | <parent entry number> | <new short entry title> | <the entry description>
+- Do not use `|` inside a title or description. Update or add each entry at most once. If everything is already in your database, write the single line `Change: NONE`.
+
+Respond in exactly this format:
+Reasoning: <how each fact fits into the existing entries>
+Change: <UPDATE | <number> | <new description>, or ADD | <parent number> | <title> | <description>>
+(one `Change:` line per update or addition, or instead the single line `Change: NONE`)
+[STOP]"""
+
+KNOWLEDGE_BATCH_RECALL_PROMPT = """You are playing [GAME] and keep a database of what you know, organised as a tree of topics.
+
+Your database right now:
+[TREE]
+
+You want to recall what you know about:
+[QUERIES]
+
+Choose every entry number in your database that holds information relevant to answering these questions, or NOT FOUND if none of the entries are relevant.
+
+Respond in exactly this format:
+Reasoning: <which entries hold relevant information and why>
+Choice: <the numbers of the relevant entries separated by commas, or NOT FOUND>
+[STOP]"""
+
 RETRY_BLOCK = """
 
 Your previous reply was:
