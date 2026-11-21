@@ -686,7 +686,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                            getattr(self._env, "walk_patterns", None), self._people_now())
         return self.call_executor(tag, task, screen_tiles=self._screen_tiles,
                                   cell_kinds=kinds,
-                                  identified=self._identified)
+                                  identified=self._identified,
+                                  people_fn=self._people_now)
 
     def _handle_interruption(self) -> Tuple[str, Dict[str, Any]]:
         frame = self._current_frame()

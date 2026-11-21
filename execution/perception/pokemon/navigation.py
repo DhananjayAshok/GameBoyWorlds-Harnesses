@@ -1,6 +1,6 @@
 import re
 from collections import deque
-from typing import Collection, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Optional, Tuple
 
 from execution.game_api import HARD_MAX_STEPS
 
@@ -26,6 +26,11 @@ FURNITURE_OVERHANG_DESC_PATTERN = re.compile(r"\b(?:table|desk|counter|shelf|boo
 X_RANGE = range(LEFT_COL, LEFT_COL + 10)
 Y_RANGE = range(TOP_ROW - 8, TOP_ROW + 1)
 DIRECTIONS: Dict[str, Cell] = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
+DIRECTION_ALIASES: Dict[str, str] = {
+    "up": "up", "down": "down", "left": "left", "right": "right",
+    "north": "up", "south": "down", "west": "left", "east": "right",
+}
+DIRECTION_PREFIX_PATTERN = re.compile(r"^\s*(up|down|left|right|north|south|west|east)\b", re.IGNORECASE)
 MAX_STEPS_PER_MOVE = HARD_MAX_STEPS
 COORDINATE_PATTERN = re.compile(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
 
@@ -249,6 +254,84 @@ def parse_cell(text: Optional[str]) -> Optional[Cell]:
     if match is None:
         return None
     return int(match.group(1)), int(match.group(2))
+
+
+def parse_all_cells(text: Optional[str]) -> List[Cell]:
+    if not text:
+        return []
+    return [(int(m.group(1)), int(m.group(2))) for m in COORDINATE_PATTERN.finditer(text)]
+
+
+def parse_edge_direction(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    match = DIRECTION_PREFIX_PATTERN.match(text)
+    if match is None:
+        return None
+    return DIRECTION_ALIASES.get(match.group(1).lower())
+
+
+def edge_runs(cells: Iterable[Cell], direction: str) -> List[List[Cell]]:
+    axis = 0 if direction in ("up", "down") else 1
+    ordered = sorted(cells, key=lambda c: c[axis])
+    runs: List[List[Cell]] = []
+    for cell in ordered:
+        if runs and cell[axis] - runs[-1][-1][axis] == 1:
+            runs[-1].append(cell)
+        else:
+            runs.append([cell])
+    return runs
+
+
+def filter_forward_edge_cells(cells: Iterable[Cell], direction: str) -> List[Cell]:
+    cells_list = list(cells)
+    dx, dy = DIRECTIONS[direction]
+    forward = [c for c in cells_list if (c[0] * dx + c[1] * dy) >= 0]
+    return forward if forward else cells_list
+
+
+def filter_open_lane_edge_cells(
+    cells: Iterable[Cell],
+    direction: str,
+    kinds: Dict[Cell, str],
+    global_map: Optional[Any] = None,
+) -> List[Cell]:
+    cells_list = list(cells)
+    if not cells_list:
+        return []
+    dx, dy = DIRECTIONS[direction]
+    seg = None
+    px = py = 0
+    if global_map is not None and getattr(global_map, "current", None) and getattr(global_map, "pos", None) is not None:
+        try:
+            _, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+            seg = global_map.current
+        except Exception:  # noqa: BLE001
+            seg = None
+
+    if seg is not None:
+        beyond_clear = []
+        for c in cells_list:
+            beyond = seg.get((px + c[0] + dx, py + c[1] + dy))
+            if beyond is None:
+                beyond_clear.append(c)
+            elif beyond.kind == WALKABLE:
+                beyond_clear.append(c)
+            elif beyond.kind == LEDGE and direction == "down":
+                landing = seg.get((px + c[0] + 2 * dx, py + c[1] + 2 * dy))
+                if landing is None or landing.kind == WALKABLE:
+                    beyond_clear.append(c)
+        if beyond_clear:
+            cells_list = beyond_clear
+
+    inward_clear = [
+        c for c in cells_list
+        if kinds.get((c[0] - dx, c[1] - dy)) == WALKABLE
+        or (kinds.get((c[0] - dx, c[1] - dy)) == LEDGE and direction == "down")
+    ]
+    if inward_clear:
+        cells_list = inward_clear
+    return cells_list
 
 
 def is_boundary_exit_direction(kinds: Dict[Cell, str], cell: Cell, direction: str) -> bool:

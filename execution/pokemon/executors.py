@@ -11,8 +11,10 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_me
                                                  is_cutscene_frame_changing, is_same_battle_frame)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path, edge_cells,
-                                                     in_bounds, is_boundary_exit_direction, parse_cell,
-                                                     shortest_path, verbalize_edges)
+                                                     edge_runs, filter_forward_edge_cells,
+                                                     filter_open_lane_edge_cells, in_bounds,
+                                                     is_boundary_exit_direction, parse_all_cells, parse_cell,
+                                                     parse_edge_direction, shortest_path, verbalize_edges)
 from execution.pokemon.executor_actions import CheckInteractionAction
 from execution.report import EnvironmentStepRecord
 from utils import log_error, ocr, parse_int, parse_key_value, parse_yes_no
@@ -283,16 +285,21 @@ GRID_DESCRIPTION = """The screen is a grid of cells. The player is at (0, 0). x 
 class GridMoveExecutor(PolicyExecutor):
     LOCATE_TAG = "locate"
     MAX_NEW_TOKENS = 4000
+    MAX_REROUTES = 2
 
     def __init__(self, env, task, max_steps: int = 10, screen_tiles: Optional[str] = None,
-                 cell_kinds: Optional[Dict[Tuple[int, int], str]] = None, identified: Optional[ Any] = None, **kwargs):
+                 cell_kinds: Optional[Dict[Tuple[int, int], str]] = None, identified: Optional[Any] = None,
+                 people_fn=None, **kwargs):
         self.screen_tiles = screen_tiles
         self.cell_kinds = cell_kinds
         self.identified = identified
+        self.people_fn = people_fn
         self.target_cell: Optional[Tuple[int, int]] = None
         self.plan: Optional[List[Tuple[str, int, str]]] = None
         self._n_moves = 0
         self._steps_taken = 0
+        self._displacement: Tuple[int, int] = (0, 0)
+        self._last_step_taken = 0
         self._saw_cutscene_activity = False
         super().__init__(env, task, max_steps, screen_tiles=screen_tiles, cell_kinds=cell_kinds,
                          identified=identified, **kwargs)
@@ -313,6 +320,41 @@ class GridMoveExecutor(PolicyExecutor):
         if self._get_state()["pokemon_core"]["agent_state"] != AgentState.FREE_ROAM:
             return self._fail(MOVE_NOT_FREE_ROAM, "not_free_roam")
         return None
+
+    def _current_map_place(self) -> Optional[Tuple[int, Tuple[int, int]]]:
+        gmap = getattr(self._env, "_map", None)
+        if gmap is None or not getattr(gmap, "current", None) or getattr(gmap, "pos", None) is None:
+            return None
+        try:
+            return gmap.resolve(gmap.segment, gmap.pos)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _refresh_local_perception(self, blocked_neighbor: Optional[Tuple[int, int]] = None) -> bool:
+        tiles = getattr(self._env, "_tiles", None)
+        if tiles is None or not hasattr(tiles, "identify_tiles"):
+            if blocked_neighbor is not None and self.cell_kinds is not None:
+                self.cell_kinds = dict(self.cell_kinds)
+                self.cell_kinds[blocked_neighbor] = BLOCKED
+            return False
+        frame = self._get_state()["core"]["current_frame"]
+        self.identified = tiles.identify_tiles(frame)
+        people = None
+        if callable(self.people_fn):
+            try:
+                people = self.people_fn()
+            except Exception:  # noqa: BLE001
+                people = None
+        kinds = cell_kinds(
+            self.identified,
+            getattr(self._env, "ledge_patterns", None),
+            getattr(self._env, "walk_patterns", None),
+            people,
+        )
+        if blocked_neighbor is not None:
+            kinds[blocked_neighbor] = BLOCKED
+        self.cell_kinds = kinds
+        return True
 
     def _settle_free_roam(self):
         state = self._get_state()["pokemon_core"]["agent_state"]
@@ -341,10 +383,12 @@ class GridMoveExecutor(PolicyExecutor):
                 post_motion_remaining -= 1
         return state
 
-    def _step(self, direction: str, steps: int) -> Optional[int]:
+    def _step(self, direction: str, steps: int, move_kind: str = "walk") -> Optional[int]:
         remaining = steps
         attempts = 0
         retried_after_cutscene = False
+        self._last_step_taken = 0
+        dx, dy = DIRECTIONS[direction]
         while remaining > 0:
             if attempts >= steps + 2:
                 return self._fail(MOVE_BLOCKED, "move_blocked", f"Could not finish moving {direction} {steps}")
@@ -352,6 +396,7 @@ class GridMoveExecutor(PolicyExecutor):
                 return self._fail(MOVE_OUT_OF_STEPS, "out_of_steps")
             attempts += 1
             self._n_moves += 1
+            before_place = self._current_map_place()
             record = self._take_action(MoveStepsAction, direction=direction, steps=remaining)
             if self._last_terminated:
                 return self._fail(MOVE_TERMINATED, "terminated")
@@ -360,6 +405,15 @@ class GridMoveExecutor(PolicyExecutor):
             action_return = (record.transition_states[-1]["core"].get("action_return") or {}) if record.transition_states else {}
             taken = action_return.get("n_steps_taken", 0)
             self._steps_taken += taken
+            self._last_step_taken += taken
+            after_place = self._current_map_place()
+            if before_place is not None and after_place is not None and before_place[0] == after_place[0]:
+                step_dx = after_place[1][0] - before_place[1][0]
+                step_dy = after_place[1][1] - before_place[1][1]
+            else:
+                mult = 2 if (move_kind == "jump" and taken > 0) else 1
+                step_dx, step_dy = dx * taken * mult, dy * taken * mult
+            self._displacement = (self._displacement[0] + step_dx, self._displacement[1] + step_dy)
             state = self._get_state()["pokemon_core"]["agent_state"]
             if record.action_success == 2 or state != AgentState.FREE_ROAM:
                 return self._fail(MOVE_INTERRUPTED, "move_interrupted",
@@ -392,18 +446,64 @@ class GridMoveExecutor(PolicyExecutor):
         return None
 
     def _walk(self, goals: Dict[Tuple[int, int], Optional[str]]) -> Optional[int]:
-        path = shortest_path(self.cell_kinds, (0, 0), goals)
-        if path is None:
-            return self._fail(MOVE_NO_PATH, "no_path", f"No walkable path from (0, 0) to any of {sorted(goals)}")
-        self.plan = compress_path(path)
-        end = path[-1][2] if path else (0, 0)
-        facing = goals[end]
-        description = ", ".join(f"{m} {d} {n}" for d, n, m in self.plan) or "stay"
-        self._begin_scripted(f"walk to {end} ({description})" + (f" and face {facing}" if facing else ""))
-        for direction, n_steps, move in self.plan:
-            code = self._step(direction, n_steps)
-            if code is not None:
-                return code
+        current_goals = dict(goals)
+        reroutes = 0
+        while True:
+            path = shortest_path(self.cell_kinds, (0, 0), current_goals)
+            if path is None:
+                if reroutes > 0:
+                    return self._fail(MOVE_BLOCKED, "move_blocked",
+                                      f"Blocked before reaching any of {sorted(current_goals)}")
+                return self._fail(MOVE_NO_PATH, "no_path",
+                                  f"No walkable path from (0, 0) to any of {sorted(current_goals)}")
+            self.plan = compress_path(path)
+            end = path[-1][2] if path else (0, 0)
+            facing = current_goals[end]
+            description = ", ".join(f"{m} {d} {n}" for d, n, m in self.plan) or "stay"
+            prefix = "reroute to" if reroutes > 0 else "walk to"
+            self._begin_scripted(f"{prefix} {end} ({description})" + (f" and face {facing}" if facing else ""))
+            start_disp = self._displacement
+            leg_steps_before = self._steps_taken
+            failed_code = None
+            failed_dir = None
+            for direction, n_steps, move in self.plan:
+                code = self._step(direction, n_steps, move_kind=move)
+                if code is not None:
+                    failed_code = code
+                    failed_dir = direction
+                    break
+            if failed_code is not None:
+                leg_taken = self._steps_taken - leg_steps_before
+                if (failed_code == MOVE_BLOCKED
+                        and leg_taken > 0
+                        and reroutes < self.MAX_REROUTES
+                        and self._n_moves < self._max_steps
+                        and self._get_state()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
+                        and not has_bottom_dialogue_box(self._get_state()["core"]["current_frame"])):
+                    dx = self._displacement[0] - start_disp[0]
+                    dy = self._displacement[1] - start_disp[1]
+                    if (dx, dy) != (0, 0):
+                        shifted_goals = {
+                            (gx - dx, gy - dy): f
+                            for (gx, gy), f in current_goals.items()
+                            if in_bounds((gx - dx, gy - dy))
+                        }
+                        if (0, 0) in shifted_goals:
+                            self.report.termination_reason = None
+                            self.report.notes = None
+                            facing = shifted_goals[(0, 0)]
+                            break
+                        if shifted_goals:
+                            blocked_neighbor = DIRECTIONS.get(failed_dir)
+                            self._refresh_local_perception(blocked_neighbor=blocked_neighbor)
+                            if shortest_path(self.cell_kinds, (0, 0), shifted_goals) is not None:
+                                current_goals = shifted_goals
+                                reroutes += 1
+                                self.report.termination_reason = None
+                                self.report.notes = None
+                                continue
+                return failed_code
+            break
         if facing is not None:
             code = self._step(facing, 1)
             if code is not None and code != MOVE_BLOCKED:
@@ -431,23 +531,41 @@ Location: <(x, y), Ambiguous, or Not Found>
 Candidates: <if Ambiguous, each candidate with its coordinates and what sets it apart from the others; otherwise None>
 [STOP]"""
 
+    def _resolve_explicit_target(self) -> Optional[Tuple[int, int]]:
+        coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
+        if len(coords) != 1:
+            return None
+        target = coords[0]
+        if target == (0, 0):
+            return target
+        if self.cell_kinds.get(target) == WALKABLE:
+            if shortest_path(self.cell_kinds, (0, 0), [target]) is not None:
+                return target
+        else:
+            goals = approach_cells(self.cell_kinds, target)
+            if goals and shortest_path(self.cell_kinds, (0, 0), goals) is not None:
+                return target
+        return target
+
     def _execute(self) -> int:
         code = self._check_inputs()
         if code is not None:
             return code
-        prompt = (self.LOCATE_PROMPT.replace("[TARGET]", self._task.strip())
-                  .replace("[GRID_DESCRIPTION]", GRID_DESCRIPTION)
-                  .replace("[SCREEN_TILES]", self.screen_tiles))
-        output = self._locate(prompt)
-        location = (parse_key_value(output, "Location") or "").strip()
-        lowered = location.lower()
-        if "ambiguous" in lowered:
-            return self._fail(MOVE_TARGET_AMBIGUOUS, "target_ambiguous", parse_key_value(output, "Candidates"))
-        if "not found" in lowered:
-            return self._fail(MOVE_TARGET_NOT_FOUND, "target_not_found", parse_key_value(output, "Reasoning"))
-        target = parse_cell(location)
-        if target is None or not in_bounds(target):
-            return self._fail(MOVE_BAD_LOCATION, "bad_location", f"Unusable location {location!r}")
+        target = self._resolve_explicit_target()
+        if target is None:
+            prompt = (self.LOCATE_PROMPT.replace("[TARGET]", self._task.strip())
+                      .replace("[GRID_DESCRIPTION]", GRID_DESCRIPTION)
+                      .replace("[SCREEN_TILES]", self.screen_tiles))
+            output = self._locate(prompt)
+            location = (parse_key_value(output, "Location") or "").strip()
+            lowered = location.lower()
+            if "ambiguous" in lowered:
+                return self._fail(MOVE_TARGET_AMBIGUOUS, "target_ambiguous", parse_key_value(output, "Candidates"))
+            if "not found" in lowered:
+                return self._fail(MOVE_TARGET_NOT_FOUND, "target_not_found", parse_key_value(output, "Reasoning"))
+            target = parse_cell(location)
+            if target is None or not in_bounds(target):
+                return self._fail(MOVE_BAD_LOCATION, "bad_location", f"Unusable location {location!r}")
         self.target_cell = target
         if target == (0, 0):
             return MOVE_OK
@@ -478,6 +596,7 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
 
 class OffScreenMoveExecutor(GridMoveExecutor):
     LOCATE_TAG = "locate_edge"
+    MAX_DETERMINISTIC_CORRIDOR_WIDTH = 3
 
     def _at_exterior_boundary(self, direction: str) -> bool:
         from execution.perception.pokemon.grid import split_grid
@@ -510,10 +629,17 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             return None
         frame = self._get_state()["core"]["current_frame"]
         identified = tiles.identify_tiles(frame)
+        people = None
+        if callable(self.people_fn):
+            try:
+                people = self.people_fn()
+            except Exception:  # noqa: BLE001
+                people = None
         kinds = cell_kinds(
             identified,
             getattr(self._env, "ledge_patterns", None),
             getattr(self._env, "walk_patterns", None),
+            people,
         )
         dx, dy = DIRECTIONS[direction]
         nxt = (dx, dy)
@@ -524,6 +650,47 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             return kinds.get((dx, dy - 1)) == WALKABLE
         if kind in (BLOCKED, LEDGE):
             return False
+        return None
+
+    def _resolve_deterministic_edge(self) -> Optional[Tuple[str, Tuple[int, int]]]:
+        direction = parse_edge_direction(self._task)
+        if direction not in DIRECTIONS:
+            return None
+        cells = edge_cells(self.cell_kinds, direction)
+        if not cells:
+            return None
+        forward_cells = filter_forward_edge_cells(cells, direction)
+        gmap = getattr(self._env, "_map", None)
+        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap)
+
+        coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
+        on_edge_coords = [c for c in coords if c in cells]
+        if on_edge_coords:
+            preferred = [c for c in on_edge_coords if c in open_cells] or [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
+            path = shortest_path(self.cell_kinds, (0, 0), preferred)
+            target = path[-1][2] if path else preferred[0]
+            return direction, target
+
+        if len(coords) == 1:
+            waypoint = coords[0]
+            axis = 0 if direction in ("up", "down") else 1
+            aligned = [c for c in open_cells if c[axis] == waypoint[axis]] or [c for c in forward_cells if c[axis] == waypoint[axis]]
+            if len(aligned) == 1:
+                return direction, aligned[0]
+
+        stripped = self._task.strip().lower()
+        is_bare_direction = stripped in ("up", "down", "left", "right", "north", "south", "west", "east")
+        runs = edge_runs(open_cells, direction)
+        if len(runs) == 1:
+            run = runs[0]
+            if is_bare_direction or len(run) <= self.MAX_DETERMINISTIC_CORRIDOR_WIDTH:
+                path = shortest_path(self.cell_kinds, (0, 0), run)
+                target = path[-1][2] if path else run[0]
+                return direction, target
+        elif is_bare_direction and open_cells:
+            path = shortest_path(self.cell_kinds, (0, 0), open_cells)
+            if path:
+                return direction, path[-1][2]
         return None
 
     LOCATE_PROMPT = """You are helping a player walk off the edge of the screen in a Game Boy Pokemon game.
@@ -550,36 +717,66 @@ Location: <(x, y) or Not Found>
         code = self._check_inputs()
         if code is not None:
             return code
-        prompt = (self.LOCATE_PROMPT.replace("[TARGET]", self._task.strip())
-                  .replace("[GRID_DESCRIPTION]", GRID_DESCRIPTION)
-                  .replace("[SCREEN_TILES]", self.screen_tiles)
-                  .replace("[EDGE_CELLS]", verbalize_edges(self.cell_kinds)))
-        output = self._locate(prompt)
-        location = (parse_key_value(output, "Location") or "").strip()
-        direction = (parse_key_value(output, "Direction") or "").strip().lower()
-        direction_aliases = {"north": "up", "south": "down", "west": "left", "east": "right"}
-        direction = direction_aliases.get(direction, direction)
-        if "not found" in location.lower():
-            if direction in DIRECTIONS and not edge_cells(self.cell_kinds, direction):
-                if is_boundary_exit_direction(self.cell_kinds, (0, 0), direction):
-                    self._begin_scripted(f"step {direction} at the boundary")
-                    step_code = self._step(direction, 1)
-                    if step_code is None:
-                        self.report.termination_reason = "left_screen"
-                        self.report.notes = f"Stepped {direction} across the boundary"
-                        return MOVE_OK
-                    if step_code != MOVE_BLOCKED:
-                        return step_code
-            return self._fail(MOVE_TARGET_NOT_FOUND, "edge_not_found", parse_key_value(output, "Reasoning"))
-        target = parse_cell(location)
-        if direction not in DIRECTIONS:
-            return self._fail(MOVE_BAD_LOCATION, "bad_direction", f"Unusable direction {direction!r}")
-        cells = edge_cells(self.cell_kinds, direction)
-        if target is not None and target not in cells and cells:
-            target = min(cells, key=lambda c: (c[0] - target[0]) ** 2 + (c[1] - target[1]) ** 2)
-        if target is None or target not in cells:
-            return self._fail(MOVE_BAD_LOCATION, "bad_location",
-                              f"{location!r} is not a walkable cell on the {direction} edge")
+        parsed_dir = parse_edge_direction(self._task)
+        if parsed_dir in DIRECTIONS and not edge_cells(self.cell_kinds, parsed_dir):
+            if is_boundary_exit_direction(self.cell_kinds, (0, 0), parsed_dir):
+                self._begin_scripted(f"step {parsed_dir} at the boundary")
+                step_code = self._step(parsed_dir, 1)
+                if step_code is None:
+                    self.report.termination_reason = "left_screen"
+                    self.report.notes = f"Stepped {parsed_dir} across the boundary"
+                    return MOVE_OK
+                if step_code != MOVE_BLOCKED:
+                    return step_code
+            return self._fail(MOVE_TARGET_NOT_FOUND, "edge_not_found",
+                              f"No walkable cells on the {parsed_dir} edge")
+
+        resolved = self._resolve_deterministic_edge()
+        if resolved is not None:
+            direction, target = resolved
+        else:
+            prompt = (self.LOCATE_PROMPT.replace("[TARGET]", self._task.strip())
+                      .replace("[GRID_DESCRIPTION]", GRID_DESCRIPTION)
+                      .replace("[SCREEN_TILES]", self.screen_tiles)
+                      .replace("[EDGE_CELLS]", verbalize_edges(self.cell_kinds)))
+            output = self._locate(prompt)
+            location = (parse_key_value(output, "Location") or "").strip()
+            direction = (parse_key_value(output, "Direction") or "").strip().lower()
+            direction_aliases = {"north": "up", "south": "down", "west": "left", "east": "right"}
+            direction = direction_aliases.get(direction, direction)
+            if parsed_dir in DIRECTIONS:
+                direction = parsed_dir
+            if "not found" in location.lower():
+                if direction in DIRECTIONS and not edge_cells(self.cell_kinds, direction):
+                    if is_boundary_exit_direction(self.cell_kinds, (0, 0), direction):
+                        self._begin_scripted(f"step {direction} at the boundary")
+                        step_code = self._step(direction, 1)
+                        if step_code is None:
+                            self.report.termination_reason = "left_screen"
+                            self.report.notes = f"Stepped {direction} across the boundary"
+                            return MOVE_OK
+                        if step_code != MOVE_BLOCKED:
+                            return step_code
+                return self._fail(MOVE_TARGET_NOT_FOUND, "edge_not_found", parse_key_value(output, "Reasoning"))
+            target = parse_cell(location)
+            if direction not in DIRECTIONS:
+                return self._fail(MOVE_BAD_LOCATION, "bad_direction", f"Unusable direction {direction!r}")
+            cells = edge_cells(self.cell_kinds, direction)
+            forward_cells = filter_forward_edge_cells(cells, direction)
+            candidate_cells = forward_cells or cells
+            if target is not None and target not in candidate_cells and candidate_cells:
+                target = min(candidate_cells, key=lambda c: (c[0] - target[0]) ** 2 + (c[1] - target[1]) ** 2)
+            if target is None or target not in cells:
+                return self._fail(MOVE_BAD_LOCATION, "bad_location",
+                                  f"{location!r} is not a walkable cell on the {direction} edge")
+            gmap = getattr(self._env, "_map", None)
+            open_cells = filter_open_lane_edge_cells(candidate_cells, direction, self.cell_kinds, gmap)
+            if target not in open_cells and open_cells:
+                axis = 0 if direction in ("up", "down") else 1
+                adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= 2]
+                if adjacent_open:
+                    target = min(adjacent_open, key=lambda c: (abs(c[axis] - target[axis]), abs(c[axis])))
+
         self.target_cell = target
         initial_frame = self._get_state()["core"]["current_frame"]
         code = self._walk({target: None})
@@ -622,7 +819,6 @@ Location: <(x, y) or Not Found>
         self.report.termination_reason = "left_screen"
         self.report.notes = f"Walked to {target} and stepped off the screen {direction}"
         return MOVE_OK
-
 
 BATTLE_ENDED = 0
 BATTLE_TERMINATED = 1
