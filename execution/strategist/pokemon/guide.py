@@ -45,6 +45,7 @@ class GuideEvent:
     place: str
     rules: Tuple[int, ...]
     segment: Optional[int] = None
+    completed_goal: bool = False
 
     @property
     def text(self) -> str:
@@ -97,7 +98,19 @@ class StrategyGuide(StrategistArtifact):
         have = {(r.trigger, r.text) for r in self.rules + self.removed if r.source == "seed"}
         return [s for s in seeds if (s["trigger"], s["rule"].strip()) not in have]
 
-    def active_event(self, gmap: GlobalMap, episode: int) -> Optional[GuideEvent]:
+    def sync_seeds(self, seeds: Sequence[Dict[str, str]], episode: int) -> None:
+        seed_rules = [r for r in self.rules if r.source == "seed"]
+        if len(seed_rules) == len(seeds) and all(r.trigger == s["trigger"] for r, s in zip(seed_rules, seeds)):
+            for r, s in zip(seed_rules, seeds):
+                text = s["rule"].strip()
+                if r.text != text:
+                    self.edit_rule(r.id, text, episode, episode_number=episode)
+            return
+        for seed in self.missing_seeds(seeds):
+            self.add_rule(seed["trigger"], seed["rule"], "seed", episode, episode_number=episode)
+
+    def active_event(self, gmap: GlobalMap, episode: int,
+                     goal_completed_since_entry: bool = False) -> Optional[GuideEvent]:
         if not self.events:
             return None
         event = self.events[-1]
@@ -105,7 +118,23 @@ class StrategyGuide(StrategistArtifact):
         if episode - event.episode >= ACTIVE_EPISODES or (
                 event.segment is not None and gmap.resolve(event.segment, (0, 0))[0] != here):
             return None
+        if event.trigger == ENTERED_BUILDING and (
+                getattr(event, "completed_goal", False) or goal_completed_since_entry):
+            return None
         return event
+
+    @update
+    def mark_goal_completed(self, gmap: GlobalMap) -> bool:
+        if not self.events:
+            return False
+        event = self.events[-1]
+        here = gmap.resolve(gmap.segment, (0, 0))[0]
+        if (event.trigger == ENTERED_BUILDING
+                and (event.segment is None or gmap.resolve(event.segment, (0, 0))[0] == here)
+                and not getattr(event, "completed_goal", False)):
+            event.completed_goal = True
+            return True
+        return False
 
     @update
     def add_rule(self, trigger: str, text: str, source: str, episode: int) -> GuideRule:
@@ -142,13 +171,14 @@ class StrategyGuide(StrategistArtifact):
         }
 
 
-def guide_block(guide: StrategyGuide, gmap: GlobalMap, episode: int) -> str:
-    event = guide.active_event(gmap, episode)
+def guide_block(guide: StrategyGuide, gmap: GlobalMap, episode: int,
+                goal_completed_since_entry: bool = False) -> str:
+    event = guide.active_event(gmap, episode, goal_completed_since_entry=goal_completed_since_entry)
     if event is None or not guide.rules_for(event.trigger):
         return ""
     lines = [f"\nYour strategy guide: the player {event.trigger} ({event.place}) in episode "
-             f"{event.episode}, so these rules of yours apply. Follow them unless the goal clearly needs "
-             f"something else first:"]
+             f"{event.episode}, so these rules of yours apply. Follow them only if your current goal does not "
+             f"already give a clear next step or require leaving this building:"]
     lines += [f"- {r.text}" for r in guide.rules_for(event.trigger)]
     return "\n".join(lines) + "\n"
 

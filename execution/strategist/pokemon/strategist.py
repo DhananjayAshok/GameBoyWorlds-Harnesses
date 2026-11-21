@@ -164,9 +164,7 @@ class PokemonStrategist:
         if self.start_episode > 0:
             self._env.load_custom_state(
                 self._emulator_state_name(self._resume_run or name, self.start_episode - 1))
-        for seed in self.guide.missing_seeds(load_seeds()):
-            self.guide.add_rule(seed["trigger"], seed["rule"], "seed", self.start_episode,
-                                episode_number=self.start_episode)
+        self.guide.sync_seeds(load_seeds(), self.start_episode)
 
         self._identified: Optional[Dict[Any, Any]] = None
         self._screen_tiles: Optional[str] = None
@@ -320,6 +318,15 @@ class PokemonStrategist:
         return "\n".join(f"- episode {e.n}: {e.task} [{e.status}]" + (f": {e.summary}" if e.summary else "")
                          for e in self.report.episodes[-self.RECENT_EPISODES:])
 
+    def _goal_completed_since_building_entry(self) -> bool:
+        if not self.guide.events:
+            return False
+        event = self.guide.events[-1]
+        for node in self.goals.tree.nodes():
+            if node.status == "complete" and node.frontier_since is not None and node.frontier_since > event.episode:
+                return True
+        return False
+
     def _fill(self, prompt: str) -> str:
         return (prompt.replace("[GAME]", self._game)
                 .replace("[RECENT_BLOCK]", self._recent_block())
@@ -327,7 +334,8 @@ class PokemonStrategist:
                 .replace("[GOAL]", frontier_text(self.goals))
                 .replace("[CURRENT]", self._current_place())
                 .replace("[NOTEPAD]", self.notepad.text.strip() or "(empty)")
-                .replace("[GUIDE]", guide_block(self.guide, self.global_map, self.start_episode + self._episodes_run)))
+                .replace("[GUIDE]", guide_block(self.guide, self.global_map, self.start_episode + self._episodes_run,
+                                                goal_completed_since_entry=self._goal_completed_since_building_entry())))
 
     def _map_opening_screen(self, frame: np.ndarray) -> None:
         free = self._env.get_info()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
@@ -797,6 +805,8 @@ class PokemonStrategist:
             self._extract_knowledge(report.digest + self._conversation_digest(n), before, frame, n)
         self._update_notepad(report.digest, summary, n)
         if closed:
+            if any(status == "complete" for _, status in closed):
+                self.guide.mark_goal_completed(self.global_map, episode_number=n)
             self._absorb_notepad(closed, n)
         if events:
             update_guide(self.guide, events, report.digest, self._vlm_caller("guide_update"), self._game, n,

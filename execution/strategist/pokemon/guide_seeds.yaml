@@ -1,5 +1,5 @@
 - trigger: entered building
-  rule: Talk to every person in this building you have not spoken to yet, and read every sign or notice you have not read yet, before leaving.
+  rule: If you do not already have a clear next step for your goal in or out of this building, talk to people here you have not spoken to yet and check signs or notices relevant to your goal before leaving; do not detour to inspect decorative furniture or objects once your objective in the building is done.
 - trigger: entered new town
   rule: Visit the Pokemon Center.
 - trigger: entered building
