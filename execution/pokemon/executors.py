@@ -9,8 +9,8 @@ from execution.executors import PolicyExecutor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
                                                  has_modal_preview_box, is_battle_decision_screen,
                                                  is_cutscene_frame_changing, is_same_battle_frame)
-from execution.perception.pokemon.navigation import (DIRECTIONS, WALKABLE, approach_cells,
-                                                     boundary_exit_direction, compress_path, edge_cells,
+from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, WALKABLE, approach_cells,
+                                                     boundary_exit_direction, cell_kinds, compress_path, edge_cells,
                                                      in_bounds, is_boundary_exit_direction, parse_cell,
                                                      shortest_path, verbalize_edges)
 from execution.pokemon.executor_actions import CheckInteractionAction
