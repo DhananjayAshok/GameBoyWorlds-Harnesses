@@ -31,6 +31,11 @@ OUTDOORS, BUILDING, CAVE = "outdoors", "building", "cave"
 AREA_KINDS = (OUTDOORS, BUILDING, CAVE)
 
 BLACKOUT_CELLS = 3
+WHITE_LEVEL = 240
+DARK_LEVEL = 100
+BRIGHT_LEVEL = 150
+TRANSITION_FLASH_CELLS = 40
+IRIS_WIPE_CELLS = 30
 # A cell counts as unchanged by a wipe if at most this fraction of its pixels changed.
 WIPE_CELL_CHANGE = 0.2
 # A wipe leaves at least this many unchanged cells for every changed one; a new room changes nearly all.
@@ -458,6 +463,7 @@ class GlobalMap(StrategistArtifact):
             self.stats["blackout_frames"] += 1
             return "blank"
         if found is not None:
+            prev_segment = self.segment
             if found != (self.segment, self.pos):
                 self._link(*found)
             self.segment, self.pos = found
@@ -465,6 +471,8 @@ class GlobalMap(StrategistArtifact):
             self.faded = False
             self.stats["relocalised"] += 1
             self.observe(frame, identified, shift)
+            if prev_segment != self.segment:
+                self.prune_transient_segments()
             return "relocalised"
         if self._wipe_closing(frame):
             if direction in DIRECTIONS and self.pending is None:
@@ -478,6 +486,7 @@ class GlobalMap(StrategistArtifact):
         if self.lost < LOST_PATIENCE:
             self.stats["lost_frames"] += 1
             return "lost"
+        prev_segment = self.segment
         self.segments.append({})
         self.visits.append(Counter())
         self.segment_info[len(self.segments) - 1] = SegmentInfo()
@@ -488,6 +497,8 @@ class GlobalMap(StrategistArtifact):
         self.segment_born = self.stats["placed"]
         self.stats["new_segment"] += 1
         self.observe(frame, identified, shift)
+        if prev_segment != self.segment:
+            self.prune_transient_segments()
         return "new_segment"
 
     def _link(self, segment: int, pos: Cell) -> None:
@@ -511,25 +522,50 @@ class GlobalMap(StrategistArtifact):
         return n >= BLACKOUT_CELLS
 
     def _wipe_closing(self, frame: np.ndarray) -> bool:
-        if self.faded:
-            return False
         seg, shift = self.segments[self.segment], tuple((-r) % GRID_SKIP for r in self.residual)
-        black = same = changed = 0
-        for (x, y), piece in _local_cells(_screen(frame), shift):
-            old = seg.get((self.pos[0] + x, self.pos[1] + y))
-            if old is None or old.pixels is None or (x, y) == (0, 0):
-                continue
-            new, prior = piece.astype(int), np.squeeze(old.pixels).astype(int)
-            lit = _still_lit(new, prior)
-            if not lit.all():
-                black += 1
-            if not lit.any():
-                continue
-            if np.mean(np.abs(new - prior)[lit] > BLACK_LEVEL) < WIPE_CELL_CHANGE:
-                same += 1
-            else:
-                changed += 1
-        return black >= BLACKOUT_CELLS and same >= WIPE_SAME_RATIO * changed
+        a = _screen(frame)
+        cells_by_xy = dict(_local_cells(a, shift))
+        top_black = sum(1 for x in range(-4, 6) if (x, 4) in cells_by_xy and cells_by_xy[(x, 4)].max() <= BLACK_LEVEL)
+        bot_black = sum(1 for x in range(-4, 6) if (x, -4) in cells_by_xy and cells_by_xy[(x, -4)].max() <= BLACK_LEVEL)
+        left_black = sum(1 for y in range(-4, 5) if (-4, y) in cells_by_xy and cells_by_xy[(-4, y)].max() <= BLACK_LEVEL)
+        right_black = sum(1 for y in range(-4, 5) if (5, y) in cells_by_xy and cells_by_xy[(5, y)].max() <= BLACK_LEVEL)
+        black = white = darkened = 0
+        best_same = 0
+        best_changed = 999
+        for dx in (-2, -1, 0, 1, 2):
+            for dy in (-2, -1, 0, 1, 2):
+                same = changed = b = w = d = 0
+                for (x, y), piece in cells_by_xy.items():
+                    old = seg.get((self.pos[0] + dx + x, self.pos[1] + dy + y))
+                    if old is None or old.pixels is None or (x, y) == (0, 0):
+                        continue
+                    new, prior = piece.astype(int), np.squeeze(old.pixels).astype(int)
+                    lit = _still_lit(new, prior)
+                    if not lit.all():
+                        b += 1
+                    if new.min() >= WHITE_LEVEL and prior.min() < WHITE_LEVEL:
+                        w += 1
+                    if new.max() <= DARK_LEVEL and prior.max() >= BRIGHT_LEVEL:
+                        d += 1
+                    if not lit.any():
+                        continue
+                    if np.mean(np.abs(new - prior)[lit] > BLACK_LEVEL) < WIPE_CELL_CHANGE:
+                        same += 1
+                    else:
+                        changed += 1
+                if (dx, dy) == (0, 0):
+                    black, white, darkened = b, w, d
+                if (same, -changed) > (best_same, -best_changed):
+                    best_same, best_changed = same, changed
+        if black >= BLACKOUT_CELLS and best_same >= WIPE_SAME_RATIO * best_changed:
+            return True
+        if top_black >= 8 and bot_black >= 8 and left_black >= 7 and right_black >= 7 and black >= IRIS_WIPE_CELLS:
+            return True
+        if white >= TRANSITION_FLASH_CELLS:
+            return True
+        if darkened >= TRANSITION_FLASH_CELLS and np.percentile(a, 98) <= DARK_LEVEL:
+            return True
+        return False
 
     def _grid_shift(self, frame: np.ndarray) -> Cell:
         shift = grid_offset(frame) or (0, 0)
@@ -584,6 +620,145 @@ class GlobalMap(StrategistArtifact):
             self.segment, self.pos = target, (self.pos[0] + dx, self.pos[1] + dy)
         self.stats["merged"] += 1
 
+    @staticmethod
+    def _block_index(seg: Dict[Cell, MapCell]) -> Dict[Tuple[Any, ...], List[Cell]]:
+        idx: Dict[Tuple[Any, ...], List[Cell]] = defaultdict(list)
+        for (x, y), c in seg.items():
+            if c.kind == OCCUPIED:
+                continue
+            c1, c2, c3 = seg.get((x + 1, y)), seg.get((x, y + 1)), seg.get((x + 1, y + 1))
+            if c1 is not None and c2 is not None and c3 is not None:
+                if c1.kind != OCCUPIED and c2.kind != OCCUPIED and c3.kind != OCCUPIED:
+                    idx[(c.hashes, c1.hashes, c2.hashes, c3.hashes)].append((x, y))
+        return idx
+
+    @staticmethod
+    def _collect_offset_votes(local_hashes: Dict[Cell, Tuple[Optional[str], ...]],
+                              index: Dict[Tuple[Optional[str], ...], List[Cell]],
+                              block_index: Dict[Tuple[Any, ...], List[Cell]]) -> Counter:
+        votes: Counter = Counter()
+        for (x, y), h in local_hashes.items():
+            places = index.get(h, ())
+            if len(places) <= RELOCALISE_MAX_FANOUT:
+                for p in places:
+                    votes[(p[0] - x, p[1] - y)] += 1
+            if (x + 1, y) in local_hashes and (x, y + 1) in local_hashes and (x + 1, y + 1) in local_hashes:
+                sig = (h, local_hashes[(x + 1, y)], local_hashes[(x, y + 1)], local_hashes[(x + 1, y + 1)])
+                b_places = block_index.get(sig, ())
+                if len(b_places) <= RELOCALISE_MAX_FANOUT:
+                    for p in b_places:
+                        votes[(p[0] - x, p[1] - y)] += 2
+        if not votes:
+            b_counts = [
+                len(block_index[sig]) for (x, y), h in local_hashes.items()
+                if (x + 1, y) in local_hashes and (x, y + 1) in local_hashes and (x + 1, y + 1) in local_hashes
+                and (sig := (h, local_hashes[(x + 1, y)], local_hashes[(x, y + 1)],
+                             local_hashes[(x + 1, y + 1)])) in block_index
+            ]
+            if b_counts:
+                cap = min(b_counts) * 2
+                for (x, y), h in local_hashes.items():
+                    if (x + 1, y) in local_hashes and (x, y + 1) in local_hashes and (x + 1, y + 1) in local_hashes:
+                        sig = (h, local_hashes[(x + 1, y)], local_hashes[(x, y + 1)], local_hashes[(x + 1, y + 1)])
+                        b_places = block_index.get(sig, ())
+                        if len(b_places) <= cap:
+                            for p in b_places:
+                                votes[(p[0] - x, p[1] - y)] += 1
+        return votes
+
+    def _transient_offset(self, si: int, target_seg: int, fallback_pos: Cell) -> Cell:
+        from .render import render_segment
+
+        seg_si = self.segments[si]
+        seg_dst = self.segments[target_seg]
+        if not seg_si or not seg_dst:
+            return fallback_pos
+        canvas = render_segment(self, si, trail=False, doors=False)
+        if canvas is None:
+            return fallback_pos
+        x0_si, y1_si = min(g[0] for g in seg_si), max(g[1] for g in seg_si)
+        a_si = canvas[:, :, 0]
+        index: Dict[Tuple[Optional[str], ...], List[Cell]] = defaultdict(list)
+        for g, mc in seg_dst.items():
+            if mc.kind != OCCUPIED:
+                index[mc.hashes].append(g)
+        best = (0, fallback_pos)
+        for dy in (0, 4, 8, 12):
+            for dx in (0, 4, 8, 12):
+                cells: Dict[Cell, Tuple[Optional[str], ...]] = {}
+                for r in range((a_si.shape[0] - dy) // GRID_SKIP):
+                    for c in range((a_si.shape[1] - dx) // GRID_SKIP):
+                        piece = a_si[dy + r * GRID_SKIP:dy + (r + 1) * GRID_SKIP,
+                                     dx + c * GRID_SKIP:dx + (c + 1) * GRID_SKIP]
+                        if piece.min() == piece.max():
+                            continue
+                        cells[(x0_si + c, y1_si - r)] = self._cell_hashes(split_quarters(piece))
+                if not cells:
+                    continue
+                votes: Counter = Counter()
+                for (gx, gy), h in cells.items():
+                    for p in index.get(h, ())[:50]:
+                        votes[(p[0] - gx, p[1] - gy)] += 1
+                for off, _ in votes.most_common(RELOCALISE_CANDIDATES):
+                    m = sum(1 for (gx, gy), h in cells.items()
+                            if (gx + off[0], gy + off[1]) in seg_dst
+                            and seg_dst[(gx + off[0], gy + off[1])].hashes == h)
+                    if m > best[0] and m >= 15:
+                        best = (m, off)
+        return best[1]
+
+    def prune_transient_segments(self) -> int:
+        changed = 0
+        for si in range(len(self.segments)):
+            if si == self.segment or si in self.merged_into or not self.segments[si]:
+                continue
+            if self.info(si).name is not None:
+                continue
+            if sum(self.visits[si].values()) >= MIN_NAME_OBSERVATIONS:
+                continue
+            si_steps = [t for t, s, _ in self.trail if s == si]
+            if not si_steps:
+                continue
+            t_min, t_max = min(si_steps), max(si_steps)
+            before = [(t, s, p) for t, s, p in self.trail if s != si and t < t_min]
+            after = [(t, s, p) for t, s, p in self.trail if s != si and t > t_max]
+            target_sp = (after[0][1], after[0][2]) if after else ((before[-1][1], before[-1][2]) if before else None)
+            if target_sp is None:
+                continue
+            target_seg, fallback_pos = self.resolve(*target_sp)
+            if before and after and self.resolve(before[-1][1], before[-1][2])[0] == target_seg:
+                offset = fallback_pos
+            else:
+                offset = self._transient_offset(si, target_seg, fallback_pos)
+            dx, dy = offset
+
+            def moved(s: int, p: Optional[Cell]) -> Tuple[int, Optional[Cell]]:
+                if s != si or p is None:
+                    return s, p
+                return target_seg, (p[0] + dx, p[1] + dy)
+
+            new_warps: List[Tuple[int, int, Cell, int, Cell]] = []
+            new_moves: List[Optional[str]] = []
+            for (t, a, pa, b, pb), m in zip(self.warps, self.warp_moves):
+                ra, rpa = moved(a, pa)
+                rb, rpb = moved(b, pb)
+                assert rpa is not None and rpb is not None
+                if ra == rb and self._same_door(ra, rpa, rpb):
+                    continue
+                new_warps.append((t, ra, rpa, rb, rpb))
+                new_moves.append(m)
+            self.warps, self.warp_moves = new_warps, new_moves
+            self.trail = [(t, target_seg, (p[0] + dx, p[1] + dy)) if s == si else (t, s, p)
+                          for t, s, p in self.trail]
+            self.naming_queue = [e for e in self.naming_queue if e.get("segment") != si]
+            self.segment_info.pop(si, None)
+            self.merged_into[si] = (target_seg, (dx, dy))
+            self.segments[si] = {}
+            self.visits[si] = Counter()
+            self.stats["transient_pruned"] += 1
+            changed += 1
+        return changed
+
     def overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
         def content(seg):
             return {g: c for g, c in seg.items()
@@ -592,12 +767,9 @@ class GlobalMap(StrategistArtifact):
         index: Dict[Tuple[Optional[str], ...], List[Cell]] = defaultdict(list)
         for g, c in dst.items():
             index[c.hashes].append(g)
-        votes: Counter = Counter()
-        for g, c in src.items():
-            places = index.get(c.hashes, ())
-            if len(places) <= RELOCALISE_MAX_FANOUT:
-                for p in places:
-                    votes[(p[0] - g[0], p[1] - g[1])] += 1
+        block_index = self._block_index(dst)
+        src_hashes = {g: c.hashes for g, c in src.items()}
+        votes = self._collect_offset_votes(src_hashes, index, block_index)
         if not votes:
             return None
         def agreement(offset: Cell) -> Tuple[int, int]:
@@ -605,14 +777,18 @@ class GlobalMap(StrategistArtifact):
                       if (g[0] + offset[0], g[1] + offset[1]) in dst]
             return sum(1 for a, b in shared if a.hashes == b.hashes), len(shared)
 
-        (dx, dy), _ = votes.most_common(1)[0]
-        matches, shared = agreement((dx, dy))
-        rivals = [(n, o) for o, n in votes.items() if max(abs(o[0] - dx), abs(o[1] - dy)) > 1]
+        ranked = sorted(
+            ((agreement(o), v, o) for o, v in votes.most_common(RELOCALISE_CANDIDATES)),
+            key=lambda item: (item[0][0], item[0][0] / max(1, item[0][1]), item[1]),
+            reverse=True,
+        )
+        (matches, shared), best_votes, (dx, dy) = ranked[0]
+        rivals = [(n, o) for o, n in votes.items() if max(abs(o[0] - dx), abs(o[1] - dy)) > 2]
         rival, rival_offset = max(rivals, default=(0, None))
         rival_matches, rival_shared = agreement(rival_offset) if rival_offset is not None else (0, 0)
         return {"offset": (dx, dy), "matches": matches, "shared": shared,
                 "agreement": matches / shared if shared else 0.0,
-                "votes": votes[(dx, dy)], "rival": rival,
+                "votes": best_votes, "rival": rival,
                 "rival_agreement": rival_matches / rival_shared if rival_shared else 0.0}
 
     def _judged_same(self, source: int, target: int, overlap: Dict[str, Any],
@@ -633,6 +809,7 @@ class GlobalMap(StrategistArtifact):
 
     def consolidate(self, judge: Optional[Callable[[int, int, Dict[str, Any]], Optional[bool]]] = None
                     ) -> List[Dict[str, Any]]:
+        self.prune_transient_segments()
         merged = []
         while True:
             live = [si for si, seg in enumerate(self.segments) if seg and si not in self.merged_into]
@@ -679,18 +856,19 @@ class GlobalMap(StrategistArtifact):
             for g, c in seg.items():
                 if c.kind != OCCUPIED:
                     index[c.hashes].append(g)
-            votes: Counter = Counter()
-            for (x, y), h in local.items():
-                for g in index.get(h, ())[:RELOCALISE_MAX_FANOUT]:
-                    votes[(g[0] - x, g[1] - y)] += 1
+            block_index = self._block_index(seg)
+            votes = self._collect_offset_votes(local, index, block_index)
             if not votes:
                 continue
             ranked = sorted((self._screen_agreement(seg, local, o), o)
                             for o, _ in votes.most_common(RELOCALISE_CANDIDATES))[::-1]
             close = [(o, overlap) for (m, overlap), o in ranked if m >= RELOCALISE_CLOSE_CALL * ranked[0][0][0]]
             if len(close) > 1:
-                distinctive = sorted(((self._distinctive_matches(seg, index, local, o), o, overlap)
-                                      for o, overlap in close), reverse=True)
+                distinctive = sorted(
+                    ((self._distinctive_matches(seg, index, local, o, block_index), o, overlap)
+                     for o, overlap in close),
+                    reverse=True,
+                )
                 if distinctive[0][0] - distinctive[1][0] < DISTINCTIVE_LEAD:
                     continue
                 close = [(distinctive[0][1], distinctive[0][2])]
@@ -715,14 +893,38 @@ class GlobalMap(StrategistArtifact):
 
     @staticmethod
     def _distinctive_matches(seg: Dict[Cell, MapCell], index: Dict[Tuple[Optional[str], ...], List[Cell]],
-                             local: Dict[Cell, Tuple[Optional[str], ...]], offset: Cell) -> int:
-        return sum(1 for (x, y), h in local.items()
-                   if len(index.get(h, ())) <= DISTINCTIVE_MAX_COPIES
-                   and (c := seg.get((offset[0] + x, offset[1] + y))) is not None and c.hashes == h)
+                             local: Dict[Cell, Tuple[Optional[str], ...]], offset: Cell,
+                             block_index: Optional[Dict[Tuple[Any, ...], List[Cell]]] = None) -> int:
+        single = sum(1 for (x, y), h in local.items()
+                     if len(index.get(h, ())) <= DISTINCTIVE_MAX_COPIES
+                     and (c := seg.get((offset[0] + x, offset[1] + y))) is not None and c.hashes == h)
+        if block_index is None:
+            return single
+        blocks = sum(
+            1 for (x, y), h in local.items()
+            if (x + 1, y) in local and (x, y + 1) in local and (x + 1, y + 1) in local
+            and len(block_index.get((h, local[(x + 1, y)], local[(x, y + 1)], local[(x + 1, y + 1)]), ()))
+            <= DISTINCTIVE_MAX_COPIES
+            and all((c := seg.get((offset[0] + x + dx, offset[1] + y + dy))) is not None
+                    and c.hashes == local[(x + dx, y + dy)]
+                    for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)))
+        )
+        return single + blocks
+
+    def _same_door(self, segment: int, p: Cell, q: Cell) -> bool:
+        if max(abs(p[0] - q[0]), abs(p[1] - q[1])) <= DOOR_REACH:
+            return True
+        if 0 <= segment < len(self.segments) and self.segments[segment]:
+            dp, dq = self._door_at(segment, p), self._door_at(segment, q)
+            return max(abs(dp[0] - dq[0]), abs(dp[1] - dq[1])) <= DOOR_REACH
+        return False
 
     @staticmethod
-    def door_conflicts(warps: List[Tuple[int, int, Cell, int, Cell]], moves: List[Optional[str]]) -> int:
-        def near(p: Cell, q: Cell) -> bool:
+    def door_conflicts(warps: List[Tuple[int, int, Cell, int, Cell]], moves: List[Optional[str]],
+                       same_door: Optional[Callable[[int, Cell, Cell], bool]] = None) -> int:
+        def near(s: int, p: Cell, q: Cell) -> bool:
+            if same_door is not None:
+                return same_door(s, p, q)
             return max(abs(p[0] - q[0]), abs(p[1] - q[1])) <= DOOR_REACH
 
         conflicts, ends = 0, []
@@ -730,11 +932,11 @@ class GlobalMap(StrategistArtifact):
             if a == b and move is not None:
                 conflicts += 1
                 continue
-            if a == b and near(pa, pb):
+            if a == b and near(a, pa, pb):
                 continue
             ends += [(a, pa, b, pb), (b, pb, a, pa)]
         for i, (s, p, other, q) in enumerate(ends):
-            conflicts += any(s == s2 and near(p, p2) and (other != other2 or not near(q, q2))
+            conflicts += any(s == s2 and near(s, p, p2) and (other != other2 or not near(other, q, q2))
                              for s2, p2, other2, q2 in ends[i + 1:])
         return conflicts
 
@@ -743,17 +945,19 @@ class GlobalMap(StrategistArtifact):
             return (target, (p[0] + offset[0], p[1] + offset[1])) if si == source else (si, p)
 
         after = [(t, *moved(a, pa), *moved(b, pb)) for t, a, pa, b, pb in self.warps]
-        return self.door_conflicts(after, self.warp_moves) > self.door_conflicts(self.warps, self.warp_moves)
+        return (self.door_conflicts(after, self.warp_moves, self._same_door)
+                > self.door_conflicts(self.warps, self.warp_moves, self._same_door))
 
     def arrival_breaks_doors(self, segment: int, pos: Cell) -> bool:
         if not self.faded:
             return False
         move = self.fade_direction if self.fade_direction in DIRECTIONS else None
         after = self.warps + [(self.step, self.segment, self.pos, segment, pos)]
-        return (self.door_conflicts(after, self.warp_moves + [move])
-                > self.door_conflicts(self.warps, self.warp_moves))
+        return (self.door_conflicts(after, self.warp_moves + [move], self._same_door)
+                > self.door_conflicts(self.warps, self.warp_moves, self._same_door))
 
     def refresh(self, tile_lookup: Dict[str, Any]) -> int:
+        self.prune_transient_segments()
         changed = 0
         for si, seg in enumerate(self.segments):
             quarter_tags: Dict[Cell, Dict[str, str]] = {}

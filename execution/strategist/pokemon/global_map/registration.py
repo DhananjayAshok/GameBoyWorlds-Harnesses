@@ -29,11 +29,12 @@ PLAYER_BOX = (PLAYER_ROW * GRID_SKIP - 6, (PLAYER_ROW + 1) * GRID_SKIP,
 # Screen-space unit of each direction, in pixels per cell: (+x right, +y DOWN).
 SCREEN_UNIT: Dict[str, Cell] = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
 # A screen that scrolled with no move pressed is searched this many cells each way.
-SCRIPTED_MAX_STEPS = 4
+SCRIPTED_MAX_STEPS = 6
 # A cell whose pixels are all at or below this level is black.
 BLACK_LEVEL = 40
 # A screen is off the 16px grid only if its best alignment beats the next best by this much.
 GRID_MARGIN = 0.02
+GRID_RELATIVE_MARGIN = 0.15
 
 
 def _screen(frame: np.ndarray) -> np.ndarray:
@@ -50,7 +51,8 @@ def _uniqueness(a: np.ndarray, dx: int, dy: int, size: int) -> float:
 def grid_offset(frame: np.ndarray) -> Optional[Cell]:
     a = _screen(frame)
     fine = sorted((_uniqueness(a, dx, dy, 8), (dx, dy)) for dy in range(0, 8, 2) for dx in range(0, 8, 2))
-    if fine[1][0] - fine[0][0] < GRID_MARGIN:
+    if (fine[1][0] - fine[0][0] < GRID_MARGIN
+            and fine[1][0] - fine[0][0] < GRID_RELATIVE_MARGIN * max(fine[0][0], 1e-6)):
         return None
     bx, by = fine[0][1]
     coarse = sorted((_uniqueness(a, dx, dy, GRID_SKIP), (dx, dy)) for dx in (bx, bx + 8) for dy in (by, by + 8))
