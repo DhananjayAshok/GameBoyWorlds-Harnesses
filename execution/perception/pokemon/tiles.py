@@ -61,6 +61,9 @@ def cell_part(quarters) -> str:
     return f" ({', '.join(names)} quarter{'s' if len(names) > 1 else ''})"
 
 
+SIGN_OBJECT_TAGS = ("sign", "interactable object", "item")
+
+
 def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple[int, int], str]] = None) -> str:
     by_cell: Dict[Tuple[int, int], Dict[str, Dict[str, Any]]] = {}
     for (x, y, quarter), tile in identified.items():
@@ -71,6 +74,18 @@ def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple
         if tile.description and tile.description not in entry["descriptions"]:
             entry["descriptions"].append(tile.description)
     for cell, label in (people or {}).items():
+        if isinstance(label, str) and label.startswith("sign:"):
+            sign_note = label[len("sign:"):].strip()
+            cell_entries = by_cell.setdefault(cell, {})
+            matched = False
+            for tag in SIGN_OBJECT_TAGS:
+                if tag in cell_entries:
+                    if sign_note not in cell_entries[tag]["descriptions"]:
+                        cell_entries[tag]["descriptions"].append(sign_note)
+                    matched = True
+            if not matched:
+                cell_entries["sign"] = {"quarters": set(QUARTER_OFFSETS), "descriptions": [sign_note]}
+            continue
         by_cell.setdefault(cell, {})["npc"] = {"quarters": set(QUARTER_OFFSETS), "descriptions": [label]}
         above = by_cell.get((cell[0], cell[1] + 1), {})
         if ((cell[0], cell[1] + 1) not in people and "npc" in above

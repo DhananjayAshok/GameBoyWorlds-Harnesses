@@ -140,6 +140,7 @@ class Sign:
     square: Cell
     conversations: List[str] = field(default_factory=list)
     text: str = ""
+    episode: int = 0
 
 
 @dataclass
@@ -206,7 +207,8 @@ class NPCRegistry(StrategistArtifact):
     """Every person the player has seen in one run."""
 
     _TRANSIENT = ("_gmap", "_episode", "_tracks", "_last_people", "_last_people_at", "_stack", "_stack_ref",
-                  "_look_merges", "_weak", "_facing", "_open", "_frame", "_free_frame", "_live", "_a_step", "_resume")
+                  "_look_merges", "_weak", "_facing", "_open", "_frame", "_free_frame", "_free_identified",
+                  "_live", "_a_step", "_a_facing", "_resume")
 
     def __init__(self, game: str, run_name: str) -> None:
         self.game = game
@@ -226,6 +228,8 @@ class NPCRegistry(StrategistArtifact):
         self.maybe_squares: Dict[Tuple[int, Cell], MaybeSquare] = {}
         # The conversation the last episode ended in the middle of; the next one may open in its text box.
         self.interrupted: Optional[str] = None
+        self.pending_press: Optional[Tuple[int, Optional[str], int, Cell]] = None
+        self.last_facing: Optional[str] = None
         self.version = 1
         self._reset_transient()
 
@@ -243,8 +247,10 @@ class NPCRegistry(StrategistArtifact):
         self._weak: Dict[Tuple[int, Cell], Set[int]] = {}
         self._frame: Optional[np.ndarray] = None
         self._free_frame: Optional[np.ndarray] = None
+        self._free_identified: Dict[Any, Any] = {}
         self._live: Optional[Callable[[str], Callable[..., Any]]] = None
         self._a_step: Optional[int] = None
+        self._a_facing: Optional[str] = None
         self._resume: Optional[str] = None
 
     def __setstate__(self, state: dict) -> None:
@@ -253,7 +259,8 @@ class NPCRegistry(StrategistArtifact):
         for name, default in (("look_aliases", dict), ("covisible", set), ("unattributed", list),
                               ("signs", dict), ("conversations", dict), ("stats", Counter),
                               ("next_ids", Counter), ("version", lambda: 1), ("tagged_squares", dict),
-                              ("maybe_squares", dict), ("interrupted", lambda: None)):
+                              ("maybe_squares", dict), ("interrupted", lambda: None),
+                              ("pending_press", lambda: None), ("last_facing", lambda: None)):
             self.__dict__.setdefault(name, default())
 
     @property
@@ -323,13 +330,22 @@ class NPCRegistry(StrategistArtifact):
         self._gmap, self._episode = gmap, episode
         self._tracks = {}
         self._forget_screen()
-        self._facing, self._open = None, None
+        self._facing, self._open = self.last_facing, None
+        self._a_step, self._a_facing = None, None
+        if self.pending_press is not None:
+            p_step, p_facing, p_seg, p_pos = self.pending_press
+            if gmap.resolve(gmap.segment, gmap.pos) == gmap.resolve(p_seg, p_pos):
+                self._a_step, self._a_facing = p_step, p_facing
+                if p_facing is not None:
+                    self._facing = p_facing
+        self.pending_press = None
         self._resume, self.interrupted = self.interrupted, None
 
     def on_opening_screen(self, frame: np.ndarray, identified: Dict[Any, Any], free: bool) -> None:
         if free and self._gmap is not None:
             self._process(frame, identified, "start", 0)
             self._free_frame = frame
+            self._free_identified = dict(identified or {})
 
     def on_env_step(self, ev: StepEvent) -> None:
         if self._gmap is None:
@@ -346,6 +362,7 @@ class NPCRegistry(StrategistArtifact):
             return
         self._process(ev.frame, ev.identified, ev.status, ev.max_steps)
         self._free_frame = ev.frame
+        self._free_identified = dict(ev.identified or {})
 
     def _view_stack(self) -> Tuple[np.ndarray, List[Tuple[str, int]]]:
         if self._stack is None:
@@ -763,12 +780,31 @@ class NPCRegistry(StrategistArtifact):
 
     @staticmethod
     def _is_a_press(action: Any, kwargs: Dict[str, Any]) -> bool:
-        from execution.game_api import InteractAction, LowLevelAction, LowLevelActions
+        from execution.game_api import InteractAction, LowLevelAction, LowLevelActions, PassDialogueAction
 
-        if isinstance(action, type) and issubclass(action, InteractAction):
+        if isinstance(action, type) and issubclass(action, (InteractAction, PassDialogueAction)):
             return True
         return (isinstance(action, type) and issubclass(action, LowLevelAction)
                 and kwargs.get("low_level_action") == LowLevelActions.PRESS_BUTTON_A)
+
+    @staticmethod
+    def _step_crops(ev: StepEvent) -> List[np.ndarray]:
+        new: List[np.ndarray] = []
+        if not ev.info:
+            return new
+        for region in (ev.info.get("ocr") or {}).get("transition_ocr_regions") or []:
+            stack = region.get("dialogue") if isinstance(region, dict) else None
+            if stack is not None and len(stack):
+                new.extend(np.asarray(c) for c in stack)
+        details = (ev.info.get("core") or {}).get("previous_action_details")
+        if isinstance(details, (tuple, list)) and len(details) >= 3 and isinstance(details[2], list):
+            for state in details[2]:
+                if not isinstance(state, dict):
+                    continue
+                stack = ((state.get("ocr") or {}).get("ocr_regions") or {}).get("dialogue")
+                if stack is not None and len(stack):
+                    new.extend(np.asarray(c) for c in stack)
+        return new
 
     def _conversation_step(self, ev: StepEvent) -> None:
         from execution.game_api import AgentState
@@ -776,22 +812,35 @@ class NPCRegistry(StrategistArtifact):
         state = ev.info.get("pokemon_core", {}).get("agent_state") if ev.info else None
         if self._resume is not None:
             self._continue_conversation(ev)
-        a_press = self._is_a_press(ev.action, ev.kwargs)
-        # The text box can open a step after the A press that called it: that press still counts.
-        pressed = a_press or (self._a_step is not None and self._a_step == self._gmap.step - 1)
-        self._a_step = self._gmap.step if a_press and ev.was_free and ev.free else None
-        if ev.was_free and ev.free:
-            if ev.direction is not None:
-                self._facing = ev.direction
-            elif ev.status in ("moved", "relocalised", "new_segment"):
-                self._facing = None
+        if ev.direction is not None and ev.was_free:
+            self._facing = ev.direction
         elif ev.status in ("relocalised", "new_segment"):
             self._facing = None
-        # Only text opens a conversation: a menu or a battle straight from free roam is not one.
-        if self._open is None and ev.was_free and state == AgentState.IN_DIALOGUE:
+        elif ev.status == "moved" and ev.direction is None:
+            self._facing = None
+        self.last_facing = self._facing
+
+        a_press = self._is_a_press(ev.action, ev.kwargs)
+        # A 1-2 tick delayed text box can open after the A press and up to 2 settle WaitActions.
+        pressed = a_press or (self._a_step is not None and 0 < self._gmap.step - self._a_step <= 3)
+        if a_press and ev.was_free:
+            self._a_step = self._gmap.step
+            self._a_facing = self._facing
+        elif not ev.free or (self._a_step is not None and self._gmap.step - self._a_step > 3) or (
+                ev.was_free and ev.free and ev.direction is not None):
+            self._a_step = None
+            self._a_facing = None
+
+        crops = self._step_crops(ev)
+        # Text opens a conversation: either entering IN_DIALOGUE from free roam, or a single-step dialogue with crops.
+        if self._open is None and ev.was_free and (
+                state == AgentState.IN_DIALOGUE
+                or (crops and state in (AgentState.FREE_ROAM, AgentState.IN_MENU))):
             self._open_conversation(ev, pressed)
+            self._a_step = None
+            self._a_facing = None
         if self._open is not None:
-            self._collect_crops(ev)
+            self._collect_crops(ev, crops)
             if state == AgentState.FREE_ROAM:
                 self._close_conversation("free_roam", True)
             elif state == AgentState.IN_BATTLE:
@@ -809,41 +858,56 @@ class NPCRegistry(StrategistArtifact):
         self._open = conv.id
         self.stats["conversations_continued"] += 1
 
-    def _sign_at(self, target: Cell) -> Optional[Cell]:
+    def _sign_at(self, target: Cell, ev: Optional[StepEvent] = None) -> Optional[Cell]:
         g = self._gmap
         square = (g.pos[0] + target[0], g.pos[1] + target[1])
         cell = g.segments[g.segment].get(square)
-        return square if cell is not None and set(cell.tags) & SIGN_TAGS else None
+        if cell is not None and set(cell.tags) & SIGN_TAGS:
+            return square
+        for identified in ((ev.identified if ev is not None else None), self._free_identified):
+            if not identified:
+                continue
+            tags = {tile.tag for (x, y, _), tile in identified.items() if (x, y) == target}
+            if tags & SIGN_TAGS:
+                return square
+        return None
 
     def _open_conversation(self, ev: StepEvent, a_press: bool) -> None:
         g = self._gmap
         speaker: Optional[str] = None
+        extra_speakers: List[str] = []
         sign_square: Optional[Cell] = None
+        facing = self._a_facing or self._facing
         on_screen = self.on_screen(g)
         neighbours = [n for c, n in on_screen.items() if abs(c[0]) + abs(c[1]) == 1]
-        if a_press and self._facing is not None:
-            target = DIRECTIONS[self._facing]
+        if a_press and facing is not None:
+            target = DIRECTIONS[facing]
             speaker = on_screen.get(target)
             if speaker is None:
-                sign_square = self._sign_at(target)
+                sign_square = self._sign_at(target, ev)
         elif len(set(neighbours)) == 1:
             speaker = neighbours[0]
         how, confidence = "seen", "high"
         if speaker is None and sign_square is None:
-            if a_press and self._facing is not None:
+            if a_press and facing is not None:
                 # Only the square in front counts: an item or a sign beside a person is not that person.
-                speaker, how = self._remembered_at(DIRECTIONS[self._facing]), "remembered"
+                speaker, how = self._remembered_at(DIRECTIONS[facing]), "remembered"
             elif not a_press:
-                speaker, how, confidence = self._nearest_person(), "nearest", "low"
+                if len(set(neighbours)) > 1:
+                    distinct = list(dict.fromkeys(neighbours))
+                    speaker, extra_speakers = distinct[0], distinct[1:]
+                    how, confidence = "seen", "low"
+                else:
+                    speaker, how, confidence = self._nearest_person(), "nearest", "low"
             if speaker is not None:
                 # Memory of someone seen on several squares is weak, and gone once they roamed.
                 squares = self.squares_in(g, self.get(speaker), g.resolve(g.segment, g.pos)[0])
-                if _spread(squares) > 1:
+                if _spread(squares) > 1 and how != "seen":
                     speaker = None
                 elif len(squares) > 1:
                     confidence = "low"
-            elif a_press and self._facing is not None:
-                speaker = self._hidden_at(DIRECTIONS[self._facing])
+            elif a_press and facing is not None:
+                speaker = self._hidden_at(DIRECTIONS[facing])
                 if speaker is not None:
                     how, confidence = "hidden", "low"
         if speaker is None and sign_square is None:
@@ -855,13 +919,20 @@ class NPCRegistry(StrategistArtifact):
         if speaker is not None:
             npc = self.get(speaker)
             conv.npc = npc.id
-            npc.conversations.append(conv.id)
+            if conv.id not in npc.conversations:
+                npc.conversations.append(conv.id)
             seen = self.last_seen(g, npc)
             conv.target = seen[1] if seen else None
+            for extra_id in extra_speakers:
+                extra_npc = self.get(extra_id)
+                if conv.id not in extra_npc.conversations:
+                    extra_npc.conversations.append(conv.id)
         elif sign_square is not None:
             sign = self._sign_for(g.segment, sign_square)
             conv.sign = sign.id
-            sign.conversations.append(conv.id)
+            if conv.id not in sign.conversations:
+                sign.conversations.append(conv.id)
+            sign.episode = self._episode
         else:
             self.unattributed.append(conv.id)
         if self._free_frame is not None:
@@ -901,19 +972,15 @@ class NPCRegistry(StrategistArtifact):
         for sign in self.signs.values():
             if g.resolve(sign.segment, sign.square) == here:
                 return sign
-        sign = Sign(id=self._next("sign"), segment=segment, square=square)
+        sign = Sign(id=self._next("sign"), segment=segment, square=square, episode=self._episode)
         self.signs[sign.id] = sign
         return sign
 
-    def _collect_crops(self, ev: StepEvent) -> None:
+    def _collect_crops(self, ev: StepEvent, crops: Optional[List[np.ndarray]] = None) -> None:
         from execution.pokemon.executors import drop_prefix_crops
 
         conv = self.conversations[self._open]
-        new = []
-        for region in (ev.info.get("ocr") or {}).get("transition_ocr_regions") or []:
-            stack = region.get("dialogue") if isinstance(region, dict) else None
-            if stack is not None and len(stack):
-                new.extend(np.asarray(c) for c in stack)
+        new = self._step_crops(ev) if crops is None else crops
         if new:
             drop_prefix_crops(new, conv.crops)
 
@@ -937,6 +1004,57 @@ class NPCRegistry(StrategistArtifact):
     def attach_model(self, vlm_caller: Optional[Callable[[str], Callable[..., Any]]]) -> None:
         self._live = vlm_caller
 
+    def _attribute_by_text(self, conv: Conversation) -> None:
+        if self._gmap is None or conv.sign is not None:
+            return
+        gmap = self._gmap
+        conv_seg = gmap.resolve(conv.segment, conv.square)[0]
+        candidates = [npc for npc, _ in self.people_here(gmap)
+                      if self.last_seen(gmap, npc) and self.last_seen(gmap, npc)[0] == conv_seg]
+        if not candidates:
+            return
+        names_in_text: Set[str] = set()
+        if conv.speaker_name:
+            names_in_text.add(conv.speaker_name.strip().casefold())
+        for line in (conv.text or "").splitlines():
+            m = npc_model.TAG.match(line)
+            if m:
+                names_in_text.add(m.group(1).strip().casefold())
+        matched: List[NPC] = []
+        for tag_name in names_in_text:
+            if not tag_name or len(tag_name) < 2:
+                continue
+            for npc in candidates:
+                real = (npc.real_name or "").strip().casefold()
+                desc = (npc.description or "").casefold()
+                if (real and (real == tag_name or tag_name in real.split())) or (
+                        tag_name in desc.split() or f" {tag_name}" in desc or f"({tag_name})" in desc):
+                    if npc not in matched:
+                        matched.append(npc)
+        if not matched:
+            return
+        if conv.npc is None or (conv.how == "nearest" and conv.confidence == "low"
+                                and self.get(conv.npc) not in matched):
+            old_npc = self.get(conv.npc) if conv.npc in self.npcs else None
+            if old_npc is not None and conv.id in old_npc.conversations:
+                old_npc.conversations.remove(conv.id)
+            primary = matched[0]
+            conv.npc = primary.id
+            conv.how = "tag" if conv.how in ("none", "nearest") else conv.how
+            if conv.id in self.unattributed:
+                self.unattributed.remove(conv.id)
+        for npc in matched:
+            if conv.id not in npc.conversations:
+                npc.conversations.append(conv.id)
+
+    def _update_sign_text(self, conv: Conversation) -> None:
+        if conv.sign and conv.sign in self.signs:
+            sign = self.signs[conv.sign]
+            sign.episode = max(sign.episode, conv.episode)
+            text = (conv.summary or conv.text or "").strip()
+            if text:
+                sign.text = text
+
     def _summarise_now(self, conv: Conversation) -> None:
         if self._live is None or self._gmap is None:
             return
@@ -945,13 +1063,19 @@ class NPCRegistry(StrategistArtifact):
                 self.read_conversations(self._live("npc_ocr"), only=[conv])
             if conv.text.strip() and not conv.summarised:
                 self.run_summaries(self._live("npc_summary"), self._gmap, only=[conv])
-                if conv.npc in self.npcs:
-                    self.apply_real_names()
+                self.apply_real_names()
+            self._attribute_by_text(conv)
+            self._update_sign_text(conv)
         except Exception as e:
             log_warn(f"NPC registry: summarising {conv.id} on the spot failed ({type(e).__name__}: {e}); "
                      f"it is retried at the end of the episode")
 
     def finish_conversations(self) -> None:
+        if self._gmap is not None and self._a_step is not None and 0 <= self._gmap.step - self._a_step <= 2:
+            self.pending_press = (self._a_step, self._a_facing or self._facing, self._gmap.segment, self._gmap.pos)
+        else:
+            self.pending_press = None
+        self.last_facing = self._facing
         if self._open is not None and self._gmap is not None:
             self._close_conversation("episode_end", False)
 
@@ -979,6 +1103,8 @@ class NPCRegistry(StrategistArtifact):
             if not pieces and only is not None:
                 continue
             c.text, c.read = "\n".join(ordered_merge(pieces)), True
+            self._update_sign_text(c)
+            self._attribute_by_text(c)
             self.stats["conversations_read"] += 1
 
     def merge_npcs(self, keep: NPC, drop: NPC) -> None:
@@ -1049,11 +1175,17 @@ class NPCRegistry(StrategistArtifact):
                             ("hidden people", lambda: npc_model.run_confirm(self, vlm_caller("npc_confirm"), self.game,
                                                                             gmap, self._p["y_offset"])),
                             ("summaries", lambda: self.run_summaries(vlm_caller("npc_summary"), gmap)),
-                            ("real names", self.apply_real_names)):
+                            ("real names", self.apply_real_names),
+                            ("text attribution", self.attribute_conversations)):
             try:
                 step()
             except Exception as e:
                 log_warn(f"NPC registry: {label} skipped: {type(e).__name__}: {e}")
+
+    def attribute_conversations(self) -> None:
+        for conv in self.conversations.values():
+            self._update_sign_text(conv)
+            self._attribute_by_text(conv)
 
     def run_model(self, vlm_card: Callable[..., Any], vlm_judge: Callable[..., Any], gmap: GlobalMap) -> None:
         npc_model.run_model(self, vlm_card, vlm_judge, self.game, gmap)
@@ -1061,6 +1193,9 @@ class NPCRegistry(StrategistArtifact):
     def run_summaries(self, vlm_call: Callable[..., Any], gmap: GlobalMap,
                       only: Optional[List[Conversation]] = None) -> None:
         npc_model.run_summaries(self, vlm_call, self.game, gmap, only=only)
+        for conv in (only if only is not None else self.conversations.values()):
+            self._update_sign_text(conv)
+            self._attribute_by_text(conv)
 
     @staticmethod
     def sighting_facing(look: Look, sighting: Sighting) -> Optional[str]:
@@ -1094,6 +1229,24 @@ class NPCRegistry(StrategistArtifact):
                 found.append((npc, seen[1]))
         return found
 
+    def signs_here(self, gmap: GlobalMap) -> List[Tuple[Sign, Cell]]:
+        found = []
+        here = gmap.resolve(gmap.segment, gmap.pos)[0]
+        for sign in self.signs.values():
+            seg, square = gmap.resolve(sign.segment, sign.square)
+            if seg == here and sign.conversations:
+                found.append((sign, square))
+        return found
+
+    def _sign_heard(self, sign: Sign) -> Tuple[int, str]:
+        convs = [self.conversations[c] for c in sign.conversations if c in self.conversations]
+        ep = max((c.episode for c in convs), default=sign.episode)
+        text = (sign.text or "").strip()
+        if not text and convs:
+            last = convs[-1]
+            text = (last.summary or last.text or "").strip()
+        return ep, text.replace("\n", " ")
+
     def when_seen(self, gmap: GlobalMap, npc: NPC, square: Cell) -> str:
         seen = self.last_seen(gmap, npc)
         if npc.id in self.on_screen(gmap).values():
@@ -1117,7 +1270,8 @@ class NPCRegistry(StrategistArtifact):
                 if self._episode - self.last_seen(gmap, npc)[2].episode <= STALE_EPISODES
                 and self.look_of(npc).kind_hint != "object"]
         maybe = [] if where == "away" else self.unconfirmed(gmap, gmap.resolve(gmap.segment, gmap.pos)[0])
-        if not here and not maybe:
+        signs = [] if where == "away" else self.signs_here(gmap)
+        if not here and not maybe and not signs:
             return ""
         px, py = gmap.pos
         here.sort(key=lambda r: abs(r[1][0] - px) + abs(r[1][1] - py))
@@ -1125,9 +1279,7 @@ class NPCRegistry(StrategistArtifact):
         for npc, square in here[:max_people]:
             dx, dy = square[0] - px, square[1] - py
             when = self.when_seen(gmap, npc, square)
-            talks = [self.conversations[c] for c in npc.conversations
-                     if c in self.conversations and (self.conversations[c].text or self.conversations[c].crops)
-                     and gmap.resolve(self.conversations[c].segment, self.conversations[c].square)[0] == gmap.segment]
+            talks = self._talks_in(gmap, npc, gmap.resolve(gmap.segment, gmap.pos)[0])
             if talks:
                 last = talks[-1]
                 heard = last.summary or last.text[:160].strip().replace("\n", " ")
@@ -1141,6 +1293,14 @@ class NPCRegistry(StrategistArtifact):
         if len(here) > max_people:
             lines.append(f"...and {len(here) - max_people} more.")
         lines += maybe_lines(gmap, maybe)
+        if signs:
+            signs.sort(key=lambda r: abs(r[1][0] - px) + abs(r[1][1] - py))
+            lines.append("Signs and objects already inspected in this area:")
+            for sign, square in signs[:max_people]:
+                dx, dy = square[0] - px, square[1] - py
+                ep, heard = self._sign_heard(sign)
+                said = f': "{heard[:120]}"' if heard else ""
+                lines.append(f"- at ({dx}, {dy}): already inspected (episode {ep}){said}.")
         note = WHERE_NOTES[where] + "\n" if where in WHERE_NOTES else ""
         block = ("PEOPLE YOU HAVE SEEN IN THIS AREA (positions are steps from you: x right, y up). The quoted names are "
                  "labels for this list (unless one is a real name the person gave): the player does not know the labels, "
@@ -1153,14 +1313,17 @@ class NPCRegistry(StrategistArtifact):
         found = set()
         for conversation_id in npc.conversations:
             c = self.conversations.get(conversation_id)
-            if c is not None and (c.text or c.crops):
+            if c is not None and (c.text or c.crops or c.trigger == "a_press" or c.complete):
                 found.add(gmap.resolve(c.segment, c.square)[0])
         return found
 
     def _talks_in(self, gmap: GlobalMap, npc: NPC, segment: int) -> List[Conversation]:
+        target_seg = gmap.resolve(segment, (0, 0))[0]
         return [self.conversations[c] for c in npc.conversations
-                if c in self.conversations and (self.conversations[c].text or self.conversations[c].crops)
-                and gmap.resolve(self.conversations[c].segment, self.conversations[c].square)[0] == segment]
+                if c in self.conversations
+                and (self.conversations[c].text or self.conversations[c].crops
+                     or self.conversations[c].trigger == "a_press" or self.conversations[c].complete)
+                and gmap.resolve(self.conversations[c].segment, self.conversations[c].square)[0] == target_seg]
 
     def screen_labels(self, gmap: GlobalMap) -> Dict[Cell, str]:
         # Keyed by square relative to the player.
@@ -1178,13 +1341,13 @@ class NPCRegistry(StrategistArtifact):
             npc = self.get(npc_id)
             if self.look_of(npc).kind_hint == "object":
                 continue
-            talks = self._talks_in(gmap, npc, gmap.segment)
+            talks = self._talks_in(gmap, npc, segment)
             if talks:
                 heard = (talks[-1].summary or talks[-1].text)[:50].strip().replace("\n", " ")
                 status = f'talked to here in episode {talks[-1].episode}' + (f': "{heard}"' if heard else "")
             else:
                 status = "not talked to here"
-                elsewhere = [seg for seg in self.talked_in(gmap, npc) if seg != gmap.segment]
+                elsewhere = [seg for seg in self.talked_in(gmap, npc) if seg != segment]
                 if elsewhere:
                     status += "; met before in another area"
             if cell in remembered:
@@ -1194,6 +1357,14 @@ class NPCRegistry(StrategistArtifact):
             name = (f'who gave the name "{npc.real_name}"' if npc.real_name
                     else f'labelled "{npc.name}" (the label is {LABEL_NOTE})')
             out[cell] = f'{kind} {name} ({status})'[:320]
+        for sign, square in self.signs_here(gmap):
+            cell = (square[0] - gmap.pos[0], square[1] - gmap.pos[1])
+            if cell in out:
+                continue
+            if LEFT_COL <= cell[0] <= LEFT_COL + 9 and TOP_ROW - 8 <= cell[1] <= TOP_ROW:
+                ep, heard = self._sign_heard(sign)
+                said = f': "{heard[:60]}"' if heard else ""
+                out[cell] = f"sign:already inspected in episode {ep}{said}"[:320]
         return out
 
     def map_people(self, gmap: GlobalMap, segment: int, upto_step: Optional[int] = None) -> List[PersonMark]:
