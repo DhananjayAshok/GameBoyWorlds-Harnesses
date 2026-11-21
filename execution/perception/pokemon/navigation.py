@@ -139,6 +139,36 @@ def parse_cell(text: Optional[str]) -> Optional[Cell]:
     return int(match.group(1)), int(match.group(2))
 
 
+def is_boundary_exit_direction(kinds: Dict[Cell, str], cell: Cell, direction: str) -> bool:
+    dx, dy = DIRECTIONS[direction]
+    cur = (cell[0] + dx, cell[1] + dy)
+    while in_bounds(cur):
+        if kinds.get(cur, BLOCKED) != BLOCKED:
+            return False
+        cur = (cur[0] + dx, cur[1] + dy)
+    return True
+
+
+def boundary_exit_direction(kinds: Dict[Cell, str], identified: Optional[Dict[Tuple[int, int, str], object]],
+                            cell: Cell, preferred: Optional[str] = None) -> Optional[str]:
+    if identified is None:
+        return None
+    tags = {
+        identified[(cell[0], cell[1], q)].tag
+        for q in QUARTERS
+        if (cell[0], cell[1], q) in identified and hasattr(identified[(cell[0], cell[1], q)], "tag")
+    }
+    if "entrance" not in tags:
+        return None
+    order = ("down", "up", "left", "right")
+    if preferred in DIRECTIONS:
+        order = (preferred,) + tuple(d for d in order if d != preferred)
+    for direction in order:
+        if is_boundary_exit_direction(kinds, cell, direction):
+            return direction
+    return None
+
+
 def verbalize_edges(kinds: Dict[Cell, str]) -> str:
     lines = []
     for direction in DIRECTIONS:

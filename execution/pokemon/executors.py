@@ -7,8 +7,9 @@ from execution.game_api import (AgentState, BattleMenuAction, InteractAction, Me
 
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.navigation import (DIRECTIONS, WALKABLE, approach_cells,
-                                                     compress_path, edge_cells, in_bounds,
-                                                     parse_cell, shortest_path, verbalize_edges)
+                                                     boundary_exit_direction, compress_path, edge_cells,
+                                                     in_bounds, is_boundary_exit_direction, parse_cell,
+                                                     shortest_path, verbalize_edges)
 from execution.pokemon.executor_actions import CheckInteractionAction
 from execution.report import EnvironmentStepRecord
 from utils import log_error, ocr, parse_int, parse_key_value, parse_yes_no
@@ -197,13 +198,16 @@ class GridMoveExecutor(PolicyExecutor):
     MAX_NEW_TOKENS = 4000
 
     def __init__(self, env, task, max_steps: int = 10, screen_tiles: Optional[str] = None,
-                 cell_kinds: Optional[Dict[Tuple[int, int], str]] = None, **kwargs):
+                 cell_kinds: Optional[Dict[Tuple[int, int], str]] = None, identified: Optional[ Any] = None, **kwargs):
         self.screen_tiles = screen_tiles
         self.cell_kinds = cell_kinds
+        self.identified = identified
         self.target_cell: Optional[Tuple[int, int]] = None
         self.plan: Optional[List[Tuple[str, int, str]]] = None
         self._n_moves = 0
-        super().__init__(env, task, max_steps, screen_tiles=screen_tiles, cell_kinds=cell_kinds, **kwargs)
+        self._steps_taken = 0
+        super().__init__(env, task, max_steps, screen_tiles=screen_tiles, cell_kinds=cell_kinds,
+                         identified=identified, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
         self.report.termination_reason = reason
@@ -239,6 +243,7 @@ class GridMoveExecutor(PolicyExecutor):
                 return self._fail(MOVE_TRUNCATED, "truncated")
             action_return = (record.transition_states[-1]["core"].get("action_return") or {}) if record.transition_states else {}
             taken = action_return.get("n_steps_taken", 0)
+            self._steps_taken += taken
             if record.action_success == 2:
                 return self._fail(MOVE_INTERRUPTED, "move_interrupted",
                                   f"Left free roam after {taken} steps {direction}: "
@@ -310,7 +315,9 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
         self.target_cell = target
         if target == (0, 0):
             return MOVE_OK
+        exit_dir = None
         if self.cell_kinds.get(target) == WALKABLE:
+            exit_dir = boundary_exit_direction(self.cell_kinds, self.identified, target)
             goals = {target: None}
         else:
             goals = approach_cells(self.cell_kinds, target)
@@ -319,6 +326,10 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
         code = self._walk(goals)
         if code is not None:
             return code
+        if exit_dir is not None and self._get_state()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM:
+            exit_code = self._step(exit_dir, 1)
+            if exit_code is not None and exit_code != MOVE_BLOCKED:
+                return exit_code
         self.report.termination_reason = "arrived"
         self.report.notes = f"Moved to the target at {target}"
         return MOVE_OK
@@ -358,6 +369,16 @@ Location: <(x, y) or Not Found>
         direction_aliases = {"north": "up", "south": "down", "west": "left", "east": "right"}
         direction = direction_aliases.get(direction, direction)
         if "not found" in location.lower():
+            if direction in DIRECTIONS and not edge_cells(self.cell_kinds, direction):
+                if is_boundary_exit_direction(self.cell_kinds, (0, 0), direction):
+                    self._begin_scripted(f"step {direction} at the boundary")
+                    step_code = self._step(direction, 1)
+                    if step_code is None:
+                        self.report.termination_reason = "left_screen"
+                        self.report.notes = f"Stepped {direction} across the boundary"
+                        return MOVE_OK
+                    if step_code != MOVE_BLOCKED:
+                        return step_code
             return self._fail(MOVE_TARGET_NOT_FOUND, "edge_not_found", parse_key_value(output, "Reasoning"))
         target = parse_cell(location)
         if direction not in DIRECTIONS:
@@ -371,9 +392,18 @@ Location: <(x, y) or Not Found>
         self.target_cell = target
         code = self._walk({target: None})
         if code is not None:
+            if code == MOVE_BLOCKED and self._steps_taken > 0:
+                self.report.termination_reason = "left_screen"
+                self.report.notes = (f"Walked {self._steps_taken} step(s) towards {target} "
+                                     f"before reaching an obstacle or boundary")
+                return MOVE_OK
             return code
         code = self._step(direction, 1)
         if code is not None:
+            if code == MOVE_BLOCKED and self._steps_taken > 0:
+                self.report.termination_reason = "left_screen"
+                self.report.notes = f"Walked to {target} at the {direction} boundary"
+                return MOVE_OK
             return code
         self.report.termination_reason = "left_screen"
         self.report.notes = f"Walked to {target} and stepped off the screen {direction}"

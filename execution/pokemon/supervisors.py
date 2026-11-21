@@ -4,7 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from execution.game_api import AgentState
 
 from execution.executors import Executor
-from execution.perception.pokemon.navigation import cell_kinds
+from execution.perception.pokemon.navigation import cell_kinds, verbalize_edges
 from execution.perception.pokemon.tiles import TileRecognizer, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
                                          InteractionExecutor, MenuExecutor,
@@ -130,7 +130,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _perceive(self, frame) -> str:
         self._tile_recognizer.record_tiles(frame, self._episode_number)
         self._identified = self._tile_recognizer.identify_tiles(frame)
-        self._screen_tiles = verbalize_tiles(self._identified, self._people_now())
+        kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None))
+        self._screen_tiles = (verbalize_tiles(self._identified, self._people_now())
+                              + "\nWalkable cells on each edge of the screen:\n"
+                              + verbalize_edges(kinds))
         return self._screen_tiles
 
     def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
@@ -275,7 +278,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
         after_block = ""
         if report.final_state["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM:
             self._tile_recognizer.record_tiles(after, self._episode_number)
-            after_tiles = verbalize_tiles(self._tile_recognizer.identify_tiles(after), self._people_now())
+            after_identified = self._tile_recognizer.identify_tiles(after)
+            after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None))
+            after_tiles = (verbalize_tiles(after_identified, self._people_now())
+                           + "\nWalkable cells on each edge of the screen:\n"
+                           + verbalize_edges(after_kinds))
             after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", after_tiles)
         text = result.get("dialogue") or ""
         text_block = PLAYTHROUGH_TEXT_BLOCK.replace("[TEXT]", text) if text.strip() else ""
@@ -387,7 +394,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _move(self, tag: str, task: str) -> Any:
         return self.call_executor(tag, task, screen_tiles=self._screen_tiles,
-                                  cell_kinds=cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None)))
+                                  cell_kinds=cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None)),
+                                  identified=self._identified)
 
     def _handle_interruption(self) -> Tuple[str, Dict[str, Any]]:
         frame = self._current_frame()

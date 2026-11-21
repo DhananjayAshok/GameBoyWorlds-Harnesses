@@ -1,5 +1,5 @@
-PRIMITIVES = """1. MoveTo(description): walk to an object or entity that is visible on the screen, e.g. MoveTo(wooden signpost at (2, -4)).
-2. MoveOff(direction description): walk off the edge of the screen in a direction, e.g. MoveOff(up, through the gap in the ledge) or MoveOff(left).
+PRIMITIVES = """1. MoveTo(description): walk to an object, entity, entrance, staircase or exit mat that is visible on the screen, e.g. MoveTo(wooden signpost at (2, -4)) or MoveTo(exit mat at (-4, -4)).
+2. MoveOff(direction description): walk to a walkable cell on the edge of the screen and step off it in that direction, e.g. MoveOff(up, through the gap in the ledge) or MoveOff(left). Only use MoveOff when that edge of the screen has walkable cells listed; never use MoveOff towards a wall or boundary where that edge is listed as "none" (when already standing on an exit mat against a room boundary, use Free to press the direction that steps off the mat).
 3. Interact(target): interact with the object or entity directly in front of the player, e.g. to talk to someone or read a sign. Name the target, e.g. Interact(wooden signpost).
 4. Battle(optional instructions): fight the battle that is on screen, optionally with instructions, e.g. Battle() or Battle(use Thundershock and do not switch Pokemon).
 5. Menu(specific instruction): use the menu system to do something specific, e.g. Menu(use a Potion on Pikachu). Only works in the main menu opened with Start, or in a menu that is already open.
