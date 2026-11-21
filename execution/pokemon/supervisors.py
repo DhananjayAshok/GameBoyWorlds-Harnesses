@@ -1,7 +1,7 @@
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
-from execution.game_api import AgentState
+from execution.game_api import AgentState, WaitAction
 
 from execution.executors import Executor
 from execution.perception.pokemon.navigation import cell_kinds
@@ -538,6 +538,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         }
 
     def _evaluate(self) -> Optional[dict]:
+        if self._agent_state() == AgentState.FREE_ROAM and not self._env_done():
+            self._env.step_high_level_action(WaitAction)
         self._clear_pending_dialogue()
         frame = self._current_frame()
         self._perceive(frame)

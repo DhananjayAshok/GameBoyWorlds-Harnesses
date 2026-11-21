@@ -96,10 +96,15 @@ class InteractionExecutor(PolicyExecutor):
 
         interact = self._take_action(InteractAction)
         records.append(interact)
-        if interact.action_success != 1:
+        if (interact.action_success != 1
+                and self._get_state()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
+                and not (self._last_terminated or self._last_truncated)):
+            wait_record = self._take_action(WaitAction)
+            records.append(wait_record)
+        in_dialogue = self._get_state()["pokemon_core"]["agent_state"] == AgentState.IN_DIALOGUE
+        if interact.action_success != 1 and not in_dialogue:
             return self._fail("interaction_did_nothing")
 
-        in_dialogue = self._get_state()["pokemon_core"]["agent_state"] == AgentState.IN_DIALOGUE
         if in_dialogue and not (self._last_terminated or self._last_truncated):
             records.append(self._take_action(PassDialogueAction))
         return self._finish(records)
@@ -194,15 +199,21 @@ class GridMoveExecutor(PolicyExecutor):
                 return self._fail(MOVE_TRUNCATED, "truncated")
             action_return = (record.transition_states[-1]["core"].get("action_return") or {}) if record.transition_states else {}
             taken = action_return.get("n_steps_taken", 0)
-            if record.action_success == 2:
+            state = self._get_state()["pokemon_core"]["agent_state"]
+            if record.action_success == 2 or state != AgentState.FREE_ROAM:
                 return self._fail(MOVE_INTERRUPTED, "move_interrupted",
-                                  f"Left free roam after {taken} steps {direction}: "
-                                  f"{self._get_state()['pokemon_core']['agent_state'].name}")
+                                  f"Left free roam after {taken} steps {direction}: {state.name}")
             remaining -= taken
             if taken == 0 and not action_return.get("rotated"):
                 return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked moving {direction} with {remaining} steps left")
             if record.action_success in (-1, 1) and remaining > 0 and taken > 0:
                 return self._fail(MOVE_BLOCKED, "move_blocked", f"Stopped moving {direction} with {remaining} steps left")
+        if self._get_state()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM:
+            self._take_action(WaitAction)
+            if self._last_terminated:
+                return self._fail(MOVE_TERMINATED, "terminated")
+            if self._last_truncated:
+                return self._fail(MOVE_TRUNCATED, "truncated")
         return None
 
     def _walk(self, goals: Dict[Tuple[int, int], Optional[str]]) -> Optional[int]:
