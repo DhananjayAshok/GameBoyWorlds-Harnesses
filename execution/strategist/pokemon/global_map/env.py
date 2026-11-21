@@ -60,6 +60,7 @@ class MappingEnvironment:
         self._parameters = parameters
         self._listeners = list(listeners)
         self.marker = None
+        self.facing: Optional[str] = None
 
     def step_high_level_action(self, action, **kwargs):
         from execution.game_api import AgentState
@@ -82,6 +83,10 @@ class MappingEnvironment:
                 identified = self._tiles.identify_tiles(frame) if free else {}
                 queued = len(self._map.naming_queue)
                 status = self._map.on_step(frame, identified, free, direction, max_steps, reported, was_free, faded)
+                if was_free and direction is not None:
+                    self.facing = direction
+                elif status in ("relocalised", "new_segment"):
+                    self.facing = None
                 for entry in self._map.naming_queue[queued:]:
                     entry["marker"] = self.marker() if self.marker is not None else None
                 if self._listeners:

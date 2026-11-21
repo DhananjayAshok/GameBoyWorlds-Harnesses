@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from execution.game_api import (AgentState, BattleMenuAction, InteractAction, MenuAction, MoveStepsAction,
-                                OpenMenuAction, PassDialogueAction, PickAttackAction)
+                                OpenMenuAction, PassDialogueAction, PickAttackAction, WaitAction)
 
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.navigation import (DIRECTIONS, WALKABLE, approach_cells,
@@ -47,6 +47,10 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
     return kept
 
 
+INTERACT_SETTLE_WAIT = 2
+MAX_INTERACT_DIALOGUE_STEPS = 10
+
+
 class InteractionExecutor(PolicyExecutor):
     CARDINAL_DIRECTIONS = {cell: name for name, cell in CheckInteractionAction.cardinals.items()}
 
@@ -62,6 +66,36 @@ class InteractionExecutor(PolicyExecutor):
         self.report.termination_reason = reason
         self.report.notes = notes
         return -1
+
+    def _agent_state(self):
+        return self._get_state()["pokemon_core"]["agent_state"]
+
+    def _wait_for_interaction(self, records: List[EnvironmentStepRecord]):
+        state = self._agent_state()
+        for _ in range(INTERACT_SETTLE_WAIT):
+            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
+                break
+            wait_record = self._take_action(WaitAction)
+            records.append(wait_record)
+            state = self._agent_state()
+            if captured_dialogue_crops([wait_record]):
+                break
+        return state
+
+    def _clear_interaction_dialogue(self, records: List[EnvironmentStepRecord]) -> None:
+        for _ in range(MAX_INTERACT_DIALOGUE_STEPS):
+            if self._agent_state() != AgentState.IN_DIALOGUE or self._last_terminated or self._last_truncated:
+                break
+            pass_record = self._take_action(PassDialogueAction)
+            records.append(pass_record)
+            if self._last_terminated or self._last_truncated:
+                break
+            if self._agent_state() == AgentState.FREE_ROAM:
+                self._wait_for_interaction(records)
+                if self._agent_state() != AgentState.IN_DIALOGUE:
+                    break
+            elif pass_record.action_success == -1:
+                break
 
     def _execute(self) -> int:
         self._last_terminated = False
@@ -84,24 +118,35 @@ class InteractionExecutor(PolicyExecutor):
         direction = result["direction"]
         records = []
         self._begin_scripted(f"face {direction} and interact with {self._task}")
-        turn = self._take_action(MoveStepsAction, direction=direction, steps=1)
-        records.append(turn)
-        if self._last_terminated or self._last_truncated:
-            return self._finish(records)
-        action_return = turn.transition_states[-1]["core"].get("action_return") or {}
-        if action_return.get("n_steps_taken"):
-            return self._fail("target_cell_walkable",
-                              f"Pressed {direction} to face the target at {result['found_cells_str']}, "
-                              "but the player walked onto that cell instead, so nothing is there")
+        if getattr(self._env, "facing", None) != direction:
+            turn = self._take_action(MoveStepsAction, direction=direction, steps=1)
+            records.append(turn)
+            if self._last_terminated or self._last_truncated:
+                return self._finish(records)
+            if self._agent_state() != AgentState.FREE_ROAM:
+                if self._agent_state() == AgentState.IN_DIALOGUE:
+                    self._clear_interaction_dialogue(records)
+                return self._finish(records)
+            action_return = turn.transition_states[-1]["core"].get("action_return") or {}
+            if action_return.get("n_steps_taken"):
+                return self._fail("target_cell_walkable",
+                                  f"Pressed {direction} to face the target at {result['found_cells_str']}, "
+                                  "but the player walked onto that cell instead, so nothing is there")
 
         interact = self._take_action(InteractAction)
         records.append(interact)
-        if interact.action_success != 1:
+        if self._last_terminated or self._last_truncated:
+            return self._finish(records)
+        state = self._agent_state()
+        if state == AgentState.FREE_ROAM:
+            state = self._wait_for_interaction(records)
+            if self._last_terminated or self._last_truncated:
+                return self._finish(records)
+        if interact.action_success != 1 and state == AgentState.FREE_ROAM and not captured_dialogue_crops(records):
             return self._fail("interaction_did_nothing")
 
-        in_dialogue = self._get_state()["pokemon_core"]["agent_state"] == AgentState.IN_DIALOGUE
-        if in_dialogue and not (self._last_terminated or self._last_truncated):
-            records.append(self._take_action(PassDialogueAction))
+        if state == AgentState.IN_DIALOGUE and not (self._last_terminated or self._last_truncated):
+            self._clear_interaction_dialogue(records)
         return self._finish(records)
 
     def _finish(self, records: List[EnvironmentStepRecord]) -> int:
