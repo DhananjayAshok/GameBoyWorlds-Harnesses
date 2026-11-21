@@ -101,3 +101,58 @@ def is_same_battle_frame(earlier: np.ndarray, later: np.ndarray) -> bool:
     if np.any(differ[:120, :]) or np.any(differ[120:, :140]):
         return False
     return True
+
+
+DIALOGUE_BOX_TOP = 96
+DIALOGUE_BOX_BOTTOM = 144
+DIALOGUE_BOX_CHECK_LEFT = 8
+DIALOGUE_BOX_CHECK_RIGHT = 104
+DIALOGUE_BOX_WHITE = 240
+DIALOGUE_BOX_MIN_WHITE_FRACTION = 0.70
+
+CUTSCENE_DIFF_THRESHOLD = 40
+CUTSCENE_DIFF_MIN_PIXELS = 80
+
+
+def has_bottom_dialogue_box(frame: np.ndarray) -> bool:
+    """Return True if the bottom of the screen shows a bordered dialogue box (even if blank)."""
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < DIALOGUE_BOX_CHECK_RIGHT:
+        return False
+    inner = img[BOTTOM_BOX_INNER_TOP:BOTTOM_BOX_INNER_BOTTOM,
+                DIALOGUE_BOX_CHECK_LEFT:DIALOGUE_BOX_CHECK_RIGHT]
+    if float((inner >= DIALOGUE_BOX_WHITE).mean()) < DIALOGUE_BOX_MIN_WHITE_FRACTION:
+        return False
+    top_border = img[DIALOGUE_BOX_TOP:BOTTOM_BOX_INNER_TOP,
+                     DIALOGUE_BOX_CHECK_LEFT:DIALOGUE_BOX_CHECK_RIGHT]
+    bottom_border = img[BOTTOM_BOX_INNER_BOTTOM:DIALOGUE_BOX_BOTTOM,
+                        DIALOGUE_BOX_CHECK_LEFT:DIALOGUE_BOX_CHECK_RIGHT]
+    left_border = img[BOTTOM_BOX_INNER_TOP:BOTTOM_BOX_INNER_BOTTOM, :DIALOGUE_BOX_CHECK_LEFT]
+    n_top_tiles = (DIALOGUE_BOX_CHECK_RIGHT - DIALOGUE_BOX_CHECK_LEFT) // TILE_SIZE
+    n_side_tiles = (BOTTOM_BOX_INNER_BOTTOM - BOTTOM_BOX_INNER_TOP) // TILE_SIZE
+    for i in range(n_top_tiles):
+        sl = slice(i * TILE_SIZE, (i + 1) * TILE_SIZE)
+        top_tile = top_border[:, sl]
+        bot_tile = bottom_border[:, sl]
+        if not ((top_tile < DARK_INK).any() and (top_tile >= LIGHT_BACKGROUND).any()):
+            return False
+        if not ((bot_tile < DARK_INK).any() and (bot_tile >= LIGHT_BACKGROUND).any()):
+            return False
+    for i in range(n_side_tiles):
+        side_tile = left_border[i * TILE_SIZE:(i + 1) * TILE_SIZE, :]
+        if not ((side_tile < DARK_INK).any() and (side_tile >= LIGHT_BACKGROUND).any()):
+            return False
+    return True
+
+
+def is_cutscene_frame_changing(earlier: np.ndarray, later: np.ndarray) -> bool:
+    """Return True if sprite movement, emote animation, or box transitions changed between frames."""
+    if earlier is None or later is None or earlier.shape != later.shape:
+        return False
+    if np.array_equal(earlier, later):
+        return False
+    a = _grey_frame(earlier).astype(int)
+    b = _grey_frame(later).astype(int)
+    diff = np.abs(a - b) > CUTSCENE_DIFF_THRESHOLD
+    diff[88:, 104:] = False
+    return int(diff.sum()) >= CUTSCENE_DIFF_MIN_PIXELS
