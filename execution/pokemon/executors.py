@@ -36,12 +36,38 @@ def is_same_crop(earlier: np.ndarray, later: np.ndarray) -> bool:
     return bool(np.array_equal(a, b))
 
 
+SCROLL_BORDER_MARGIN = 3
+SCROLL_SHIFTS = (4, 8, 12, 16)
+
+
 def is_prefix_crop(earlier: np.ndarray, later: np.ndarray) -> bool:
     if earlier.shape != later.shape:
         return False
     a, b = earlier[:, :-CURSOR_MARGIN], later[:, :-CURSOR_MARGIN]
     differ = a != b
     return bool(np.all(a[differ] >= DIALOGUE_BACKGROUND))
+
+
+def is_scrolled_prefix_crop(earlier: np.ndarray, later: np.ndarray) -> bool:
+    if (earlier.shape != later.shape
+            or earlier.shape[0] <= 2 * SCROLL_BORDER_MARGIN + 8
+            or earlier.shape[1] <= CURSOR_MARGIN + SCROLL_BORDER_MARGIN):
+        return False
+    a = earlier[:, SCROLL_BORDER_MARGIN:-CURSOR_MARGIN] >= DIALOGUE_BACKGROUND
+    b = later[:, SCROLL_BORDER_MARGIN:-CURSOR_MARGIN] >= DIALOGUE_BACKGROUND
+    top = SCROLL_BORDER_MARGIN + 1
+    bot = a.shape[0] - (SCROLL_BORDER_MARGIN + 1)
+    if bot <= top:
+        return False
+    for dy in SCROLL_SHIFTS:
+        if top + dy >= bot:
+            continue
+        a_body = a[top + dy:bot]
+        b_body = b[top:bot - dy]
+        differ = a_body != b_body
+        if bool(np.all(a[top:top + dy])) and bool(np.all(a_body[differ])):
+            return True
+    return False
 
 
 def captured_dialogue_crops(records: List[EnvironmentStepRecord]) -> List[Any]:
@@ -62,7 +88,7 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
             continue
         if kept and is_same_crop(kept[-1], crop):
             continue
-        if kept and is_prefix_crop(kept[-1], crop):
+        if kept and (is_prefix_crop(kept[-1], crop) or is_scrolled_prefix_crop(kept[-1], crop)):
             kept[-1] = crop
         else:
             kept.append(crop)

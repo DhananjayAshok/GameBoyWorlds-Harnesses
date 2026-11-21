@@ -152,6 +152,45 @@ def merge_ocr_strings(strings, min_overlap=3):
     return merged_list
 
 
+DEFAULT_OCR_PROMPT = "If there is no text in the image, just say NONE. Otherwise, perform OCR and state the text in this image:"
+OCR_CURSOR_MARGIN = 12
+OCR_BACKGROUND = 248
+_OCR_CACHE: dict[str, str] = {}
+
+
+def ocr_crop_key(crop: np.ndarray) -> str | None:
+    from execution.perception.matching import cell_key
+
+    if crop is None or not hasattr(crop, "shape") or crop.size == 0:
+        return None
+    body = crop[:, :-OCR_CURSOR_MARGIN] if crop.shape[1] > OCR_CURSOR_MARGIN else crop
+    mask = np.ascontiguousarray(body >= OCR_BACKGROUND, dtype=np.uint8)
+    return cell_key(mask)
+
+
+def clean_ocr_output(text: str) -> str:
+    text = str(text or "")
+    text = text.rsplit("Response:", 1)[1] if "Response:" in text else text
+    text = text.strip()
+    for lead in ("The text in the image is:", "The text in this image is:"):
+        if text.startswith(lead):
+            text = text[len(lead):].strip()
+    return text.strip("*").strip()
+
+
+def cache_lookup_ocr(crop: np.ndarray) -> str | None:
+    key = ocr_crop_key(crop)
+    return _OCR_CACHE.get(key) if key is not None else None
+
+
+def cache_store_ocr(crop: np.ndarray, text: str) -> str:
+    cleaned = clean_ocr_output(text)
+    key = ocr_crop_key(crop)
+    if key is not None:
+        _OCR_CACHE[key] = cleaned
+    return cleaned
+
+
 def ocr(
     images: List[np.ndarray],
     vlm: VLM,
@@ -162,20 +201,36 @@ def ocr(
     parameters: dict = None,
 ) -> List[str]:
     parameters = load_parameters(parameters)
+    if not images:
+        return []
+    use_cache = text_prompt is None or text_prompt == DEFAULT_OCR_PROMPT
     if text_prompt is None:
-        text_prompt = "If there is no text in the image, just say NONE. Otherwise, perform OCR and state the text in this image:"
+        text_prompt = DEFAULT_OCR_PROMPT
     if vlm is None:
         log_error("ocr() needs a vlm to be passed in.", parameters)
-    texts = [text_prompt] * len(images)
-    ocred = vlm.infer(texts=texts, images=[[image] for image in images], max_new_tokens=max_new_tokens)["output"]
-    ocred = [text.rsplit("Response:", 1)[1] if "Response:" in text else text for text in ocred]
-    for i, res in enumerate(ocred):
-        if res.strip().lower() == "none":
-            log_warn(
-                f"Got NONE as output from OCR. Could this have been avoided?\nimages statistics: Max: {images[i].max()}, Min: {images[i].min()}, Mean: {images[i].mean()}, percentage of non zero cells {(images[i] > 0).mean()}, percentage of non 255 cells {(images[i] < 255).mean()}",
-                parameters,
-            )
-    ocred = [text.strip() for text in ocred if text.strip().lower() != "none"]
+
+    results: List[str | None] = [cache_lookup_ocr(img) if use_cache else None for img in images]
+    missing_indices = [i for i, res in enumerate(results) if res is None]
+    if missing_indices:
+        missing_images = [[images[i]] for i in missing_indices]
+        raw_out = vlm.infer(
+            texts=[text_prompt] * len(missing_images),
+            images=missing_images,
+            max_new_tokens=max_new_tokens,
+        )["output"]
+        if not isinstance(raw_out, list):
+            raw_out = [raw_out]
+        for idx, raw in zip(missing_indices, raw_out):
+            cleaned = cache_store_ocr(images[idx], raw) if use_cache else clean_ocr_output(raw)
+            results[idx] = cleaned
+            if cleaned.lower() == "none":
+                img = images[idx]
+                log_warn(
+                    f"Got NONE as output from OCR. Could this have been avoided?\nimages statistics: Max: {img.max()}, Min: {img.min()}, Mean: {img.mean()}, percentage of non zero cells {(img > 0).mean()}, percentage of non 255 cells {(img < 255).mean()}",
+                    parameters,
+                )
+
+    ocred = [res.strip() for res in results if res and res.strip().lower() != "none"]
     if do_merge:
         ocred = merge_ocr_strings(ocred)
     return ocred

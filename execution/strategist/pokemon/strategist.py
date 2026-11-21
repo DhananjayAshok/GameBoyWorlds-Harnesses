@@ -860,7 +860,6 @@ class PokemonStrategist:
         log_info(f"Global map: {added} new squares this episode, {self.global_map.n_cells} in all, "
                  f"{self.global_map.n_areas} area(s).", self._parameters)
         if self.npcs is not None:
-            self._read_conversations()
             try:
                 self.npcs.end_episode(self.global_map, vlm_caller=self._vlm_caller, episode_number=record.n)
             except Exception as e:

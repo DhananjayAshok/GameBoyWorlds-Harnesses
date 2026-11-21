@@ -998,8 +998,6 @@ class NPCRegistry(StrategistArtifact):
             self.stats["battle_starts"] += 1
             self.stats["conversations"] -= 1
         self._open = None
-        if conv.trigger != "battle_start":
-            self._summarise_now(conv)
 
     def attach_model(self, vlm_caller: Optional[Callable[[str], Callable[..., Any]]]) -> None:
         self._live = vlm_caller
@@ -1080,26 +1078,36 @@ class NPCRegistry(StrategistArtifact):
             self._close_conversation("episode_end", False)
 
     def read_conversations(self, vlm_call: Any, only: Optional[List[Conversation]] = None) -> None:
+        from execution.pokemon.executors import drop_prefix_crops
+        from utils.vlm import cache_lookup_ocr, cache_store_ocr
+
         todo = [c for c in (only if only is not None else self.conversations.values())
                 if c.crops and not c.text and not c.read]
         if not todo:
             return
-        images = [[crop] for c in todo for crop in c.crops[:MAX_OCR_CROPS]]
-        out = vlm_call(texts=[OCR_PROMPT] * len(images), images=images, max_new_tokens=4000)
-        out = out if isinstance(out, list) else [out]
-        at = 0
-        for c in todo:
-            n = len(c.crops[:MAX_OCR_CROPS])
-            pieces = []
-            for text in out[at:at + n]:
-                text = text.rsplit("Response:", 1)[1] if "Response:" in text else text
-                text = text.strip()
-                for lead in ("The text in the image is:", "The text in this image is:"):
-                    if text.startswith(lead):
-                        text = text[len(lead):].strip()
-                if text and text.lower() != "none":
-                    pieces.append(text)
-            at += n
+        crops_by_conv: List[List[np.ndarray]] = []
+        cached_by_conv: List[List[Optional[str]]] = []
+        missing_crops: List[np.ndarray] = []
+        missing_refs: List[Tuple[int, int]] = []
+        for ci, c in enumerate(todo):
+            deduped = drop_prefix_crops(c.crops)[:MAX_OCR_CROPS]
+            crops_by_conv.append(deduped)
+            row: List[Optional[str]] = []
+            for j, crop in enumerate(deduped):
+                cached = cache_lookup_ocr(crop)
+                row.append(cached)
+                if cached is None:
+                    missing_crops.append(crop)
+                    missing_refs.append((ci, j))
+            cached_by_conv.append(row)
+        if missing_crops:
+            images = [[crop] for crop in missing_crops]
+            out = vlm_call(texts=[OCR_PROMPT] * len(images), images=images, max_new_tokens=4000)
+            out = out if isinstance(out, list) else [out]
+            for (ci, j), crop, raw in zip(missing_refs, missing_crops, out):
+                cached_by_conv[ci][j] = cache_store_ocr(crop, raw)
+        for c, texts in zip(todo, cached_by_conv):
+            pieces = [t for t in texts if t and t.lower() != "none"]
             if not pieces and only is not None:
                 continue
             c.text, c.read = "\n".join(ordered_merge(pieces)), True
@@ -1163,6 +1171,11 @@ class NPCRegistry(StrategistArtifact):
     def end_episode(self, gmap: GlobalMap, vlm_caller: Optional[Callable[[str], Callable[..., Any]]] = None) -> None:
         self._gmap = gmap
         self.finish_conversations()
+        if vlm_caller is not None:
+            try:
+                self.read_conversations(vlm_caller("npc_ocr"))
+            except Exception as e:
+                log_warn(f"NPC registry: reading conversations failed and was skipped: {type(e).__name__}: {e}")
         self.consolidate()
         if vlm_caller is not None:
             self._model_steps(vlm_caller, gmap)
