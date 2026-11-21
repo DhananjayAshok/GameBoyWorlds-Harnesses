@@ -478,6 +478,21 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
 
 class OffScreenMoveExecutor(GridMoveExecutor):
     LOCATE_TAG = "locate_edge"
+
+    def _at_exterior_boundary(self, direction: str) -> bool:
+        from execution.perception.pokemon.grid import split_grid
+
+        dx, dy = DIRECTIONS[direction]
+        cells = split_grid(self._get_state()["core"]["current_frame"])
+        cur = (dx, dy)
+        saw_neighbor = False
+        while in_bounds(cur):
+            piece = cells.get(cur)
+            if piece is None or int(piece.min()) != int(piece.max()):
+                return False
+            saw_neighbor = True
+            cur = (cur[0] + dx, cur[1] + dy)
+        return saw_neighbor
     LOCATE_PROMPT = """You are helping a player walk off the edge of the screen in a Game Boy Pokemon game.
 
 The player wants to: "[TARGET]"
@@ -533,15 +548,10 @@ Location: <(x, y) or Not Found>
         self.target_cell = target
         code = self._walk({target: None})
         if code is not None:
-            if code == MOVE_BLOCKED and self._steps_taken > 0:
-                self.report.termination_reason = "left_screen"
-                self.report.notes = (f"Walked {self._steps_taken} step(s) towards {target} "
-                                     f"before reaching an obstacle or boundary")
-                return MOVE_OK
             return code
         code = self._step(direction, 1)
         if code is not None:
-            if code == MOVE_BLOCKED and self._steps_taken > 0:
+            if code == MOVE_BLOCKED and self._steps_taken > 0 and self._at_exterior_boundary(direction):
                 self.report.termination_reason = "left_screen"
                 self.report.notes = f"Walked to {target} at the {direction} boundary"
                 return MOVE_OK
