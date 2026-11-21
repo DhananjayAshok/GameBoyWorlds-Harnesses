@@ -32,7 +32,7 @@ def in_bounds(cell: Cell) -> bool:
     return cell[0] in X_RANGE and cell[1] in Y_RANGE
 
 
-def is_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+def is_top_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
     cell_q = quarter_tags.get(cell, {})
     if len(cell_q) < 4:
         return False
@@ -49,8 +49,42 @@ def is_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]])
     return True
 
 
-def cell_kinds(identified, ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None) -> Dict[Cell, str]:
-    # ``ledge_patterns``: quarter hashes (QUARTERS order) of cells seen hopped over; they override the labels.
+def is_player_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+    if cell != (0, 1):
+        return False
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    top_tags = {cell_q["top_left"], cell_q["top_right"]}
+    bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
+    if not (top_tags <= WALKABLE_TAGS) or (bottom_tags <= WALKABLE_TAGS):
+        return False
+    return bottom_tags <= WALKABLE_TAGS | OVERHANG_TOP_TAGS
+
+
+def is_player_overhang_ledge_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+    if cell != (0, 1):
+        return False
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    top_tags = {cell_q["top_left"], cell_q["top_right"]}
+    bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
+    if not (top_tags <= WALKABLE_TAGS | LEDGE_TAGS) or (bottom_tags <= WALKABLE_TAGS | LEDGE_TAGS):
+        return False
+    return bool(bottom_tags & LEDGE_TAGS) and (bottom_tags <= WALKABLE_TAGS | LEDGE_TAGS | OVERHANG_TOP_TAGS)
+
+
+def is_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+    return is_top_overhang_floor_cell(cell, quarter_tags) or is_player_overhang_floor_cell(cell, quarter_tags)
+
+
+def cell_kinds(
+    identified,
+    ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
+    walk_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
+) -> Dict[Cell, str]:
+    # ``ledge_patterns`` / ``walk_patterns``: quarter hashes (QUARTERS order) learned from movement.
     tags: Dict[Cell, set] = {}
     quarter_tags: Dict[Cell, Dict[str, str]] = {}
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
@@ -60,11 +94,14 @@ def cell_kinds(identified, ledge_patterns: Optional[Collection[Tuple[Optional[st
         hashes.setdefault((x, y), {})[quarter] = tile.hash
     kinds = {}
     for cell, cell_tags in tags.items():
+        pattern = tuple(hashes[cell].get(q) for q in QUARTERS)
         if cell_tags & WARP_TAGS or cell_tags <= WALKABLE_TAGS or is_overhang_floor_cell(cell, quarter_tags):
             kinds[cell] = WALKABLE
-        elif cell_tags <= WALKABLE_TAGS | LEDGE_TAGS:
+        elif walk_patterns and pattern in walk_patterns and "npc" not in cell_tags:
+            kinds[cell] = WALKABLE
+        elif cell_tags <= WALKABLE_TAGS | LEDGE_TAGS or is_player_overhang_ledge_cell(cell, quarter_tags):
             kinds[cell] = LEDGE
-        elif ledge_patterns and tuple(hashes[cell].get(q) for q in QUARTERS) in ledge_patterns:
+        elif ledge_patterns and pattern in ledge_patterns:
             kinds[cell] = LEDGE
         else:
             kinds[cell] = BLOCKED

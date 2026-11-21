@@ -9,7 +9,8 @@ from execution.perception.matching import cell_key, shade_bank, shade_candidates
 from execution.perception.pokemon.battle import (BANNER_TOP, TILE_SIZE, find_modal_preview_boxes,
                                                  has_bottom_dialogue_box, has_bottom_location_banner)
 from execution.perception.pokemon.grid import GRID_SKIP, cell_box, draw_box, split_grid
-from execution.perception.pokemon.navigation import OVERHANG_TOP_TAGS, is_overhang_floor_cell
+from execution.perception.pokemon.navigation import (OVERHANG_TOP_TAGS, is_overhang_floor_cell,
+                                                     is_player_overhang_floor_cell, is_top_overhang_floor_cell)
 from execution.perception.pokemon.prompts import PLAYER_SIDES, TILE_IN_CELL_PROMPT, TILE_TAGS, fill_player_note
 from utils import log_error, parse_key_value
 
@@ -71,11 +72,19 @@ TABLETOP_OBJECT_PATTERN = re.compile(
     r"(?!.*\b(?:potted\s+plant|plant|flower\s*pot|flowerpot)\b)",
     re.IGNORECASE,
 )
+WALKABLE_GROUND_OVERRIDE_PATTERN = re.compile(
+    r"^(?:boundary\s+hedge|hedge\s+border|roadside\s+sign)$",
+    re.IGNORECASE,
+)
 
 
 def normalize_tabletop_tag(tag: str, description: Optional[str]) -> str:
-    if tag == "obstacle" and description and TABLETOP_OBJECT_PATTERN.search(description):
-        return "interactable object"
+    if description:
+        stripped = description.strip()
+        if tag == "obstacle" and TABLETOP_OBJECT_PATTERN.search(stripped):
+            return "interactable object"
+        if tag in ("obstacle", "sign") and WALKABLE_GROUND_OVERRIDE_PATTERN.search(stripped):
+            return "ground"
     return tag
 
 
@@ -88,11 +97,14 @@ def _quarter_tag_map(identified: Dict[TileKey, Tile]) -> Dict[Tuple[int, int], D
 
 def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple[int, int], str]] = None) -> str:
     quarter_tags = _quarter_tag_map(identified)
-    overhang_cells = {cell for cell in quarter_tags if is_overhang_floor_cell(cell, quarter_tags)}
+    top_overhang_cells = {cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags)}
+    player_overhang_cells = {cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags)}
     by_cell: Dict[Tuple[int, int], Dict[str, Dict[str, Any]]] = {}
     for (x, y, quarter), tile in identified.items():
         tag = normalize_tabletop_tag(tile.tag, tile.description)
-        if (x, y) in overhang_cells and quarter in ("top_left", "top_right") and tag in OVERHANG_TOP_TAGS:
+        if (x, y) in top_overhang_cells and quarter in ("top_left", "top_right") and tag in OVERHANG_TOP_TAGS:
+            continue
+        if (x, y) in player_overhang_cells and quarter in ("bottom_left", "bottom_right") and tag in OVERHANG_TOP_TAGS:
             continue
         if tag in NON_OBJECT_TAGS:
             continue
@@ -167,13 +179,16 @@ PLAYER_NEIGHBOURS = {
 
 def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> str:
     quarter_tags = _quarter_tag_map(identified)
-    is_overhang = is_overhang_floor_cell(cell, quarter_tags)
+    is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags)
+    is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags)
     groups: Dict[Tuple[str, Optional[str]], set] = {}
     for quarter in QUARTER_OFFSETS:
         tile = identified.get((cell[0], cell[1], quarter))
         if tile is not None:
             tag = normalize_tabletop_tag(tile.tag, tile.description)
-            if is_overhang and quarter in ("top_left", "top_right") and tag in OVERHANG_TOP_TAGS:
+            if is_top_overhang and quarter in ("top_left", "top_right") and tag in OVERHANG_TOP_TAGS:
+                continue
+            if is_player_overhang and quarter in ("bottom_left", "bottom_right") and tag in OVERHANG_TOP_TAGS:
                 continue
             groups.setdefault((tag, tile.description), set()).add(quarter)
     parts = []

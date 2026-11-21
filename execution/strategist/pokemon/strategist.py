@@ -142,6 +142,7 @@ class PokemonStrategist:
         self.knowledge = self._load_or_default(PokemonKnowledgeTree, PokemonKnowledgeTree)
         self.notepad = self._load_or_default(ThoughtNotepad, ThoughtNotepad)
         self.global_map = self._load_or_default(GlobalMap, GlobalMap)
+        self.global_map.refresh(self.tiles._by_hash)
         self.guide = self._load_or_default(StrategyGuide, StrategyGuide)
         self._npc_registry = npc_registry
         self.npcs = self._load_or_default(NPCRegistry, lambda: NPCRegistry(game, name)) if npc_registry else None
@@ -490,7 +491,8 @@ class PokemonStrategist:
     def _global_map_block(self) -> str:
         if not self.global_map.current:
             return ""
-        local = cell_kinds(self._identified, self.global_map.ledge_patterns) if self._identified else None
+        local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns)
+                 if self._identified else None)
         self.global_map.prune_routes()
         _, failed = self._failure_streak()
         gmap = self.global_map

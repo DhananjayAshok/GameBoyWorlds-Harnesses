@@ -112,6 +112,10 @@ class MappingEnvironment:
     def ledge_patterns(self) -> set:
         return self._map.ledge_patterns
 
+    @property
+    def walk_patterns(self) -> set:
+        return self._map.walk_patterns
+
     def step_str(self, input_str: str):
         action, kwargs = self._env.string_to_high_level_action(input_str)
         if action is None:

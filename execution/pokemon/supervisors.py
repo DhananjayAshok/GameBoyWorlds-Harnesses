@@ -152,7 +152,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return self._screen_tiles
         self._tile_recognizer.record_tiles(frame, self._episode_number)
         self._identified = self._tile_recognizer.identify_tiles(frame)
-        kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None))
+        kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
+                           getattr(self._env, "walk_patterns", None))
         self._screen_tiles = (verbalize_tiles(self._identified, self._people_now())
                               + "\nWalkable cells on each edge of the screen:\n"
                               + verbalize_edges(kinds))
@@ -314,7 +315,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if after_state == AgentState.FREE_ROAM:
             self._tile_recognizer.record_tiles(after, self._episode_number)
             after_identified = self._tile_recognizer.identify_tiles(after)
-            after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None))
+            after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None),
+                                     getattr(self._env, "walk_patterns", None))
             after_tiles = (verbalize_tiles(after_identified, self._people_now())
                            + "\nWalkable cells on each edge of the screen:\n"
                            + verbalize_edges(after_kinds))
@@ -446,8 +448,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return result, task
 
     def _move(self, tag: str, task: str) -> Any:
+        kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
+                           getattr(self._env, "walk_patterns", None))
         return self.call_executor(tag, task, screen_tiles=self._screen_tiles,
-                                  cell_kinds=cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None)),
+                                  cell_kinds=kinds,
                                   identified=self._identified)
 
     def _handle_interruption(self) -> Tuple[str, Dict[str, Any]]:

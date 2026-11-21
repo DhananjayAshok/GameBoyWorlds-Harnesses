@@ -13,17 +13,17 @@ You are given two images:
 2. The contents of that grid cell on its own.
 
 Classify what is in the outlined cell into exactly one of these categories:
-- Ground: plain navigable ground the player can walk on, including ground with a repeating texture
+- Ground: plain navigable ground the player can walk on, including ground with a repeating texture (such as mottled or diagonal-patterned grass/lawn or paved road) and flat horizontal-bar or step openings that interrupt a one-way ledge row so the player can walk through
 - Ground Decoration: walkable ground with small decorations on it, such as flowers or little tufts that look like tiny Digletts
-- Ledge: a ledge the player can jump down from one side
-- Obstacle: a boundary or obstacle that blocks movement and cannot be interacted with (trees, rocks, walls, fences, buildings, or a plain empty table or counter with nothing on it)
+- Ledge: a raised one-way ridge or slope the player can jump down from one side (do not confuse with flat horizontal-bar step gaps interrupting a ledge row, which are Ground)
+- Obstacle: a solid boundary or obstacle that blocks movement and cannot be interacted with (trees, bushes, rocks, walls, fences, bollards, buildings, or a plain empty table or counter with nothing on it; never classify flat repeating ground or lawn textures as a hedge or obstacle)
 - Entrance: a door or entrance the player can walk into to enter or leave a building, cave or another area, including doorways, cave mouths, gates between routes, and the exit mats on the floor at the edge of a room
 - Water
 - Tall Grass: tall grass where wild Pokemon can appear
 - Interactable Object: an object the player can interact with (machines, computers, bookshelves, or an object such as a Poke Ball, book, or item resting on a table, desk, or counter)
 - Item: an item lying on the ground that the player can pick up. An item on the ground always looks like a Poke Ball
 - NPC: a non-player character
-- Sign: a sign the player can read
+- Sign: a freestanding wooden signpost or wall plaque/notice the player can read (never a flat horizontal-bar step tile interrupting a ledge row on the ground)
 - Staircase: stairs, a ladder, or a hole in the floor that takes the player up or down to another floor or level
 - Elevator: an elevator, or the panel or floor of an elevator, that moves the player between floors
 - Special Ground Tile: a tile the player can walk on that may move them around, such as arrow or spinner tiles that push the player, ice floors the player slides across, or teleportation pads

@@ -12,7 +12,8 @@ from execution.perception.matching import cell_key, split_quarters
 from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import (LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
-                                                     is_overhang_floor_cell)
+                                                     is_overhang_floor_cell, is_player_overhang_floor_cell,
+                                                     is_player_overhang_ledge_cell, is_top_overhang_floor_cell)
 from execution.perception.pokemon.tiles import TileRecognizer, normalize_tabletop_tag
 
 from .registration import (BLACK_LEVEL, _local_cells, _screen, _still_lit, grid_offset, grid_residual, has_structure,
@@ -153,6 +154,7 @@ class GlobalMap(StrategistArtifact):
         self.defeats: List[Dict[str, Any]] = []
         self.defeat_return: Optional[Dict[str, Any]] = None
         self.ledge_patterns: set = set()
+        self.walk_patterns: set = set()
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -169,12 +171,35 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("naming_queue", [])
         self.__dict__.setdefault("merge_verdicts", {})
         self.__dict__.setdefault("ledge_patterns", set())
+        self.__dict__.setdefault("walk_patterns", set())
 
     def _classify(self, tags: Iterable[str], hashes: Tuple[Optional[str], ...]) -> str:
         kind = classify(tags)
+        if kind == BLOCKED and hashes in self.walk_patterns:
+            return WALKABLE
         if kind == BLOCKED and hashes in self.ledge_patterns:
             return LEDGE
         return kind
+
+    def _learn_walkable(self, cell: "MapCell") -> int:
+        pattern = cell.hashes
+        if any(h is None for h in pattern):
+            return 0
+        self.ledge_patterns.discard(pattern)
+        relabelled = 0
+        if pattern not in self.walk_patterns:
+            self.walk_patterns.add(pattern)
+            for other in self.segments:
+                for c in other.values():
+                    if c.kind == BLOCKED and c.hashes == pattern:
+                        c.kind = WALKABLE
+                        relabelled += 1
+            self.stats["walk_patterns_learned"] += 1
+            self.stats["walk_cells_relabelled"] += relabelled
+        elif cell.kind == BLOCKED:
+            cell.kind = WALKABLE
+            relabelled += 1
+        return relabelled
 
     def _learn_ledges(self, start: Cell, end: Cell, direction: Optional[str]) -> int:
         # a move down across exactly one cell mapped as blocked went over a ledge
@@ -305,7 +330,9 @@ class GlobalMap(StrategistArtifact):
         if shift == (0, 0):
             for (ix, iy, iq), tile in (identified or {}).items():
                 quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(tile.tag, tile.description)
-        overhang_cells = {cell for cell in quarter_tags if is_overhang_floor_cell(cell, quarter_tags)}
+        top_overhang_cells = {cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags)}
+        player_overhang_cells = {cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags)}
+        player_ledge_cells = {cell for cell in quarter_tags if is_player_overhang_ledge_cell(cell, quarter_tags)}
         for (x, y), piece in _local_cells(a, shift):
             if (x, y) in masked_cells and (x, y) != (0, 0):
                 continue
@@ -316,11 +343,22 @@ class GlobalMap(StrategistArtifact):
                 tags, kind = ("player",), WALKABLE
             elif shift != (0, 0):
                 tags, kind = ("unknown",), UNKNOWN
-            elif (x, y) in overhang_cells:
+            elif (x, y) in top_overhang_cells:
                 tags = tuple(sorted({
                     quarter_tags[(x, y)][q] for q in ("bottom_left", "bottom_right") if q in quarter_tags[(x, y)]
                 }))
                 kind = WALKABLE
+            elif (x, y) in player_overhang_cells:
+                tags = tuple(sorted({
+                    quarter_tags[(x, y)][q] for q in ("top_left", "top_right") if q in quarter_tags[(x, y)]
+                }))
+                kind = WALKABLE
+            elif (x, y) in player_ledge_cells:
+                tags = tuple(sorted(
+                    {quarter_tags[(x, y)][q] for q in ("top_left", "top_right") if q in quarter_tags[(x, y)]}
+                    | {"ledge"}
+                ))
+                kind = LEDGE
             else:
                 tags = tuple(sorted({
                     normalize_tabletop_tag(identified[(x, y, q)].tag, identified[(x, y, q)].description)
@@ -338,6 +376,11 @@ class GlobalMap(StrategistArtifact):
             if kind in (OCCUPIED, UNKNOWN) and old.kind not in (OCCUPIED, UNKNOWN):
                 continue
             if (x, y) == (0, 0) and old.kind != OCCUPIED:
+                if old.kind == BLOCKED:
+                    self._learn_walkable(old)
+                continue
+            if (x, y) == (0, 1) and old.kind == WALKABLE and kind != OCCUPIED:
+                # keep clean ground hashes/pixels at (0, 1) rather than overwriting with the player's cap overhang
                 continue
             old.kind, old.tags, old.hashes, old.pixels = kind, tags, hashes, pixels
         self.visits[self.segment][self.pos] += 1
@@ -704,7 +747,7 @@ class GlobalMap(StrategistArtifact):
 
     def refresh(self, tile_lookup: Dict[str, Any]) -> int:
         changed = 0
-        for seg in self.segments:
+        for si, seg in enumerate(self.segments):
             quarter_tags: Dict[Cell, Dict[str, str]] = {}
             for g, c in seg.items():
                 tiles = [tile_lookup.get(h) for h in c.hashes]
@@ -712,17 +755,18 @@ class GlobalMap(StrategistArtifact):
                     quarter_tags[g] = {
                         q: normalize_tabletop_tag(t.tag, t.description) for q, t in zip(QUARTERS, tiles)
                     }
+            visits = self.visits[si] if si < len(self.visits) else Counter()
             for g, c in seg.items():
-                if g not in quarter_tags:
+                if visits.get(g, 0) > 0 and c.kind == BLOCKED:
+                    self._learn_walkable(c)
+                if g not in quarter_tags or c.kind == OCCUPIED:
                     continue
-                if is_overhang_floor_cell(g, quarter_tags):
+                if is_top_overhang_floor_cell(g, quarter_tags):
                     new_tags = tuple(sorted({quarter_tags[g]["bottom_left"], quarter_tags[g]["bottom_right"]}))
                     new_kind = WALKABLE
-                elif c.kind == UNKNOWN:
+                else:
                     new_tags = tuple(sorted(set(quarter_tags[g].values())))
                     new_kind = self._classify(new_tags, c.hashes)
-                else:
-                    continue
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1
