@@ -1,10 +1,10 @@
-PRIMITIVES = """1. MoveTo(description): walk to an object, entity, entrance, staircase or exit mat that is visible on the screen, e.g. MoveTo(wooden signpost at (2, -4)) or MoveTo(exit mat at (-4, -4)).
-2. MoveOff(direction description): walk to a walkable cell on the edge of the screen and step off it in that direction, e.g. MoveOff(up, through the gap in the ledge) or MoveOff(left). Only use MoveOff when that edge of the screen has walkable cells listed; never use MoveOff towards a wall or boundary where that edge is listed as "none" (when already standing on an exit mat against a room boundary, use Free to press the direction that steps off the mat).
-3. Interact(target): interact with the object or entity directly in front of the player, e.g. to talk to someone or read a sign. Name the target, e.g. Interact(wooden signpost).
-4. Battle(optional instructions): fight the battle that is on screen, optionally with instructions, e.g. Battle() or Battle(use Thundershock and do not switch Pokemon).
-5. Menu(specific instruction): use the menu system to do something specific, e.g. Menu(use a Potion on Pikachu). Only works in the main menu opened with Start, or in a menu that is already open.
-6. Dialogue(): press through the dialogue that is on screen until it ends.
-7. Free(instruction; stop when: condition): press single buttons (a, b, start, arrows) towards something specific, and say what to stop at. The condition must be something visible on screen, e.g. Free(walk up and down inside the patch of tall grass; stop when: a wild Pokemon appears). Use this when none of the others fit."""
+PRIMITIVES = """1. MoveTo(description): walk to an object, entity, entrance, staircase or exit mat that is visible on the screen, e.g. MoveTo(wooden signpost at (2, -4)) or MoveTo(exit mat at (-4, -4)). Only works in free roam.
+2. MoveOff(direction description): walk to a walkable cell on the edge of the screen and step off it in that direction, e.g. MoveOff(up, through the gap in the ledge) or MoveOff(left). Only works in free roam when that edge of the screen has walkable cells listed; never use MoveOff towards a wall or boundary where that edge is listed as "none" (when already standing on an exit mat against a room boundary, use Free to press the direction that steps off the mat).
+3. Interact(target): interact with the object or entity directly in front of the player, e.g. to talk to someone or read a sign. Name the target, e.g. Interact(wooden signpost). Only works in free roam.
+4. Battle(optional instructions): fight or advance the battle that is on screen (including battle intro or defeat text on the battle screen), optionally with instructions, e.g. Battle() or Battle(use Thundershock and do not switch Pokemon). Only works in battle.
+5. Menu(specific instruction): use the menu system to do something specific, e.g. Menu(use a Potion on Pikachu). Only works in the main menu opened with Start from free roam, or in a menu or choice box that is already open (in menu).
+6. Dialogue(): press through the dialogue that is on screen until it ends. Only works in dialogue.
+7. Free(instruction; stop when: condition): press single buttons (a, b, start, arrows) towards something specific, and say what to stop at. The condition must be something visible on screen, e.g. Free(walk up and down inside the patch of tall grass; stop when: a wild Pokemon appears). Use this when none of the others fit, or during a scripted cutscene between text boxes."""
 
 PLAYTHROUGH_GUIDANCE_BLOCK = """
 Guidance for this task:
@@ -20,13 +20,14 @@ PLAYTHROUGH_PLAN_PROMPT = """You are playing [GAME] and are planning how to comp
 
 Your task: "[TASK]"
 [GUIDANCE_BLOCK][LOG_BLOCK]
+The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
 [SCREEN_TILES]
 
 These are the only things the player can be told to do:
 [PRIMITIVES]
 
-Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now.
+Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now. If a dialogue box or scripted cutscene is currently playing or about to continue (including when a text box at the bottom of the screen is blank, has only printed its first few characters, or is between consecutive lines), include finishing that dialogue/cutscene before any walking subgoal.
 
 Respond in exactly this format:
 Reasoning: <what the screen shows and how you intend to get the task done>
@@ -45,13 +46,14 @@ Your plan:
 
 You are working on this subgoal: "[SUBGOAL]"
 [LOG_BLOCK][ATTEMPTS_BLOCK]
+The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
 [SCREEN_TILES]
 
 You can make the player do exactly one of the following:
 [PRIMITIVES]
 
-Pick the single action that makes the most progress on the subgoal from this screen.
+Pick the single action that makes the most progress on the subgoal from this screen and matches the current game state ([AGENT_STATE]). Always check the bottom of the screen for a dialogue box frame—even if it is blank or has only printed its first few letters—and check whether your previous movement attempt was just interrupted by dialogue without the player moving. While a dialogue box is visible or a multi-part scripted conversation/cutscene is still playing between text boxes, choose Dialogue() or Free(...) to advance it rather than MoveTo or MoveOff.
 
 Respond in exactly this format:
 Reasoning: <what you see, and why this action is the best next step>
@@ -76,7 +78,7 @@ The first image is the screen before, and the second image is the screen after. 
 Before, this had been recognised on the screen, with the player at (0, 0):
 [SCREEN_TILES]
 [AFTER_BLOCK][TEXT_BLOCK]
-The game reported: [EXECUTOR_REPORT]
+The game reported: [EXECUTOR_REPORT] (current game state: [AGENT_STATE]).
 That report can be wrong about where the player ended up, so judge from the images.
 
 Say whether the subgoal is now finished, and write a short note for the log of this playthrough. The note is the only record that survives, so say what actually happened and anything learned about the game or the map.
@@ -109,6 +111,7 @@ You have been trying this subgoal and it is not working: "[SUBGOAL]"
 What you tried for this subgoal:
 [ATTEMPTS]
 
+The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
 [SCREEN_TILES]
 
@@ -130,6 +133,7 @@ PLAYTHROUGH_TASK_CHECK_PROMPT = """You are playing [GAME] and have worked throug
 
 Your task: "[TASK]"
 [GUIDANCE_BLOCK][LOG_BLOCK]
+The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
 [SCREEN_TILES]
 
@@ -140,7 +144,6 @@ Reasoning: <what was achieved, and whether it adds up to the task>
 Task complete: <yes or no>
 Summary: <one or two sentences describing how the playthrough went>
 [STOP]"""
-
 PLAYTHROUGH_CLARIFY_TARGET_PROMPT = """You are playing [GAME] and deciding what the player should do next.
 
 Your task: "[TASK]"

@@ -5,7 +5,7 @@ from execution.game_api import AgentState
 
 from execution.executors import Executor
 from execution.perception.pokemon.navigation import cell_kinds, verbalize_edges
-from execution.perception.pokemon.tiles import TileRecognizer, verbalize_tiles
+from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
                                          InteractionExecutor, MenuExecutor,
                                          BATTLE_ENDED, BATTLE_LEFT_TO_DIALOGUE, BATTLE_LEFT_TO_MENU,
@@ -128,6 +128,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return self._env.get_info()["pokemon_core"]["agent_state"]
 
     def _perceive(self, frame) -> str:
+        state = self._agent_state()
+        if state != AgentState.FREE_ROAM:
+            self._identified = {}
+            self._screen_tiles = describe_state_screen(state)
+            return self._screen_tiles
         self._tile_recognizer.record_tiles(frame, self._episode_number)
         self._identified = self._tile_recognizer.identify_tiles(frame)
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None))
@@ -156,11 +161,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             log_error("Supervisor prompt built before the screen was perceived.", self._parameters)
         guidance_block = PLAYTHROUGH_GUIDANCE_BLOCK.replace("[GUIDANCE]", self._guidance) if self._guidance else ""
         plan = "\n".join(f"{n + 1}. {subgoal}" for n, subgoal in enumerate(self.plan))
+        state = self._agent_state().name.lower().replace("_", " ")
         return (prompt.replace("[GAME]", self._game)
                 .replace("[TASK]", self._task)
                 .replace("[GUIDANCE_BLOCK]", guidance_block)
                 .replace("[LOG_BLOCK]", self._log_block())
                 .replace("[SCREEN_TILES]", self._screen_tiles)
+                .replace("[AGENT_STATE]", state)
                 .replace("[PRIMITIVES]", PRIMITIVES)
                 .replace("[PLAN]", plan))
 
@@ -275,8 +282,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         report = result["report"]
         before = report.initial_state["core"]["current_frame"]
         after = report.final_state["core"]["current_frame"]
-        after_block = ""
-        if report.final_state["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM:
+        after_state = report.final_state["pokemon_core"]["agent_state"]
+        if after_state == AgentState.FREE_ROAM:
             self._tile_recognizer.record_tiles(after, self._episode_number)
             after_identified = self._tile_recognizer.identify_tiles(after)
             after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None))
@@ -284,6 +291,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                            + "\nWalkable cells on each edge of the screen:\n"
                            + verbalize_edges(after_kinds))
             after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", after_tiles)
+        else:
+            after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", describe_state_screen(after_state))
         text = result.get("dialogue") or ""
         text_block = PLAYTHROUGH_TEXT_BLOCK.replace("[TEXT]", text) if text.strip() else ""
         executor_report = f"{result['reason']} (code {result['code']})"

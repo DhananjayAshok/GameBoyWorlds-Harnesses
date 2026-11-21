@@ -87,6 +87,30 @@ def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple
     return "\n".join(lines)
 
 
+STATE_SCREEN_DESCRIPTIONS = {
+    "in_dialogue": (
+        "Game state: in_dialogue (a dialogue box is open on screen; "
+        "overworld grid perception is not applicable until returned to free_roam)."
+    ),
+    "in_menu": (
+        "Game state: in_menu (a menu, choice box, or info overlay is open on screen; "
+        "overworld grid perception is not applicable until returned to free_roam)."
+    ),
+    "in_battle": (
+        "Game state: in_battle (a battle screen is open; "
+        "overworld grid perception is not applicable until returned to free_roam)."
+    ),
+}
+
+
+def describe_state_screen(state: Any) -> str:
+    name = getattr(state, "name", str(state)).lower()
+    return STATE_SCREEN_DESCRIPTIONS.get(
+        name,
+        f"Game state: {name} (overworld grid perception is not applicable until returned to free_roam).",
+    )
+
+
 PLAYER_NEIGHBOURS = {
     (-1, 1): "diagonally up and to the left of",
     (0, 1): "directly above",

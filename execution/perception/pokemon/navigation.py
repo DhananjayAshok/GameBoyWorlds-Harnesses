@@ -35,7 +35,7 @@ def cell_kinds(identified, ledge_patterns: Optional[Collection[Tuple[Optional[st
     # ``ledge_patterns``: quarter hashes (QUARTERS order) of cells seen hopped over; they override the labels.
     tags: Dict[Cell, set] = {}
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
-    for (x, y, quarter), tile in identified.items():
+    for (x, y, quarter), tile in (identified or {}).items():
         tags.setdefault((x, y), set()).add(tile.tag)
         hashes.setdefault((x, y), {})[quarter] = tile.hash
     kinds = {}

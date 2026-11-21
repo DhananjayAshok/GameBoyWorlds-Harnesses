@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from execution.artifact import episode_dirs
 from execution.game_api import AgentState, WaitAction
-from execution.perception.pokemon.tiles import TileRecognizer, verbalize_tiles
+from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import CombatExecutor
 from execution.pokemon.supervisors import PokemonPlayThroughSupervisor
 from execution.report import (EnvironmentStepRecord, ExecutorVLMCallRecord, SupervisorReport, SupervisorVLMCallRecord,
@@ -293,7 +293,15 @@ class PokemonStrategist:
     def _env_done(self) -> bool:
         return bool(self._env._emulator.check_if_done())
 
+    def _agent_state(self):
+        return self._env.get_info()["pokemon_core"]["agent_state"]
+
     def _perceive(self, frame: np.ndarray, episode_number: int) -> str:
+        state = self._agent_state()
+        if state != AgentState.FREE_ROAM:
+            self._identified = {}
+            self._screen_tiles = describe_state_screen(state)
+            return self._screen_tiles
         self.tiles.set_vlm_call(self._vlm_caller("perception"))
         self.tiles.record_tiles(frame, episode_number)
         self._identified = self.tiles.identify_tiles(frame)
