@@ -723,7 +723,16 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                     summary)
 
             if outcome == "out_of_calls":
-                return self._finish("out_of_calls", f"Used all {self._max_steps} executor calls.")
+                summary = None
+                if self.report.narrative and not self._env_done():
+                    self._settle_free_roam()
+                    frame = self._current_frame()
+                    if self._agent_state() == AgentState.FREE_ROAM and not self._is_in_dialogue(frame):
+                        self._perceive(frame)
+                        complete, summary = self._task_check(frame)
+                        if complete:
+                            return self._finish("completed", None, summary)
+                return self._finish("out_of_calls", f"Used all {self._max_steps} executor calls.", summary)
 
             if outcome == "lost_battle":
                 return self._finish("lost_battle", "The player lost a battle and blacked out.")

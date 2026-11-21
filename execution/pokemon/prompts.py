@@ -28,6 +28,7 @@ These are the only things the player can be told to do:
 [PRIMITIVES]
 
 Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now. Because MoveTo on a doorway, staircase or boundary exit mat automatically steps through or off it to warp into the next room or outside, write leaving or entering through a visible entrance or exit mat as a single subgoal (reaching the new room or outside) rather than splitting it into standing on the mat and stepping off it. If a dialogue box or scripted cutscene is currently playing or about to continue (including when a text box at the bottom of the screen is blank, has only printed its first few characters, or is between consecutive lines), include finishing that dialogue/cutscene before any walking subgoal. If the task or guidance suggests a cardinal detour around a local obstacle (such as walking east or west around a ledge, tree row, NPC, or building) that is blocked on the current screen or contradicts the walkable screen edges and shortest paths listed above, trust the live screen and walkable edges to route toward the task's destination rather than following a blocked cardinal direction.
+Treat "Guidance for this task" as tactical advice and lookahead context rather than extra mandatory goals: only plan subgoals for what "Your task" asks, and do not append extra landmarks, trainers, or exits mentioned only in guidance. An episode has a budget of at most 10 actions (including any battles along the way), so when "Your task" asks for open-ended progression along a route or corridor (such as "continue heading <direction>" or "follow the path as it turns toward..."), scope the movement subgoals to the concrete turns or 1-2 screen transitions needed to make clear forward progress along that path rather than requiring an entire multi-screen route to be traversed in a single subgoal. If "Your task" contains a conditional fallback or alternative branch (such as "walk <direction> along the path, or if it ends in a dead end / is blocked, then..."), plan only the primary path up to the point where you can see on screen whether that condition holds; never include the fallback branch as sequential subgoals upfront unless the current screen already shows that the primary path is blocked or at a dead end.
 
 Respond in exactly this format:
 Reasoning: <what the screen shows and how you intend to get the task done>
@@ -68,7 +69,7 @@ What you already tried for this subgoal, and what came of it:
 PLAYTHROUGH_REMAINING_SUBGOALS_BLOCK = """
 Later subgoals in your plan:
 [REMAINING_SUBGOALS]
-If this action also already achieved one or more of these later subgoals (for example, moving to an exit mat also stepped off it and exited the building, or walking down an aisle also triggered and cleared an NPC's dialogue), give the highest plan number that is now complete in `Reached subgoal:`.
+If this action also already achieved one or more of these later subgoals (for example, moving to an exit mat also stepped off it and exited the building, or walking down an aisle also triggered and cleared an NPC's dialogue), give the highest plan number that is now complete in `Reached subgoal:`. Never mark a later walking or navigation subgoal as reached just because a battle or dialogue ended; only mark a later movement subgoal as reached if the overworld screen shows the player actually travelled to that subgoal's destination.
 """
 
 PLAYTHROUGH_REMAINING_SUBGOALS_LINE = """
@@ -93,7 +94,7 @@ Before, this had been recognised on the screen, with the player at (0, 0):
 The game reported: [EXECUTOR_REPORT] (current game state: [AGENT_STATE]).
 That report can be wrong about where the player ended up, so judge from the images.
 
-Say whether the subgoal is now finished, and write a short note for the log of this playthrough. The note is the only record that survives, so say what actually happened and anything learned about the game or the map.
+Say whether the subgoal is now finished, and write a short note for the log of this playthrough. The note is the only record that survives, so say what actually happened and anything learned about the game or the map. Note that finishing a battle or clearing an interrupting dialogue only returns the player to free roam at their current position—it does not complete a walking or navigation subgoal unless the overworld screens show that the player also reached the subgoal's destination.
 
 Respond in exactly this format:
 Reasoning: <compare the two screens and the text>
@@ -129,7 +130,7 @@ The image is the current game screen. Here is what has been recognised on it:
 
 Decide whether to carry on with a new plan or to give up. Give up only if the task cannot be done from here at all, for example because it needs something the player does not have and cannot get.
 
-If you carry on, write a fresh plan for what is left, starting from the current screen. It may drop the subgoal that failed, or reach it another way.
+If you carry on, write a fresh plan for what is left, starting from the current screen. It may drop the subgoal that failed, or reach it another way. Plan only for what remains of "Your task" (do not add extra goals from guidance, and keep open-ended directional progression scoped to 1-2 screen transitions).
 
 Respond in exactly this format:
 Reasoning: <why it is not working, and what to do about it>
@@ -149,7 +150,10 @@ The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
 [SCREEN_TILES]
 
-Decide whether the task is now complete.
+Decide whether "Your task" is now complete.
+- Judge completion against "Your task" itself. Treat "Guidance for this task" as tactical advice and lookahead context, not as mandatory extra requirements: if the player has done what "Your task" asks, answer yes even if further landmarks, trainers, or exits mentioned only in guidance have not been reached yet.
+- If "Your task" is an open-ended directional traversal (such as "continue heading <direction> along the route" or "follow the path as it turns toward...") without requiring entering a specific doorway or interacting with a specific object, answer yes once the player has carried out the described turns/detours, made substantial forward progress in that direction across one or more screens, and is in free roam.
+- If "Your task" includes a conditional fallback ("or if it ends in a dead end / is blocked, walk back..."), check the current screen: if the primary path did not end in a dead end, the fallback is not needed; if the player did hit a dead end on screen, the fallback movement must also be completed before answering yes.
 
 Respond in exactly this format:
 Reasoning: <what was achieved, and whether it adds up to the task>
