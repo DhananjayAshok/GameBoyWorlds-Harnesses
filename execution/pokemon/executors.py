@@ -616,6 +616,8 @@ Move: <1, 2, 3 or 4>
 MENU_OK = 0
 MENU_TERMINATED = 1
 MENU_TRUNCATED = 2
+MENU_LEFT_TO_DIALOGUE = 3
+MENU_LEFT_TO_BATTLE = 4
 MENU_NOT_IN_MENU = -1
 MENU_OPEN_FAILED = -2
 MENU_UNREADABLE = -3
@@ -623,6 +625,11 @@ MENU_OUT_OF_STEPS = -4
 
 MENU_PRESSES = ("up", "down", "left", "right", "confirm", "back")
 MENU_STATES = (AgentState.IN_MENU, AgentState.IN_BATTLE, AgentState.IN_DIALOGUE)
+LEFT_MENU_OUTCOMES = {
+    AgentState.FREE_ROAM: (MENU_OK, "menu_closed"),
+    AgentState.IN_DIALOGUE: (MENU_LEFT_TO_DIALOGUE, "left_menu_to_dialogue"),
+    AgentState.IN_BATTLE: (MENU_LEFT_TO_BATTLE, "left_menu_to_battle"),
+}
 
 
 class MenuExecutor(PolicyExecutor):
@@ -654,7 +661,7 @@ Objective: "[TASK]"
 
 The image is the current screen.
 [HISTORY]
-First decide whether the objective has already been achieved on this screen. If it has not, choose the single button press that best moves towards it.
+First decide whether the objective for the menu or choice box on screen has already been achieved (including if the menu, info screen, or yes/no box has already closed into plain dialogue or the overworld). If it has not, choose the single button press that best moves towards it.
 
 The presses you can make:
 - up, down, left, right: move the cursor
@@ -670,11 +677,22 @@ Press: <one of up, down, left, right, confirm, back>
     def __init__(self, env, task, max_steps: int = 15, is_start_menu: bool = False, **kwargs):
         self.is_start_menu = is_start_menu
         self.presses: List[str] = []
+        self.dialogue_crops: List[Any] = []
+        self.dialogue_text: str = ""
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
         self.report.termination_reason = reason
         self.report.notes = notes
+        return code
+
+    def _finish(self, code: int, reason: str) -> int:
+        if self.dialogue_crops:
+            self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
+                                               parameters=self._parameters))
+        self.report.termination_reason = reason
+        self.report.notes = "\n".join(filter(None, [f"Presses: {', '.join(self.presses) or 'none'}",
+                                                    self.dialogue_text]))
         return code
 
     def _agent_state(self):
@@ -689,10 +707,11 @@ Press: <one of up, down, left, right, confirm, back>
         if entry is None:
             return self._fail(MENU_OPEN_FAILED, "menu_entry_unreadable", output)
         record = self._take_action(OpenMenuAction, option=entry)
+        drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
         if self._last_terminated:
-            return self._fail(MENU_TERMINATED, "terminated")
+            return self._finish(MENU_TERMINATED, "terminated")
         if self._last_truncated:
-            return self._fail(MENU_TRUNCATED, "truncated")
+            return self._finish(MENU_TRUNCATED, "truncated")
         if record.action_success != 0 or self._agent_state() not in MENU_STATES:
             return self._fail(MENU_OPEN_FAILED, "menu_did_not_open",
                               f"Tried to open {entry}, success={record.action_success}, state={self._agent_state().name}")
@@ -721,15 +740,17 @@ Press: <one of up, down, left, right, confirm, back>
 
         consecutive_invalid = 0
         for _ in range(self._max_steps):
+            state = self._agent_state()
+            if state != AgentState.IN_MENU:
+                code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
+                return self._finish(code, reason)
             frame = self._get_state()["core"]["current_frame"]
             prompt = (self.STEP_PROMPT.replace("[TASK]", self._task.strip())
                       .replace("[HISTORY]", self._history_block()))
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
             if parse_yes_no(output, "Complete"):
-                self.report.termination_reason = "objective_complete"
-                self.report.notes = f"Presses: {', '.join(self.presses) or 'none'}"
-                return MENU_OK
+                return self._finish(MENU_OK, "objective_complete")
             press = (parse_key_value(output, "Press") or "").strip().lower()
             press = next((option for option in MENU_PRESSES if option in press), None)
             if press is None:
@@ -740,12 +761,17 @@ Press: <one of up, down, left, right, confirm, back>
                 continue
             consecutive_invalid = 0
             self.presses.append(press)
-            self._take_action(MenuAction, menu_action=press)
+            record = self._take_action(MenuAction, menu_action=press)
+            drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
             if self._last_terminated:
-                return self._fail(MENU_TERMINATED, "terminated")
+                return self._finish(MENU_TERMINATED, "terminated")
             if self._last_truncated:
-                return self._fail(MENU_TRUNCATED, "truncated")
-        return self._fail(MENU_OUT_OF_STEPS, "out_of_steps", f"Presses: {', '.join(self.presses) or 'none'}")
+                return self._finish(MENU_TRUNCATED, "truncated")
+            state = self._agent_state()
+            if state != AgentState.IN_MENU:
+                code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
+                return self._finish(code, reason)
+        return self._finish(MENU_OUT_OF_STEPS, "out_of_steps")
 
 
 DIALOGUE_CLEARED = 0
@@ -755,6 +781,8 @@ DIALOGUE_LEFT_TO_MENU = 3
 DIALOGUE_LEFT_TO_BATTLE = 4
 DIALOGUE_NOT_IN_DIALOGUE = -1
 DIALOGUE_STUCK = -2
+
+DIALOGUE_SETTLE_WAIT = 1
 
 LEFT_DIALOGUE_CODES = {
     AgentState.FREE_ROAM: DIALOGUE_CLEARED,
@@ -785,6 +813,16 @@ class DialogueExecutor(PolicyExecutor):
         self.report.notes = self.dialogue_text
         return code
 
+    def _settle_state(self):
+        state = self._agent_state()
+        for _ in range(DIALOGUE_SETTLE_WAIT):
+            if state != AgentState.IN_MENU or self._last_terminated or self._last_truncated:
+                break
+            wait_record = self._take_action(WaitAction)
+            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
+            state = self._agent_state()
+        return state
+
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
@@ -802,6 +840,12 @@ class DialogueExecutor(PolicyExecutor):
             if self._last_truncated:
                 return self._finish(DIALOGUE_TRUNCATED, "truncated")
             state = self._agent_state()
+            if state == AgentState.IN_MENU:
+                state = self._settle_state()
+                if self._last_terminated:
+                    return self._finish(DIALOGUE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._finish(DIALOGUE_TRUNCATED, "truncated")
             if state != AgentState.IN_DIALOGUE:
                 code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
                 return self._finish(code, {

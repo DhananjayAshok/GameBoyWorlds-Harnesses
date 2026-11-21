@@ -9,7 +9,8 @@ from execution.perception.pokemon.tiles import TileRecognizer, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
                                          InteractionExecutor, MenuExecutor,
                                          BATTLE_ENDED, BATTLE_LEFT_TO_DIALOGUE, BATTLE_LEFT_TO_MENU,
-                                         DIALOGUE_CLEARED, FREE_OK, LOCATION_FAIL_CODES, MENU_OK,
+                                         DIALOGUE_CLEARED, FREE_OK, LOCATION_FAIL_CODES,
+                                         MENU_LEFT_TO_BATTLE, MENU_LEFT_TO_DIALOGUE, MENU_OK,
                                          MOVE_OK, MOVE_TARGET_AMBIGUOUS,
                                          OffScreenMoveExecutor, OnScreenMoveExecutor)
 from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUGH_AFTER_BLOCK,
@@ -234,7 +235,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             left_battle=report.outcome in (BATTLE_LEFT_TO_DIALOGUE, BATTLE_LEFT_TO_MENU))
 
     def _process_menu(self, report: ExecutorReport) -> Dict[str, Any]:
-        return self._result("menu", report, report.outcome == MENU_OK)
+        return self._result("menu", report,
+                            report.outcome in (MENU_OK, MENU_LEFT_TO_DIALOGUE, MENU_LEFT_TO_BATTLE),
+                            dialogue=report.notes,
+                            left_menu=report.outcome in (MENU_LEFT_TO_DIALOGUE, MENU_LEFT_TO_BATTLE))
 
     def _process_dialogue(self, report: ExecutorReport) -> Dict[str, Any]:
         return self._result("dialogue", report, report.outcome == DIALOGUE_CLEARED,
@@ -396,6 +400,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
             objective, is_start_menu = self._menu_objective(
                 "deal with the menu that opened while the player was doing something else", frame)
             handled = self.call_executor("menu", objective, is_start_menu=is_start_menu)
+            if (handled.get("code") == MENU_LEFT_TO_DIALOGUE
+                    and self._agent_state() == AgentState.IN_DIALOGUE
+                    and not self._out_of_calls()
+                    and not self._env_done()):
+                follow_up = self.call_executor("dialogue", "clear the dialogue that followed the menu")
+                combined_text = "\n".join(filter(None, [handled.get("dialogue"), follow_up.get("dialogue")]))
+                if combined_text:
+                    follow_up["dialogue"] = combined_text
+                handled = follow_up
         else:
             handled = self.call_executor("free", self.CLEAR_EVENT_INSTRUCTION,
                                          termination=self.CLEAR_EVENT_TERMINATION)
@@ -437,6 +450,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 self._note(note)
                 attempts.append(note)
                 return "env_done", attempts
+
+            if (result.get("code") == MENU_LEFT_TO_DIALOGUE
+                    and self._agent_state() == AgentState.IN_DIALOGUE
+                    and not self._out_of_calls()
+                    and not self._env_done()):
+                follow_up = self.call_executor("dialogue", "clear the dialogue that followed the menu")
+                combined_text = "\n".join(filter(None, [result.get("dialogue"), follow_up.get("dialogue")]))
+                if combined_text:
+                    follow_up["dialogue"] = combined_text
+                follow_up["report"].initial_state = result["report"].initial_state
+                result = follow_up
 
             if not result["succeeded"] and self._agent_state() != AgentState.FREE_ROAM:
                 state, handled = self._handle_interruption()

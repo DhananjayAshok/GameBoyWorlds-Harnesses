@@ -169,7 +169,7 @@ The player is currently [AGENT_STATE].
 
 You decided to use the menus for this: "[INSTRUCTION]"
 
-Write one clear, specific objective for whoever operates the menus. They see only the screen and your objective, not the task, so name exactly what should end up selected, used, or read.
+Write one clear, specific objective for whoever operates the menus. They see only the screen and your objective, not the task, so name only what should be selected, used, read, or closed in the single menu, info screen, or yes/no choice box that is currently open (or about to be opened). Do not bundle future dialogue or later prompts that will appear after this menu or box closes.
 
 Then say whether this needs the main menu, the one opened with the Start button from the overworld, which holds the Pokedex, your Pokemon, the bag and the trainer card. Answer no if it is about a menu that is already open on the screen, such as a PC, a shop, a yes/no choice or a battle menu.
 
