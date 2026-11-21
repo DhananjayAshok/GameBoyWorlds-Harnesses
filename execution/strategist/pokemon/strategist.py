@@ -31,7 +31,7 @@ from execution.strategist.pokemon.npcs import PLACED_STATUS, STALE_EPISODES, NPC
 from execution.strategist.pokemon.global_map import (FAILURE_EPISODES, GlobalMap, MappingEnvironment, explore_text,
                                                      exploring, judge_merge, judge_stuck, keep_exploring,
                                                      name_segment, navigate_map, prompt_block, stuck_signs)
-from execution.perception.pokemon.navigation import cell_kinds
+from execution.perception.pokemon.navigation import cell_kinds, verbalize_edges
 from execution.strategist.report import (REPORT_DETAILS, EpisodeArchive, EpisodeRecord, StrategistReport,
                                          StrategistVLMCallRecord, save_episode_report, trim_episode)
 from python_scripts.paths import playthrough_dir, playthrough_session_rel
@@ -382,8 +382,12 @@ class PokemonStrategist:
     def _name_people_on_screen(self) -> None:
         try:
             people = self._screen_people()
-            if people and self._identified:
-                self._screen_tiles = verbalize_tiles(self._identified, people)
+            if self._identified:
+                kinds = cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
+                                   people)
+                self._screen_tiles = (verbalize_tiles(self._identified, people)
+                                      + "\nWalkable cells on each edge of the screen:\n"
+                                      + verbalize_edges(kinds))
         except Exception as e:
             log_warn(f"NPC registry: naming the people on screen was skipped: {type(e).__name__}: {e}",
                      self._parameters)

@@ -281,10 +281,28 @@ def boundary_exit_direction(kinds: Dict[Cell, str], identified: Optional[Dict[Tu
     return None
 
 
+def format_path_runs(runs: List[Tuple[str, int, str]]) -> str:
+    parts = []
+    for direction, steps, move in runs:
+        if move == "jump":
+            parts.append(f"jump {direction}")
+        else:
+            parts.append(f"{direction} {steps}")
+    return ", ".join(parts)
+
+
 def verbalize_edges(kinds: Dict[Cell, str]) -> str:
     lines = []
     for direction in DIRECTIONS:
         cells = edge_cells(kinds, direction)
-        listed = ", ".join(f"({x}, {y})" for x, y in cells) if cells else "none"
+        if cells:
+            listed = ", ".join(f"({x}, {y})" for x, y in cells)
+            path = shortest_path(kinds, (0, 0), cells)
+            if path:
+                target = path[-1][2]
+                runs_text = format_path_runs(compress_path(path))
+                listed += f" (shortest path to {target}: {runs_text})"
+        else:
+            listed = "none"
         lines.append(f"- {direction} edge: {listed}")
     return "\n".join(lines)
