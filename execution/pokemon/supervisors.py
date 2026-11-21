@@ -410,6 +410,21 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _env_done(self) -> bool:
         return bool(self._env._emulator.check_if_done())
 
+    @staticmethod
+    def _dialogue_snippet(handled: Dict[str, Any], limit: int = 160) -> str:
+        text = " ".join((handled.get("dialogue") or "").split())
+        return f": \"{text[:limit]}\"" if text else ""
+
+    def _clear_pending_dialogue(self, attempts: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        if self._agent_state() != AgentState.IN_DIALOGUE or self._out_of_calls() or self._env_done():
+            return None
+        handled = self.call_executor("dialogue", "clear the dialogue on screen")
+        note = f"Cleared open dialogue ({handled['reason']}){self._dialogue_snippet(handled)}"
+        self._note(note)
+        if attempts is not None:
+            attempts.append(note)
+        return handled
+
     def _pursue(self, subgoal: str) -> Tuple[str, List[str]]:
         attempts: List[str] = []
         for _ in range(self.MAX_SUBGOAL_ATTEMPTS):
@@ -417,6 +432,23 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 return "env_done", attempts
             if self._out_of_calls():
                 return "out_of_calls", attempts
+            if self._agent_state() == AgentState.IN_DIALOGUE:
+                before = self._current_frame()
+                self._perceive(before)
+                handled = self._clear_pending_dialogue(attempts)
+                if self._battles_lost():
+                    self._note("the player lost a battle and blacked out")
+                    return "lost_battle", attempts
+                if self._env_done():
+                    return "env_done", attempts
+                if handled and handled.get("succeeded") and self._agent_state() == AgentState.FREE_ROAM:
+                    complete, summary = self._judge(subgoal, "Dialogue(clear open dialogue)", handled)
+                    if complete:
+                        self._note(summary)
+                        attempts.append(f"Dialogue(): {summary}")
+                        return "complete", attempts
+                if self._out_of_calls():
+                    return "out_of_calls", attempts
             frame = self._current_frame()
             self._perceive(frame)
             decision = self._decide(subgoal, attempts, frame)
@@ -441,7 +473,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if not result["succeeded"] and self._agent_state() != AgentState.FREE_ROAM:
                 state, handled = self._handle_interruption()
                 note = (f"{request} was interrupted while the game was in {state}; "
-                        f"dealt with it ({handled['reason']})")
+                        f"dealt with it ({handled['reason']}){self._dialogue_snippet(handled)}")
                 self._note(note)
                 attempts.append(note)
                 if self._battles_lost():
@@ -461,6 +493,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 self._note(note)
                 attempts.append(note)
                 continue
+
+            if (result["tag"] in MOVE_TAGS and self._agent_state() == AgentState.IN_DIALOGUE
+                    and not self._out_of_calls() and not self._env_done()):
+                _, handled = self._handle_interruption()
+                combined_text = "\n".join(filter(None, [result.get("dialogue"), handled.get("dialogue")]))
+                result["dialogue"] = combined_text or None
+                result["report"].final_state = handled["report"].final_state
 
             complete, summary = self._judge(subgoal, request, result)
             self._note(summary)
@@ -499,6 +538,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         }
 
     def _evaluate(self) -> Optional[dict]:
+        self._clear_pending_dialogue()
         frame = self._current_frame()
         self._perceive(frame)
         self.plan = self._plan_subgoals(frame)
