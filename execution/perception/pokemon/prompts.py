@@ -16,11 +16,11 @@ Classify what is in the outlined cell into exactly one of these categories:
 - Ground: plain navigable ground the player can walk on, including ground with a repeating texture
 - Ground Decoration: walkable ground with small decorations on it, such as flowers or little tufts that look like tiny Digletts
 - Ledge: a ledge the player can jump down from one side
-- Obstacle: a boundary or obstacle that blocks movement and cannot be interacted with (trees, rocks, walls, fences, buildings)
+- Obstacle: a boundary or obstacle that blocks movement and cannot be interacted with (trees, rocks, walls, fences, buildings, or a plain empty table or counter with nothing on it)
 - Entrance: a door or entrance the player can walk into to enter or leave a building, cave or another area, including doorways, cave mouths, gates between routes, and the exit mats on the floor at the edge of a room
 - Water
 - Tall Grass: tall grass where wild Pokemon can appear
-- Interactable Object: an object the player can interact with (machines, computers, bookshelves, etc.)
+- Interactable Object: an object the player can interact with (machines, computers, bookshelves, or an object such as a Poke Ball, book, or item resting on a table, desk, or counter)
 - Item: an item lying on the ground that the player can pick up. An item on the ground always looks like a Poke Ball
 - NPC: a non-player character
 - Sign: a sign the player can read

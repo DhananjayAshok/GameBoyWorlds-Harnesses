@@ -18,6 +18,7 @@ WALKABLE_TAGS = {
 }
 WARP_TAGS = {"entrance", "staircase"}
 LEDGE_TAGS = {"ledge"}
+OVERHANG_TOP_TAGS = {"interactable object", "obstacle", "npc", "item", "sign"}
 QUARTERS = ("top_left", "top_right", "bottom_left", "bottom_right")
 
 X_RANGE = range(LEFT_COL, LEFT_COL + 10)
@@ -31,16 +32,35 @@ def in_bounds(cell: Cell) -> bool:
     return cell[0] in X_RANGE and cell[1] in Y_RANGE
 
 
+def is_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
+    top_tags = {cell_q["top_left"], cell_q["top_right"]}
+    if not (bottom_tags <= WALKABLE_TAGS) or (top_tags <= WALKABLE_TAGS):
+        return False
+    if not (top_tags <= WALKABLE_TAGS | OVERHANG_TOP_TAGS):
+        return False
+    above_q = quarter_tags.get((cell[0], cell[1] + 1), {})
+    above_bottom = {above_q[q] for q in ("bottom_left", "bottom_right") if q in above_q}
+    if above_bottom:
+        return bool(above_bottom & OVERHANG_TOP_TAGS)
+    return True
+
+
 def cell_kinds(identified, ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None) -> Dict[Cell, str]:
     # ``ledge_patterns``: quarter hashes (QUARTERS order) of cells seen hopped over; they override the labels.
     tags: Dict[Cell, set] = {}
+    quarter_tags: Dict[Cell, Dict[str, str]] = {}
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
         tags.setdefault((x, y), set()).add(tile.tag)
+        quarter_tags.setdefault((x, y), {})[quarter] = tile.tag
         hashes.setdefault((x, y), {})[quarter] = tile.hash
     kinds = {}
     for cell, cell_tags in tags.items():
-        if cell_tags & WARP_TAGS or cell_tags <= WALKABLE_TAGS:
+        if cell_tags & WARP_TAGS or cell_tags <= WALKABLE_TAGS or is_overhang_floor_cell(cell, quarter_tags):
             kinds[cell] = WALKABLE
         elif cell_tags <= WALKABLE_TAGS | LEDGE_TAGS:
             kinds[cell] = LEDGE

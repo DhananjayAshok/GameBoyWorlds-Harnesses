@@ -11,8 +11,9 @@ from execution.artifact import StrategistArtifact, update
 from execution.perception.matching import cell_key, split_quarters
 from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box
 from execution.perception.pokemon.grid import GRID_SKIP
-from execution.perception.pokemon.navigation import LEDGE_TAGS, WALKABLE_TAGS
-from execution.perception.pokemon.tiles import TileRecognizer
+from execution.perception.pokemon.navigation import (LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
+                                                     is_overhang_floor_cell)
+from execution.perception.pokemon.tiles import TileRecognizer, normalize_tabletop_tag
 
 from .registration import (BLACK_LEVEL, _local_cells, _screen, _still_lit, grid_offset, grid_residual, has_structure,
                            register)
@@ -300,6 +301,11 @@ class GlobalMap(StrategistArtifact):
             self.trail.append((self.step, self.segment, self.pos))
             return 0
         masked_cells = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
+        quarter_tags: Dict[Cell, Dict[str, str]] = {}
+        if shift == (0, 0):
+            for (ix, iy, iq), tile in (identified or {}).items():
+                quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(tile.tag, tile.description)
+        overhang_cells = {cell for cell in quarter_tags if is_overhang_floor_cell(cell, quarter_tags)}
         for (x, y), piece in _local_cells(a, shift):
             if (x, y) in masked_cells and (x, y) != (0, 0):
                 continue
@@ -310,8 +316,16 @@ class GlobalMap(StrategistArtifact):
                 tags, kind = ("player",), WALKABLE
             elif shift != (0, 0):
                 tags, kind = ("unknown",), UNKNOWN
+            elif (x, y) in overhang_cells:
+                tags = tuple(sorted({
+                    quarter_tags[(x, y)][q] for q in ("bottom_left", "bottom_right") if q in quarter_tags[(x, y)]
+                }))
+                kind = WALKABLE
             else:
-                tags = tuple(sorted({identified[(x, y, q)].tag for q in QUARTERS if (x, y, q) in identified}))
+                tags = tuple(sorted({
+                    normalize_tabletop_tag(identified[(x, y, q)].tag, identified[(x, y, q)].description)
+                    for q in QUARTERS if (x, y, q) in identified
+                }))
                 kind = self._classify(tags, hashes)
             g = (px + x, py + y)
             old = seg.get(g)
@@ -691,15 +705,27 @@ class GlobalMap(StrategistArtifact):
     def refresh(self, tile_lookup: Dict[str, Any]) -> int:
         changed = 0
         for seg in self.segments:
-            for c in seg.values():
-                if c.kind != UNKNOWN:
-                    continue
+            quarter_tags: Dict[Cell, Dict[str, str]] = {}
+            for g, c in seg.items():
                 tiles = [tile_lookup.get(h) for h in c.hashes]
-                if any(t is None for t in tiles):
+                if all(t is not None for t in tiles):
+                    quarter_tags[g] = {
+                        q: normalize_tabletop_tag(t.tag, t.description) for q, t in zip(QUARTERS, tiles)
+                    }
+            for g, c in seg.items():
+                if g not in quarter_tags:
                     continue
-                c.tags = tuple(sorted({t.tag for t in tiles}))
-                c.kind = self._classify(c.tags, c.hashes)
-                changed += 1
+                if is_overhang_floor_cell(g, quarter_tags):
+                    new_tags = tuple(sorted({quarter_tags[g]["bottom_left"], quarter_tags[g]["bottom_right"]}))
+                    new_kind = WALKABLE
+                elif c.kind == UNKNOWN:
+                    new_tags = tuple(sorted(set(quarter_tags[g].values())))
+                    new_kind = self._classify(new_tags, c.hashes)
+                else:
+                    continue
+                if (c.kind, c.tags) != (new_kind, new_tags):
+                    c.kind, c.tags = new_kind, new_tags
+                    changed += 1
         return changed
 
     @update
