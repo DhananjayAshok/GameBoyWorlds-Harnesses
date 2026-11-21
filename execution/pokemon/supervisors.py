@@ -416,6 +416,16 @@ class PokemonPlayThroughSupervisor(Supervisor):
             handled = self.call_executor("dialogue", "clear the dialogue that interrupted what the player was doing")
         elif state == AgentState.IN_BATTLE:
             handled = self._combat(self._battle_instructions(frame))
+            if (handled.get("succeeded")
+                    and self._agent_state() == AgentState.IN_DIALOGUE
+                    and not self._out_of_calls()
+                    and not self._env_done()):
+                follow_up = self.call_executor("dialogue", "clear the dialogue that followed the battle")
+                combined_text = "
+".join(filter(None, [handled.get("dialogue"), follow_up.get("dialogue")]))
+                if combined_text:
+                    handled["dialogue"] = combined_text
+                handled["report"].final_state = follow_up["report"].final_state
         elif state == AgentState.IN_MENU:
             objective, is_start_menu = self._menu_objective(
                 "deal with the menu that opened while the player was doing something else", frame)

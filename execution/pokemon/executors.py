@@ -6,6 +6,8 @@ from execution.game_api import (AgentState, BattleMenuAction, InteractAction, Me
                                 OpenMenuAction, PassDialogueAction, PickAttackAction, WaitAction)
 
 from execution.executors import PolicyExecutor
+from execution.perception.pokemon.battle import (has_menu_cursor, is_battle_decision_screen,
+                                                 is_same_battle_frame)
 from execution.perception.pokemon.navigation import (DIRECTIONS, WALKABLE, approach_cells,
                                                      boundary_exit_direction, compress_path, edge_cells,
                                                      in_bounds, is_boundary_exit_direction, parse_cell,
@@ -17,6 +19,20 @@ from utils import log_error, ocr, parse_int, parse_key_value, parse_yes_no
 
 DIALOGUE_BACKGROUND = 248
 CURSOR_MARGIN = 12
+
+
+def is_blank_crop(crop: np.ndarray) -> bool:
+    if crop.size == 0 or crop.shape[1] <= CURSOR_MARGIN:
+        return True
+    return bool(np.all(crop[:, :-CURSOR_MARGIN] >= DIALOGUE_BACKGROUND))
+
+
+def is_same_crop(earlier: np.ndarray, later: np.ndarray) -> bool:
+    if earlier.shape != later.shape:
+        return False
+    a = earlier[:, :-CURSOR_MARGIN] >= DIALOGUE_BACKGROUND
+    b = later[:, :-CURSOR_MARGIN] >= DIALOGUE_BACKGROUND
+    return bool(np.array_equal(a, b))
 
 
 def is_prefix_crop(earlier: np.ndarray, later: np.ndarray) -> bool:
@@ -41,6 +57,10 @@ def captured_dialogue_crops(records: List[EnvironmentStepRecord]) -> List[Any]:
 def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> List[Any]:
     kept = [] if kept is None else kept
     for crop in crops:
+        if is_blank_crop(crop):
+            continue
+        if kept and is_same_crop(kept[-1], crop):
+            continue
         if kept and is_prefix_crop(kept[-1], crop):
             kept[-1] = crop
         else:
@@ -451,9 +471,12 @@ BATTLE_UNREADABLE = -2
 BATTLE_ACTION_FAILED = -3
 BATTLE_OUT_OF_STEPS = -4
 
-FREE_ROAM_CHECK_PRESSES = 5
-AUTO_PROGRESS_PRESSES = 4
+BATTLE_EXIT_SETTLE_WAIT = 4
+MAX_TURN_PROGRESS_STEPS = 25
+MAX_IDLE_PROGRESS_STEPS = 3
+MAX_STAT_DISMISS_STEPS = 4
 BATTLE_OPTIONS = ("fight", "bag", "pokemon", "run", "progress")
+MENU_PRESSES = ("up", "down", "left", "right", "confirm", "back")
 LEFT_BATTLE_CODES = {
     AgentState.FREE_ROAM: BATTLE_ENDED,
     AgentState.IN_DIALOGUE: BATTLE_LEFT_TO_DIALOGUE,
@@ -475,8 +498,8 @@ Choose what to do next:
 - fight: attack, and say which of the four moves to use (1 is the top one)
 - progress: press through battle text, or continue when there is no choice to make
 - run: try to escape. This never works against another trainer
-- bag: open the bag to use an item. This hands over to the menu system, so only choose it if an item is needed
-- pokemon: open your team to switch. This hands over to the menu system, so only choose it if switching is needed
+- bag: open the bag to use an item; only choose it if an item is needed
+- pokemon: open your team to switch; only choose it if switching is needed
 
 Respond in exactly this format:
 Reasoning: <what the screen shows and what to do about it>
@@ -503,10 +526,30 @@ Reasoning: <which move to use and why>
 Move: <1, 2, 3 or 4>
 [STOP]"""
 
+    MENU_STEP_TAG = "battle_menu_step"
+
+    MENU_STEP_PROMPT = """You are playing a Game Boy Pokemon game and a menu or choice box is open during a battle.
+
+[INSTRUCTIONS]
+The image is the current screen.
+[HISTORY]
+Choose the single button press that best moves towards completing this menu or choice box so the battle can continue (or press back to cancel and return to the battle menu if nothing is needed here).
+
+The presses you can make:
+- up, down, left, right: move the cursor
+- confirm: press A to choose what the cursor is on
+- back: press B to go back, say no, or close the menu
+
+Respond in exactly this format:
+Reasoning: <what the menu or choice box shows, and what should be pressed next>
+Press: <one of up, down, left, right, confirm, back>
+[STOP]"""
+
     def __init__(self, env, task, max_steps: int = 60, **kwargs):
         self.history: List[str] = []
         self.dialogue_crops: List[Any] = []
         self.dialogue_text: List[str] = []
+        self._exited_to_free_roam: bool = False
         super().__init__(env, task, max_steps, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
@@ -517,19 +560,111 @@ Move: <1, 2, 3 or 4>
     def _agent_state(self):
         return self._get_state()["pokemon_core"]["agent_state"]
 
-    def _read_new_text(self, record: EnvironmentStepRecord) -> List[str]:
-        before = len(self.dialogue_crops)
-        last_before = self.dialogue_crops[-1] if self.dialogue_crops else None
-        drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
-        start = before
-        if last_before is not None and self.dialogue_crops[before - 1] is not last_before:
-            start = before - 1
-        fresh = self.dialogue_crops[start:]
+    def _current_frame(self) -> np.ndarray:
+        return self._get_state()["core"]["current_frame"]
+
+    def _ensure_scripted(self, description: str) -> None:
+        if self._current_call is None:
+            self._begin_scripted(description)
+
+    def _read_new_text(self, records: List[EnvironmentStepRecord], *, new_turn: bool = False) -> List[str]:
+        if isinstance(records, EnvironmentStepRecord):
+            records = [records]
+        crops = captured_dialogue_crops(records)
+        if not crops:
+            return []
+        if new_turn:
+            fresh = drop_prefix_crops(crops)
+            self.dialogue_crops.extend(fresh)
+        else:
+            before = len(self.dialogue_crops)
+            last_before = self.dialogue_crops[-1] if self.dialogue_crops else None
+            drop_prefix_crops(crops, self.dialogue_crops)
+            start = before
+            if last_before is not None and self.dialogue_crops[before - 1] is not last_before:
+                start = before - 1
+            fresh = self.dialogue_crops[start:]
         if not fresh:
             return []
         texts = ocr(fresh, self._vlm, do_merge=True, parameters=self._parameters)
         self.dialogue_text.extend(texts)
         return texts
+
+    def _confirm_battle_exit(self, records: List[EnvironmentStepRecord]) -> bool:
+        self._ensure_scripted("settle battle exit")
+        state = self._agent_state()
+        for _ in range(BATTLE_EXIT_SETTLE_WAIT):
+            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
+                break
+            wait_record = self._take_action(WaitAction)
+            records.append(wait_record)
+            state = self._agent_state()
+        if state != AgentState.IN_BATTLE:
+            self._exited_to_free_roam = True
+            return True
+        return False
+
+    def _advance_until_decision(self, records: List[EnvironmentStepRecord]) -> Tuple[int, int]:
+        self._ensure_scripted("advance battle text")
+        progress_presses = 0
+        stat_dismisses = 0
+        consecutive_dismisses = 0
+        idle_steps = 0
+        for _ in range(MAX_TURN_PROGRESS_STEPS):
+            if self._last_terminated or self._last_truncated:
+                break
+            state = self._agent_state()
+            frame = self._current_frame()
+            if state == AgentState.FREE_ROAM:
+                if self._confirm_battle_exit(records):
+                    break
+                continue
+            if state == AgentState.IN_MENU:
+                if has_menu_cursor(frame) or consecutive_dismisses >= MAX_STAT_DISMISS_STEPS:
+                    break
+                extra = self._take_action(MenuAction, menu_action="confirm")
+                records.append(extra)
+                stat_dismisses += 1
+                consecutive_dismisses += 1
+                idle_steps = 0
+                if extra.action_success == -1:
+                    break
+                continue
+            if state == AgentState.IN_DIALOGUE:
+                extra = self._take_action(PassDialogueAction)
+                records.append(extra)
+                progress_presses += 1
+                consecutive_dismisses = 0
+                idle_steps = 0
+                if extra.action_success == -1:
+                    break
+                continue
+            if is_battle_decision_screen(frame):
+                break
+            extra = self._take_action(BattleMenuAction, option="progress")
+            records.append(extra)
+            if self._last_terminated or self._last_truncated:
+                break
+            if extra.action_success == -1:
+                break
+            progress_presses += 1
+            consecutive_dismisses = 0
+            if is_same_battle_frame(extra.frame_before, extra.frame_after):
+                idle_steps += 1
+                if idle_steps >= MAX_IDLE_PROGRESS_STEPS:
+                    break
+            else:
+                idle_steps = 0
+        return progress_presses, stat_dismisses
+
+    @staticmethod
+    def _format_auto_suffix(progress_presses: int, stat_dismisses: int) -> str:
+        parts = []
+        if progress_presses:
+            parts.append(f"pressed progress {progress_presses} time{'s' if progress_presses > 1 else ''}")
+        if stat_dismisses:
+            parts.append(f"dismissed {stat_dismisses} stat box{'es' if stat_dismisses > 1 else ''}")
+        return (", then " + " and ".join(parts)) if parts else ""
 
     def _history_block(self) -> str:
         if not self.history:
@@ -548,7 +683,7 @@ Move: <1, 2, 3 or 4>
             if move is not None:
                 return move
             self._record_invalid(output, reason="no move number")
-            frame = self._get_state()["core"]["current_frame"]
+            frame = self._current_frame()
             prompt = (self.MOVE_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
                       .replace("[HISTORY]", self._history_block())
                       .replace("[PREVIOUS]", output[:self.MAX_PREVIOUS_CHARS]))
@@ -573,35 +708,134 @@ Move: <1, 2, 3 or 4>
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
+        self._exited_to_free_roam = False
         if self._agent_state() != AgentState.IN_BATTLE:
             return self._fail(BATTLE_NOT_IN_BATTLE, "not_in_battle",
                               f"The player is {self._agent_state().name.lower()}, not in a battle.")
+
+        if not is_battle_decision_screen(self._current_frame()):
+            self._begin_scripted("advance through opening battle text")
+            intro_records: List[EnvironmentStepRecord] = []
+            presses, dismisses = self._advance_until_decision(intro_records)
+            if self._last_terminated:
+                return self._fail(BATTLE_TERMINATED, "terminated")
+            if self._last_truncated:
+                return self._fail(BATTLE_TRUNCATED, "truncated")
+            texts = self._read_new_text(intro_records, new_turn=True)
+            if presses or dismisses or texts:
+                entry = "- battle intro" + self._format_auto_suffix(presses, dismisses).replace(", then ", ": ")
+                if texts:
+                    entry += "\n  text on screen: " + " / ".join(texts)
+                self.history.append(entry)
+            if self._exited_to_free_roam:
+                return self._record_outcome(AgentState.FREE_ROAM)
 
         consecutive_invalid = 0
         consecutive_failures = 0
         for step in range(self._max_steps):
             state = self._agent_state()
-            if state == AgentState.FREE_ROAM:
-                texts = []
-                for _ in range(FREE_ROAM_CHECK_PRESSES):
-                    record = self._take_action_string("button(b)")
+            if self._exited_to_free_roam or state == AgentState.FREE_ROAM:
+                if not self._exited_to_free_roam:
+                    check_records: List[EnvironmentStepRecord] = []
+                    exited = self._confirm_battle_exit(check_records)
                     if self._last_terminated:
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
-                    texts.extend(self._read_new_text(record))
-                state = self._agent_state()
-                entry = f"- step {step + 1}: the screen did not look like a battle, pressed B {FREE_ROAM_CHECK_PRESSES} times"
+                    texts = self._read_new_text(check_records)
+                    if texts:
+                        self.history.append(f"- step {step + 1}: settled battle exit\n  text on screen: "
+                                            + " / ".join(texts))
+                    if not exited:
+                        continue
+                return self._record_outcome(AgentState.FREE_ROAM)
+
+            if state == AgentState.IN_DIALOGUE:
+                self._ensure_scripted("advance battle dialogue")
+                turn_records: List[EnvironmentStepRecord] = []
+                presses, dismisses = self._advance_until_decision(turn_records)
+                if self._last_terminated:
+                    return self._fail(BATTLE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._fail(BATTLE_TRUNCATED, "truncated")
+                texts = self._read_new_text(turn_records)
+                if presses or dismisses or texts:
+                    entry = f"- step {step + 1}: advanced battle dialogue" + self._format_auto_suffix(presses, dismisses)
+                    if texts:
+                        entry += "\n  text on screen: " + " / ".join(texts)
+                    self.history.append(entry)
+                if self._exited_to_free_roam:
+                    return self._record_outcome(AgentState.FREE_ROAM)
+                if self._agent_state() == AgentState.IN_DIALOGUE and not presses:
+                    return self._record_outcome(AgentState.IN_DIALOGUE)
+                continue
+
+            if state == AgentState.IN_MENU:
+                frame = self._current_frame()
+                if not has_menu_cursor(frame):
+                    self._ensure_scripted("dismiss battle stat overlay")
+                    turn_records = []
+                    presses, dismisses = self._advance_until_decision(turn_records)
+                    if self._last_terminated:
+                        return self._fail(BATTLE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._fail(BATTLE_TRUNCATED, "truncated")
+                    texts = self._read_new_text(turn_records)
+                    if presses or dismisses or texts:
+                        entry = f"- step {step + 1}: dismissed stat overlay" + self._format_auto_suffix(presses, dismisses)
+                        if texts:
+                            entry += "\n  text on screen: " + " / ".join(texts)
+                        self.history.append(entry)
+                    if self._exited_to_free_roam:
+                        return self._record_outcome(AgentState.FREE_ROAM)
+                    if self._agent_state() != AgentState.IN_MENU:
+                        continue
+                    frame = self._current_frame()
+
+                prompt = (self.MENU_STEP_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
+                          .replace("[HISTORY]", self._history_block()))
+                output = self._vlm_call(self.MENU_STEP_TAG, texts=prompt, images=[frame],
+                                        max_new_tokens=self.MAX_NEW_TOKENS)
+                press = (parse_key_value(output, "Press") or "").strip().lower()
+                press = next((name for name in MENU_PRESSES if name in press), None)
+                if press is None:
+                    self._record_invalid(output)
+                    consecutive_invalid += 1
+                    if consecutive_invalid >= self.MAX_INVALID:
+                        return self._fail(BATTLE_UNREADABLE, "action_unreadable", output)
+                    continue
+                consecutive_invalid = 0
+                record = self._take_action(MenuAction, menu_action=press)
+                if self._last_terminated:
+                    return self._fail(BATTLE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._fail(BATTLE_TRUNCATED, "truncated")
+                turn_records = [record]
+                entry = f"- step {step + 1}: pressed {press} in battle menu"
+                if record.action_success == -1:
+                    entry += " (the game did not accept it)"
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+                presses, dismisses = 0, 0
+                if self._agent_state() != AgentState.IN_MENU:
+                    presses, dismisses = self._advance_until_decision(turn_records)
+                    if self._last_terminated:
+                        return self._fail(BATTLE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._fail(BATTLE_TRUNCATED, "truncated")
+                entry += self._format_auto_suffix(presses, dismisses)
+                texts = self._read_new_text(turn_records, new_turn=True)
                 if texts:
                     entry += "\n  text on screen: " + " / ".join(texts)
                 self.history.append(entry)
-                if state != AgentState.IN_BATTLE:
-                    return self._record_outcome(state)
+                if self._exited_to_free_roam:
+                    return self._record_outcome(AgentState.FREE_ROAM)
+                if consecutive_failures >= self.MAX_INVALID:
+                    return self._fail(BATTLE_ACTION_FAILED, "actions_not_accepted", self._history_block())
                 continue
-            if state != AgentState.IN_BATTLE:
-                return self._record_outcome(state)
 
-            frame = self._get_state()["core"]["current_frame"]
+            frame = self._current_frame()
             prompt = (self.STEP_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
                       .replace("[HISTORY]", self._history_block()))
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
@@ -621,58 +855,73 @@ Move: <1, 2, 3 or 4>
                 return self._fail(BATTLE_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._fail(BATTLE_TRUNCATED, "truncated")
+            turn_records = [record]
             entry = f"- step {step + 1}: chose {option}"
             if record.action_success in (1, 2):
                 entry += " (could not escape)"
+                consecutive_failures = 0
             elif record.action_success == -1:
                 entry += " (the game did not accept it)"
                 consecutive_failures += 1
             else:
                 consecutive_failures = 0
 
-            if option == "fight" and record.action_success == 0:
-                move = self._choose_move(output)
-                if move is None:
-                    entry += ", but no move number was given"
-                else:
-                    attack = self._take_action(PickAttackAction, option=move)
+            presses, dismisses = 0, 0
+            if option == "fight":
+                attack = None
+                if record.action_success == 0:
+                    move = self._choose_move(output)
+                    if move is None:
+                        entry += ", but no move number was given"
+                    else:
+                        attack = self._take_action(PickAttackAction, option=move)
+                elif record.action_success == -1:
+                    move = parse_int(output, "Move", lo=1, hi=4)
+                    if move is not None:
+                        attack = self._take_action(PickAttackAction, option=move)
+                        if attack.action_success != -1:
+                            consecutive_failures = 0
+                            entry = f"- step {step + 1}: chose fight"
+                if attack is not None:
+                    if self._last_terminated:
+                        return self._fail(BATTLE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._fail(BATTLE_TRUNCATED, "truncated")
+                    turn_records.append(attack)
                     entry += f", used move {move}"
                     if attack.action_success == 1:
                         entry += " (no PP left)"
                     elif attack.action_success == -1:
                         entry += " (the game did not accept it)"
+                    else:
+                        presses, dismisses = self._advance_until_decision(turn_records)
+                        if self._last_terminated:
+                            return self._fail(BATTLE_TERMINATED, "terminated")
+                        if self._last_truncated:
+                            return self._fail(BATTLE_TRUNCATED, "truncated")
+            elif option in ("progress", "run") and record.action_success != -1:
+                if (option == "progress"
+                        and is_same_battle_frame(record.frame_before, record.frame_after)
+                        and is_battle_decision_screen(self._current_frame())):
+                    entry += " (a battle menu is already open waiting for a choice; choose fight, pokemon, bag, or run)"
+                else:
+                    presses, dismisses = self._advance_until_decision(turn_records)
                     if self._last_terminated:
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
-                    record = attack
 
-            texts = self._read_new_text(record)
-            if option == "progress" and texts:
-                auto = 0
-                while auto < AUTO_PROGRESS_PRESSES and self._agent_state() == AgentState.IN_BATTLE:
-                    extra = self._take_action(BattleMenuAction, option="progress")
-                    if self._last_terminated:
-                        return self._fail(BATTLE_TERMINATED, "terminated")
-                    if self._last_truncated:
-                        return self._fail(BATTLE_TRUNCATED, "truncated")
-                    if extra.action_success == -1:
-                        break
-                    auto += 1
-                    more = self._read_new_text(extra)
-                    texts.extend(more)
-                    if not more:
-                        break
-                if auto:
-                    entry += f", then pressed progress {auto} more time{'s' if auto > 1 else ''}"
+            entry += self._format_auto_suffix(presses, dismisses)
+            texts = self._read_new_text(turn_records, new_turn=(option != "progress"))
             if texts:
                 entry += "\n  text on screen: " + " / ".join(texts)
             self.history.append(entry)
+            if self._exited_to_free_roam:
+                return self._record_outcome(AgentState.FREE_ROAM)
             if consecutive_failures >= self.MAX_INVALID:
                 return self._fail(BATTLE_ACTION_FAILED, "actions_not_accepted", self._history_block())
 
         return self._fail(BATTLE_OUT_OF_STEPS, "out_of_steps", self._history_block())
-
 
 MENU_OK = 0
 MENU_TERMINATED = 1
@@ -684,7 +933,6 @@ MENU_OPEN_FAILED = -2
 MENU_UNREADABLE = -3
 MENU_OUT_OF_STEPS = -4
 
-MENU_PRESSES = ("up", "down", "left", "right", "confirm", "back")
 MENU_STATES = (AgentState.IN_MENU, AgentState.IN_BATTLE, AgentState.IN_DIALOGUE)
 LEFT_MENU_OUTCOMES = {
     AgentState.FREE_ROAM: (MENU_OK, "menu_closed"),
