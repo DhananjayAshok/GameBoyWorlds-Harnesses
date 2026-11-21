@@ -9,8 +9,10 @@ import numpy as np
 
 from execution.artifact import StrategistArtifact, update
 from execution.perception.matching import cell_key, split_quarters
+from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import LEDGE_TAGS, WALKABLE_TAGS
+from execution.perception.pokemon.tiles import TileRecognizer
 
 from .registration import (BLACK_LEVEL, _local_cells, _screen, _still_lit, grid_offset, grid_residual, has_structure,
                            register)
@@ -293,7 +295,14 @@ class GlobalMap(StrategistArtifact):
         a = _screen(frame)
         px, py = self.pos
         added = 0
+        if has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
+            self.visits[self.segment][self.pos] += 1
+            self.trail.append((self.step, self.segment, self.pos))
+            return 0
+        masked_cells = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
         for (x, y), piece in _local_cells(a, shift):
+            if (x, y) in masked_cells and (x, y) != (0, 0):
+                continue
             pixels = piece.copy()
             quarters = split_quarters(piece)
             hashes = self._cell_hashes(quarters)

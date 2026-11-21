@@ -4,7 +4,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from execution.game_api import AgentState, WaitAction
 
 from execution.executors import Executor
-from execution.perception.pokemon.battle import has_bottom_dialogue_box, is_cutscene_frame_changing
+from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_modal_preview_box,
+                                                 is_cutscene_frame_changing)
 from execution.perception.pokemon.navigation import cell_kinds, verbalize_edges
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
@@ -135,7 +136,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return True
         if state == AgentState.FREE_ROAM:
             frame = self._current_frame() if frame is None else frame
-            return has_bottom_dialogue_box(frame)
+            return has_bottom_dialogue_box(frame) or has_modal_preview_box(frame)
         return False
 
     def _perceive(self, frame) -> str:
@@ -144,7 +145,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._identified = {}
             self._screen_tiles = describe_state_screen(state)
             return self._screen_tiles
-        if has_bottom_dialogue_box(frame):
+        if has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
             self._identified = {}
             self._screen_tiles = describe_state_screen(AgentState.IN_DIALOGUE)
             return self._screen_tiles
@@ -306,7 +307,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         before = report.initial_state["core"]["current_frame"]
         after = report.final_state["core"]["current_frame"]
         after_state = report.final_state["pokemon_core"]["agent_state"]
-        if after_state == AgentState.FREE_ROAM and has_bottom_dialogue_box(after):
+        if after_state == AgentState.FREE_ROAM and (has_bottom_dialogue_box(after) or has_modal_preview_box(after)):
             after_state = AgentState.IN_DIALOGUE
         if after_state == AgentState.FREE_ROAM:
             self._tile_recognizer.record_tiles(after, self._episode_number)

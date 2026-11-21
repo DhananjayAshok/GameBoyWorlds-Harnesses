@@ -156,3 +156,110 @@ def is_cutscene_frame_changing(earlier: np.ndarray, later: np.ndarray) -> bool:
     diff = np.abs(a - b) > CUTSCENE_DIFF_THRESHOLD
     diff[88:, 104:] = False
     return int(diff.sum()) >= CUTSCENE_DIFF_MIN_PIXELS
+
+
+BANNER_TOP = 112
+BANNER_INNER_TOP = 120
+BANNER_INNER_BOTTOM = 136
+BANNER_BOTTOM = 144
+BANNER_MIN_LIGHT_FRACTION = 0.65
+
+MODAL_MIN_SPAN_TILES = 5
+MODAL_MIN_LIGHT_FRACTION = 0.50
+MODAL_MIN_MARGIN_LIGHT_FRACTION = 0.75
+
+
+def is_horizontal_border_tile(raw_tile: np.ndarray) -> bool:
+    """Return True if an 8x8 tile has horizontal UI frame border lines."""
+    if raw_tile.shape[:2] != (TILE_SIZE, TILE_SIZE):
+        return False
+    tile = _grey_frame(raw_tile)
+    if not ((tile < DARK_INK).any() and (tile >= LIGHT_BACKGROUND).any()):
+        return False
+    row_dark = (tile < DARK_INK).mean(axis=1)
+    row_light = (tile >= LIGHT_BACKGROUND).mean(axis=1)
+    return bool((row_dark >= 0.5).any() and (row_light >= 0.5).any())
+
+
+def is_vertical_border_tile(raw_tile: np.ndarray) -> bool:
+    """Return True if an 8x8 tile has vertical UI frame border lines."""
+    if raw_tile.shape[:2] != (TILE_SIZE, TILE_SIZE):
+        return False
+    tile = _grey_frame(raw_tile)
+    if not ((tile < DARK_INK).any() and (tile >= LIGHT_BACKGROUND).any()):
+        return False
+    col_dark = (tile < DARK_INK).mean(axis=0)
+    col_light = (tile >= LIGHT_BACKGROUND).mean(axis=0)
+    return bool((col_dark >= 0.5).any() and (col_light >= 0.5).any())
+
+
+def has_bottom_location_banner(frame: np.ndarray) -> bool:
+    """Return True if a bottom-anchored location/area banner overlay is drawn on the screen."""
+    img = _grey_frame(frame)
+    if img.shape[0] < BANNER_BOTTOM or img.shape[1] < DIALOGUE_BOX_CHECK_RIGHT:
+        return False
+    inner = img[BANNER_INNER_TOP:BANNER_INNER_BOTTOM,
+                BOTTOM_BOX_INNER_LEFT:DIALOGUE_BOX_CHECK_RIGHT]
+    if float((inner >= LIGHT_BACKGROUND).mean()) < BANNER_MIN_LIGHT_FRACTION:
+        return False
+    top_border = img[BANNER_TOP:BANNER_INNER_TOP,
+                     DIALOGUE_BOX_CHECK_LEFT:DIALOGUE_BOX_CHECK_RIGHT]
+    bottom_border = img[BANNER_INNER_BOTTOM:BANNER_BOTTOM,
+                        DIALOGUE_BOX_CHECK_LEFT:DIALOGUE_BOX_CHECK_RIGHT]
+    left_border = img[BANNER_INNER_TOP:BANNER_INNER_BOTTOM, :DIALOGUE_BOX_CHECK_LEFT]
+    n_top_tiles = (DIALOGUE_BOX_CHECK_RIGHT - DIALOGUE_BOX_CHECK_LEFT) // TILE_SIZE
+    n_side_tiles = (BANNER_INNER_BOTTOM - BANNER_INNER_TOP) // TILE_SIZE
+    for i in range(n_top_tiles):
+        sl = slice(i * TILE_SIZE, (i + 1) * TILE_SIZE)
+        if not (is_horizontal_border_tile(top_border[:, sl])
+                and is_horizontal_border_tile(bottom_border[:, sl])):
+            return False
+    for i in range(n_side_tiles):
+        if not is_vertical_border_tile(left_border[i * TILE_SIZE:(i + 1) * TILE_SIZE, :]):
+            return False
+    return True
+
+
+def find_modal_preview_boxes(frame: np.ndarray):
+    """Return (top_ty, bot_ty, left_tx, right_tx) tile bounds for enclosed modal preview boxes."""
+    img = _grey_frame(frame)
+    max_ty = min(GRID_ROWS, img.shape[0] // TILE_SIZE)
+    max_tx = min(GRID_COLS, img.shape[1] // TILE_SIZE)
+    if max_ty < GRID_ROWS or max_tx < GRID_COLS:
+        return []
+    tiles = [[img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+              for tx in range(max_tx)] for ty in range(max_ty)]
+    h_border = [[is_horizontal_border_tile(tiles[ty][tx]) for tx in range(max_tx)] for ty in range(max_ty)]
+    v_border = [[is_vertical_border_tile(tiles[ty][tx]) for tx in range(max_tx)] for ty in range(max_ty)]
+    boxes = []
+    for top_ty in range(1, 11):
+        for bot_ty in range(top_ty + MODAL_MIN_SPAN_TILES, 16):
+            for left_tx in range(1, 12):
+                for right_tx in range(left_tx + MODAL_MIN_SPAN_TILES, 19):
+                    if not all(h_border[top_ty][tx] and h_border[bot_ty][tx]
+                               for tx in range(left_tx + 1, right_tx)):
+                        continue
+                    if not all(v_border[ty][left_tx] for ty in range(top_ty + 1, bot_ty)):
+                        continue
+                    r_end = min(bot_ty, 12) if right_tx >= 13 else bot_ty
+                    if not all(v_border[ty][right_tx] for ty in range(top_ty + 1, r_end)):
+                        continue
+                    y0, y1 = (top_ty + 1) * TILE_SIZE, bot_ty * TILE_SIZE
+                    x0, x1 = (left_tx + 1) * TILE_SIZE, right_tx * TILE_SIZE
+                    inner = img[y0:y1, x0:x1]
+                    if float((inner >= LIGHT_BACKGROUND).mean()) < MODAL_MIN_LIGHT_FRACTION:
+                        continue
+                    margin_mask = np.zeros(inner.shape, dtype=bool)
+                    margin_mask[:TILE_SIZE, :] = True
+                    margin_mask[-TILE_SIZE:, :] = True
+                    margin_mask[:, :TILE_SIZE] = True
+                    margin_mask[:, -TILE_SIZE:] = True
+                    if float((inner[margin_mask] >= LIGHT_BACKGROUND).mean()) < MODAL_MIN_MARGIN_LIGHT_FRACTION:
+                        continue
+                    boxes.append((top_ty, bot_ty, left_tx, right_tx))
+    return boxes
+
+
+def has_modal_preview_box(frame: np.ndarray) -> bool:
+    """Return True if an enclosed modal preview window is open over the overworld."""
+    return bool(find_modal_preview_boxes(frame))

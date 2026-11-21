@@ -5,6 +5,8 @@ import numpy as np
 
 from execution.artifact import StrategistArtifact, update
 from execution.perception.matching import cell_key, shade_bank, shade_candidates, split_quarters
+from execution.perception.pokemon.battle import (BANNER_TOP, TILE_SIZE, find_modal_preview_boxes,
+                                                 has_bottom_dialogue_box, has_bottom_location_banner)
 from execution.perception.pokemon.grid import GRID_SKIP, cell_box, draw_box, split_grid
 from execution.perception.pokemon.prompts import PLAYER_SIDES, TILE_IN_CELL_PROMPT, TILE_TAGS, fill_player_note
 from utils import log_error, parse_key_value
@@ -255,17 +257,51 @@ class TileRecognizer(StrategistArtifact):
                 pieces[(x, y, quarter)] = piece
         return pieces
 
+    @staticmethod
+    def overlay_tile_keys(frame: np.ndarray) -> set:
+        if has_bottom_dialogue_box(frame):
+            return {(x, y, q) for x in range(-4, 6) for y in (-4, -3, -2) for q in QUARTER_OFFSETS}
+        masked = set()
+        if has_bottom_location_banner(frame):
+            for x in range(-4, 6):
+                for y in range(-4, 5):
+                    _, y0, _, _ = cell_box(x, y)
+                    for q, (_, dy) in QUARTER_OFFSETS.items():
+                        if y0 + dy + TILE_SIZE > BANNER_TOP:
+                            masked.add((x, y, q))
+        for top_ty, bot_ty, left_tx, right_tx in find_modal_preview_boxes(frame):
+            box_x0, box_x1 = left_tx * TILE_SIZE, (right_tx + 1) * TILE_SIZE
+            box_y0, box_y1 = top_ty * TILE_SIZE, (bot_ty + 1) * TILE_SIZE
+            for x in range(-4, 6):
+                for y in range(-4, 5):
+                    x0, y0, _, _ = cell_box(x, y)
+                    for q, (dx, dy) in QUARTER_OFFSETS.items():
+                        qx0, qy0 = x0 + dx, y0 + dy
+                        if qx0 + TILE_SIZE > box_x0 and qx0 < box_x1 and qy0 + TILE_SIZE > box_y0 and qy0 < box_y1:
+                            masked.add((x, y, q))
+        return masked
+
     def identify_tiles(self, frame: np.ndarray) -> Dict[TileKey, Tile]:
-        pieces = {key: piece for key, piece in self._split(frame).items() if key[:2] != PLAYER_CELL}
+        all_pieces = self._split(frame)
+        masked = self.overlay_tile_keys(frame)
+        pieces = {key: piece for key, piece in all_pieces.items()
+                  if key[:2] != PLAYER_CELL and key not in masked}
         identified = {key: tile or UNKNOWN_TILE for key, tile in self._resolve_screen(pieces).items()}
-        for key in self._split(frame):
+        for key in masked:
+            if key[:2] != PLAYER_CELL and key in all_pieces:
+                identified[key] = UNKNOWN_TILE
+        for key in all_pieces:
             if key[:2] == PLAYER_CELL:
                 identified[key] = PLAYER_TILE
         return identified
 
     def record_tiles(self, frame: np.ndarray, episode_number: int) -> None:
+        if has_bottom_dialogue_box(frame) or find_modal_preview_boxes(frame):
+            return
         pieces = self._split(frame)
-        resolved = self._resolve_screen({key: piece for key, piece in pieces.items() if key[:2] != PLAYER_CELL})
+        masked = self.overlay_tile_keys(frame)
+        resolved = self._resolve_screen({key: piece for key, piece in pieces.items()
+                                         if key[:2] != PLAYER_CELL and key not in masked})
         new_groups: Dict[str, List[TileKey]] = {}
         for key, tile in resolved.items():
             if tile is None:

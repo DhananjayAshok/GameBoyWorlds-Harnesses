@@ -7,8 +7,8 @@ from execution.game_api import (AgentState, BattleMenuAction, InteractAction, Me
 
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
-                                                 is_battle_decision_screen, is_cutscene_frame_changing,
-                                                 is_same_battle_frame)
+                                                 has_modal_preview_box, is_battle_decision_screen,
+                                                 is_cutscene_frame_changing, is_same_battle_frame)
 from execution.perception.pokemon.navigation import (DIRECTIONS, WALKABLE, approach_cells,
                                                      boundary_exit_direction, compress_path, edge_cells,
                                                      in_bounds, is_boundary_exit_direction, parse_cell,
@@ -70,6 +70,7 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
 
 
 INTERACT_SETTLE_WAIT = 2
+INTERACT_MODAL_MAX_PRESSES = 8
 MAX_INTERACT_DIALOGUE_STEPS = 10
 
 
@@ -92,6 +93,13 @@ class InteractionExecutor(PolicyExecutor):
     def _agent_state(self):
         return self._get_state()["pokemon_core"]["agent_state"]
 
+    def _current_frame(self):
+        return self._get_state()["core"]["current_frame"]
+
+    def _has_interaction_overlay(self, frame=None) -> bool:
+        frame = self._current_frame() if frame is None else frame
+        return has_bottom_dialogue_box(frame) or has_modal_preview_box(frame)
+
     def _wait_for_interaction(self, records: List[EnvironmentStepRecord]):
         state = self._agent_state()
         for _ in range(INTERACT_SETTLE_WAIT):
@@ -100,8 +108,26 @@ class InteractionExecutor(PolicyExecutor):
             wait_record = self._take_action(WaitAction)
             records.append(wait_record)
             state = self._agent_state()
-            if captured_dialogue_crops([wait_record]):
+            if captured_dialogue_crops([wait_record]) or self._has_interaction_overlay(wait_record.frame_after):
                 break
+        return state
+
+    def _advance_interaction_overlay(self, records: List[EnvironmentStepRecord]):
+        state = self._agent_state()
+        for _ in range(INTERACT_MODAL_MAX_PRESSES):
+            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
+                break
+            if not self._has_interaction_overlay():
+                break
+            btn_record = self._take_action_string("button(a)")
+            if btn_record is None:
+                break
+            records.append(btn_record)
+            if self._last_terminated or self._last_truncated:
+                break
+            state = self._agent_state()
+            if state == AgentState.FREE_ROAM:
+                state = self._wait_for_interaction(records)
         return state
 
     def _clear_interaction_dialogue(self, records: List[EnvironmentStepRecord]) -> None:
@@ -114,6 +140,8 @@ class InteractionExecutor(PolicyExecutor):
                 break
             if self._agent_state() == AgentState.FREE_ROAM:
                 self._wait_for_interaction(records)
+                if self._agent_state() == AgentState.FREE_ROAM and self._has_interaction_overlay():
+                    self._advance_interaction_overlay(records)
                 if self._agent_state() != AgentState.IN_DIALOGUE:
                     break
             elif pass_record.action_success == -1:
@@ -164,7 +192,16 @@ class InteractionExecutor(PolicyExecutor):
             state = self._wait_for_interaction(records)
             if self._last_terminated or self._last_truncated:
                 return self._finish(records)
-        if interact.action_success != 1 and state == AgentState.FREE_ROAM and not captured_dialogue_crops(records):
+        saw_overlay = any(self._has_interaction_overlay(r.frame_after) for r in records)
+        if state == AgentState.FREE_ROAM and self._has_interaction_overlay():
+            saw_overlay = True
+            state = self._advance_interaction_overlay(records)
+            if self._last_terminated or self._last_truncated:
+                return self._finish(records)
+        if (interact.action_success != 1
+                and state == AgentState.FREE_ROAM
+                and not captured_dialogue_crops(records)
+                and not saw_overlay):
             return self._fail("interaction_did_nothing")
 
         if state == AgentState.IN_DIALOGUE and not (self._last_terminated or self._last_truncated):
@@ -1260,7 +1297,8 @@ class DialogueExecutor(_DialogueSettlingExecutor):
             if self._last_truncated:
                 return self._finish(DIALOGUE_TRUNCATED, "truncated")
         if state != AgentState.IN_DIALOGUE:
-            if state == AgentState.FREE_ROAM and has_bottom_dialogue_box(self._current_frame()):
+            if state == AgentState.FREE_ROAM and (has_bottom_dialogue_box(self._current_frame())
+                                                  or has_modal_preview_box(self._current_frame())):
                 a_record = self._take_action_string("button(a)")
                 if a_record is not None:
                     drop_prefix_crops(captured_dialogue_crops([a_record]), self.dialogue_crops)

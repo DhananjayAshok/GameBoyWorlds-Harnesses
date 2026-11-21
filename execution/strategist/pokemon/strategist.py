@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from execution.artifact import episode_dirs
 from execution.game_api import AgentState, WaitAction
-from execution.perception.pokemon.battle import has_bottom_dialogue_box
+from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import CombatExecutor
 from execution.pokemon.supervisors import PokemonPlayThroughSupervisor
@@ -301,7 +301,7 @@ class PokemonStrategist:
             self._identified = {}
             self._screen_tiles = describe_state_screen(state)
             return self._screen_tiles
-        if has_bottom_dialogue_box(frame):
+        if has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
             self._identified = {}
             self._screen_tiles = describe_state_screen(AgentState.IN_DIALOGUE)
             return self._screen_tiles
