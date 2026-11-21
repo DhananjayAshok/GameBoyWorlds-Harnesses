@@ -189,6 +189,7 @@ MOVE_BLOCKED = -6
 MOVE_INTERRUPTED = -7
 MOVE_OUT_OF_STEPS = -8
 LOCATION_FAIL_CODES = (MOVE_TARGET_NOT_FOUND, MOVE_TARGET_AMBIGUOUS, MOVE_BAD_LOCATION)
+MOVE_SETTLE_WAIT = 2
 
 GRID_DESCRIPTION = """The screen is a grid of cells. The player is at (0, 0). x increases to the right, from -4 at the left edge to 5 at the right edge. y increases upward, from 4 at the top edge to -4 at the bottom edge."""
 
@@ -226,6 +227,15 @@ class GridMoveExecutor(PolicyExecutor):
             return self._fail(MOVE_NOT_FREE_ROAM, "not_free_roam")
         return None
 
+    def _settle_free_roam(self):
+        state = self._get_state()["pokemon_core"]["agent_state"]
+        for _ in range(MOVE_SETTLE_WAIT):
+            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
+                break
+            self._take_action(WaitAction)
+            state = self._get_state()["pokemon_core"]["agent_state"]
+        return state
+
     def _step(self, direction: str, steps: int) -> Optional[int]:
         remaining = steps
         attempts = 0
@@ -244,15 +254,26 @@ class GridMoveExecutor(PolicyExecutor):
             action_return = (record.transition_states[-1]["core"].get("action_return") or {}) if record.transition_states else {}
             taken = action_return.get("n_steps_taken", 0)
             self._steps_taken += taken
-            if record.action_success == 2:
+            state = self._get_state()["pokemon_core"]["agent_state"]
+            if record.action_success == 2 or state != AgentState.FREE_ROAM:
                 return self._fail(MOVE_INTERRUPTED, "move_interrupted",
-                                  f"Left free roam after {taken} steps {direction}: "
-                                  f"{self._get_state()['pokemon_core']['agent_state'].name}")
+                                  f"Left free roam after {taken} steps {direction}: {state.name}")
             remaining -= taken
-            if taken == 0 and not action_return.get("rotated"):
-                return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked moving {direction} with {remaining} steps left")
-            if record.action_success in (-1, 1) and remaining > 0 and taken > 0:
-                return self._fail(MOVE_BLOCKED, "move_blocked", f"Stopped moving {direction} with {remaining} steps left")
+            if (taken == 0 and not action_return.get("rotated")) or (
+                    record.action_success in (-1, 1) and remaining > 0 and taken > 0):
+                state = self._settle_free_roam()
+                if self._last_terminated:
+                    return self._fail(MOVE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._fail(MOVE_TRUNCATED, "truncated")
+                if state != AgentState.FREE_ROAM:
+                    return self._fail(MOVE_INTERRUPTED, "move_interrupted",
+                                      f"Left free roam after {taken} steps {direction}: {state.name}")
+                if taken == 0 and not action_return.get("rotated"):
+                    return self._fail(MOVE_BLOCKED, "move_blocked",
+                                      f"Blocked moving {direction} with {remaining} steps left")
+                return self._fail(MOVE_BLOCKED, "move_blocked",
+                                  f"Stopped moving {direction} with {remaining} steps left")
         return None
 
     def _walk(self, goals: Dict[Tuple[int, int], Optional[str]]) -> Optional[int]:
@@ -330,6 +351,11 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
             exit_code = self._step(exit_dir, 1)
             if exit_code is not None and exit_code != MOVE_BLOCKED:
                 return exit_code
+        self._settle_free_roam()
+        if self._last_terminated:
+            return self._fail(MOVE_TERMINATED, "terminated")
+        if self._last_truncated:
+            return self._fail(MOVE_TRUNCATED, "truncated")
         self.report.termination_reason = "arrived"
         self.report.notes = f"Moved to the target at {target}"
         return MOVE_OK
@@ -405,6 +431,11 @@ Location: <(x, y) or Not Found>
                 self.report.notes = f"Walked to {target} at the {direction} boundary"
                 return MOVE_OK
             return code
+        self._settle_free_roam()
+        if self._last_terminated:
+            return self._fail(MOVE_TERMINATED, "terminated")
+        if self._last_truncated:
+            return self._fail(MOVE_TRUNCATED, "truncated")
         self.report.termination_reason = "left_screen"
         self.report.notes = f"Walked to {target} and stepped off the screen {direction}"
         return MOVE_OK
@@ -812,7 +843,8 @@ DIALOGUE_LEFT_TO_BATTLE = 4
 DIALOGUE_NOT_IN_DIALOGUE = -1
 DIALOGUE_STUCK = -2
 
-DIALOGUE_SETTLE_WAIT = 1
+DIALOGUE_SETTLE_WAIT = 4
+MENU_SETTLE_WAIT = 1
 
 LEFT_DIALOGUE_CODES = {
     AgentState.FREE_ROAM: DIALOGUE_CLEARED,
@@ -843,9 +875,19 @@ class DialogueExecutor(PolicyExecutor):
         self.report.notes = self.dialogue_text
         return code
 
-    def _settle_state(self):
+    def _wait_for_next_box(self):
         state = self._agent_state()
         for _ in range(DIALOGUE_SETTLE_WAIT):
+            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
+                break
+            wait_record = self._take_action(WaitAction)
+            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
+            state = self._agent_state()
+        return state
+
+    def _settle_state(self):
+        state = self._agent_state()
+        for _ in range(MENU_SETTLE_WAIT):
             if state != AgentState.IN_MENU or self._last_terminated or self._last_truncated:
                 break
             wait_record = self._take_action(WaitAction)
@@ -856,12 +898,18 @@ class DialogueExecutor(PolicyExecutor):
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
+        self._begin_scripted(f"pass the dialogue: {self._task}")
         state = self._agent_state()
+        if state == AgentState.FREE_ROAM:
+            state = self._wait_for_next_box()
+            if self._last_terminated:
+                return self._finish(DIALOGUE_TERMINATED, "terminated")
+            if self._last_truncated:
+                return self._finish(DIALOGUE_TRUNCATED, "truncated")
         if state != AgentState.IN_DIALOGUE:
             return self._fail(DIALOGUE_NOT_IN_DIALOGUE, "not_in_dialogue",
                               f"The player is {state.name.lower()}, not in dialogue.")
 
-        self._begin_scripted(f"pass the dialogue: {self._task}")
         for _ in range(self._max_steps):
             record = self._take_action(PassDialogueAction)
             drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
@@ -870,6 +918,12 @@ class DialogueExecutor(PolicyExecutor):
             if self._last_truncated:
                 return self._finish(DIALOGUE_TRUNCATED, "truncated")
             state = self._agent_state()
+            if state == AgentState.FREE_ROAM:
+                state = self._wait_for_next_box()
+                if self._last_terminated:
+                    return self._finish(DIALOGUE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._finish(DIALOGUE_TRUNCATED, "truncated")
             if state == AgentState.IN_MENU:
                 state = self._settle_state()
                 if self._last_terminated:
