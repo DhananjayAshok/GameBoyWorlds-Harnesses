@@ -491,7 +491,8 @@ class PokemonStrategist:
     def _global_map_block(self) -> str:
         if not self.global_map.current:
             return ""
-        local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns)
+        local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
+                            self._screen_people())
                  if self._identified else None)
         self.global_map.prune_routes()
         _, failed = self._failure_streak()

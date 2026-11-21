@@ -12,8 +12,9 @@ from execution.perception.matching import cell_key, split_quarters
 from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import (LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
-                                                     is_overhang_floor_cell, is_player_overhang_floor_cell,
-                                                     is_player_overhang_ledge_cell, is_top_overhang_floor_cell)
+                                                     is_npc_head_overhang_floor_cell, is_overhang_floor_cell,
+                                                     is_player_overhang_floor_cell, is_player_overhang_ledge_cell,
+                                                     is_top_overhang_floor_cell)
 from execution.perception.pokemon.tiles import TileRecognizer, normalize_tabletop_tag
 
 from .registration import (BLACK_LEVEL, _local_cells, _screen, _still_lit, grid_offset, grid_residual, has_structure,
@@ -327,11 +328,18 @@ class GlobalMap(StrategistArtifact):
             return 0
         masked_cells = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
         quarter_tags: Dict[Cell, Dict[str, str]] = {}
+        quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
         if shift == (0, 0):
             for (ix, iy, iq), tile in (identified or {}).items():
                 quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(tile.tag, tile.description)
-        top_overhang_cells = {cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags)}
+                quarter_descriptions.setdefault((ix, iy), {})[iq] = tile.description
+        top_overhang_cells = {
+            cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+        }
         player_overhang_cells = {cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags)}
+        npc_head_overhang_cells = {
+            cell for cell in quarter_tags if is_npc_head_overhang_floor_cell(cell, quarter_tags)
+        }
         player_ledge_cells = {cell for cell in quarter_tags if is_player_overhang_ledge_cell(cell, quarter_tags)}
         for (x, y), piece in _local_cells(a, shift):
             if (x, y) in masked_cells and (x, y) != (0, 0):
@@ -348,7 +356,7 @@ class GlobalMap(StrategistArtifact):
                     quarter_tags[(x, y)][q] for q in ("bottom_left", "bottom_right") if q in quarter_tags[(x, y)]
                 }))
                 kind = WALKABLE
-            elif (x, y) in player_overhang_cells:
+            elif (x, y) in player_overhang_cells or (x, y) in npc_head_overhang_cells:
                 tags = tuple(sorted({
                     quarter_tags[(x, y)][q] for q in ("top_left", "top_right") if q in quarter_tags[(x, y)]
                 }))
@@ -749,11 +757,15 @@ class GlobalMap(StrategistArtifact):
         changed = 0
         for si, seg in enumerate(self.segments):
             quarter_tags: Dict[Cell, Dict[str, str]] = {}
+            quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
             for g, c in seg.items():
                 tiles = [tile_lookup.get(h) for h in c.hashes]
                 if all(t is not None for t in tiles):
                     quarter_tags[g] = {
                         q: normalize_tabletop_tag(t.tag, t.description) for q, t in zip(QUARTERS, tiles)
+                    }
+                    quarter_descriptions[g] = {
+                        q: t.description for q, t in zip(QUARTERS, tiles)
                     }
             visits = self.visits[si] if si < len(self.visits) else Counter()
             for g, c in seg.items():
@@ -761,8 +773,11 @@ class GlobalMap(StrategistArtifact):
                     self._learn_walkable(c)
                 if g not in quarter_tags or c.kind == OCCUPIED:
                     continue
-                if is_top_overhang_floor_cell(g, quarter_tags):
+                if is_top_overhang_floor_cell(g, quarter_tags, quarter_descriptions):
                     new_tags = tuple(sorted({quarter_tags[g]["bottom_left"], quarter_tags[g]["bottom_right"]}))
+                    new_kind = WALKABLE
+                elif is_npc_head_overhang_floor_cell(g, quarter_tags):
+                    new_tags = tuple(sorted({quarter_tags[g]["top_left"], quarter_tags[g]["top_right"]}))
                     new_kind = WALKABLE
                 else:
                     new_tags = tuple(sorted(set(quarter_tags[g].values())))

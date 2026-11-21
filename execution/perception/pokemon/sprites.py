@@ -93,9 +93,20 @@ def tag_counts(identified: Dict[Tuple[int, int, str], Any], cell: Cell) -> Dict[
     return counts
 
 
+def _has_top_half_npc_in_grass(identified: Dict[Tuple[int, int, str], Any], cell: Cell) -> bool:
+    tl = identified.get((cell[0], cell[1], "top_left"))
+    tr = identified.get((cell[0], cell[1], "top_right"))
+    if tl is None or tr is None or tl.tag != "npc" or tr.tag != "npc":
+        return False
+    return tag_counts(identified, cell).get("tall grass", 0) >= 1
+
+
 def find_npc_cells(identified: Dict[Tuple[int, int, str], Any], min_quarters: int = 3) -> List[Cell]:
     cells = sorted({(x, y) for (x, y, _) in identified if (x, y) != (0, 0)})
-    return [c for c in cells if tag_counts(identified, c).get("npc", 0) >= min_quarters]
+    return [
+        c for c in cells
+        if tag_counts(identified, c).get("npc", 0) >= min_quarters or _has_top_half_npc_in_grass(identified, c)
+    ]
 
 
 def scan_cells(identified: Dict[Tuple[int, int, str], Any], exclude: Sequence[Cell], min_quarters: int = 2) -> List[Cell]:
@@ -114,7 +125,10 @@ def full_window_ok(identified: Dict[Tuple[int, int, str], Any], cell: Cell) -> b
     counts = tag_counts(identified, cell)
     if counts.get("npc", 0) == 4:
         return True
-    return counts.get("npc", 0) >= 3 and (counts.get("ground", 0) + counts.get("ground decoration", 0)) >= 1
+    walkable = counts.get("ground", 0) + counts.get("ground decoration", 0) + counts.get("tall grass", 0)
+    if counts.get("npc", 0) >= 3 and walkable >= 1:
+        return True
+    return counts.get("npc", 0) == 2 and counts.get("tall grass", 0) == 2 and _has_top_half_npc_in_grass(identified, cell)
 
 
 def scan_for_views(frame: np.ndarray, keys: np.ndarray, cells: Sequence[Cell], level: int, scan_range: int = 8,

@@ -18,8 +18,10 @@ WALKABLE_TAGS = {
 }
 WARP_TAGS = {"entrance", "staircase"}
 LEDGE_TAGS = {"ledge"}
+FURNITURE_OVERHANG_TOP_TAGS = {"interactable object", "obstacle"}
 OVERHANG_TOP_TAGS = {"interactable object", "obstacle", "npc", "item", "sign"}
 QUARTERS = ("top_left", "top_right", "bottom_left", "bottom_right")
+FURNITURE_OVERHANG_DESC_PATTERN = re.compile(r"\b(?:table|desk|counter|shelf|bookshelf|machine|computer|pc|tv|television|sink|stove|bed)\b", re.IGNORECASE)
 
 X_RANGE = range(LEFT_COL, LEFT_COL + 10)
 Y_RANGE = range(TOP_ROW - 8, TOP_ROW + 1)
@@ -32,7 +34,11 @@ def in_bounds(cell: Cell) -> bool:
     return cell[0] in X_RANGE and cell[1] in Y_RANGE
 
 
-def is_top_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+def is_top_overhang_floor_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
     cell_q = quarter_tags.get(cell, {})
     if len(cell_q) < 4:
         return False
@@ -40,12 +46,19 @@ def is_top_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, st
     top_tags = {cell_q["top_left"], cell_q["top_right"]}
     if not (bottom_tags <= WALKABLE_TAGS) or (top_tags <= WALKABLE_TAGS):
         return False
-    if not (top_tags <= WALKABLE_TAGS | OVERHANG_TOP_TAGS):
+    if not (top_tags <= WALKABLE_TAGS | FURNITURE_OVERHANG_TOP_TAGS):
         return False
+    if quarter_descriptions is not None:
+        cell_d = quarter_descriptions.get(cell, {})
+        for q in ("top_left", "top_right"):
+            if cell_q.get(q) in FURNITURE_OVERHANG_TOP_TAGS:
+                desc = cell_d.get(q) or ""
+                if not FURNITURE_OVERHANG_DESC_PATTERN.search(desc):
+                    return False
     above_q = quarter_tags.get((cell[0], cell[1] + 1), {})
     above_bottom = {above_q[q] for q in ("bottom_left", "bottom_right") if q in above_q}
     if above_bottom:
-        return bool(above_bottom & OVERHANG_TOP_TAGS)
+        return bool(above_bottom & (FURNITURE_OVERHANG_TOP_TAGS | {"item"}))
     return True
 
 
@@ -75,27 +88,69 @@ def is_player_overhang_ledge_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str,
     return bool(bottom_tags & LEDGE_TAGS) and (bottom_tags <= WALKABLE_TAGS | LEDGE_TAGS | OVERHANG_TOP_TAGS)
 
 
-def is_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
-    return is_top_overhang_floor_cell(cell, quarter_tags) or is_player_overhang_floor_cell(cell, quarter_tags)
+def is_npc_head_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+    if cell == (0, 1):
+        return False
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    top_tags = {cell_q["top_left"], cell_q["top_right"]}
+    bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
+    if not (top_tags <= WALKABLE_TAGS) or (bottom_tags <= WALKABLE_TAGS):
+        return False
+    if not (bottom_tags <= WALKABLE_TAGS | {"npc"}) or "npc" not in bottom_tags:
+        return False
+    below_q = quarter_tags.get((cell[0], cell[1] - 1), {})
+    below_top = {below_q[q] for q in ("top_left", "top_right") if q in below_q}
+    return "npc" in below_top
+
+
+def is_overhang_floor_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
+    return (
+        is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+        or is_player_overhang_floor_cell(cell, quarter_tags)
+        or is_npc_head_overhang_floor_cell(cell, quarter_tags)
+    )
 
 
 def cell_kinds(
     identified,
     ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
     walk_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
+    people: Optional[Dict[Cell, str]] = None,
 ) -> Dict[Cell, str]:
     # ``ledge_patterns`` / ``walk_patterns``: quarter hashes (QUARTERS order) learned from movement.
     tags: Dict[Cell, set] = {}
     quarter_tags: Dict[Cell, Dict[str, str]] = {}
+    quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
         tags.setdefault((x, y), set()).add(tile.tag)
         quarter_tags.setdefault((x, y), {})[quarter] = tile.tag
+        quarter_descriptions.setdefault((x, y), {})[quarter] = getattr(tile, "description", None)
         hashes.setdefault((x, y), {})[quarter] = tile.hash
+    confirmed_occupied: set = set()
+    for cell, label in (people or {}).items():
+        if cell == (0, 0):
+            continue
+        lower = (label or "").lower()
+        if "remembered here" in lower or "seen only in part" in lower:
+            continue
+        confirmed_occupied.add(cell)
     kinds = {}
     for cell, cell_tags in tags.items():
         pattern = tuple(hashes[cell].get(q) for q in QUARTERS)
-        if cell_tags & WARP_TAGS or cell_tags <= WALKABLE_TAGS or is_overhang_floor_cell(cell, quarter_tags):
+        if cell in confirmed_occupied:
+            kinds[cell] = BLOCKED
+        elif (
+            cell_tags & WARP_TAGS
+            or cell_tags <= WALKABLE_TAGS
+            or is_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+        ):
             kinds[cell] = WALKABLE
         elif walk_patterns and pattern in walk_patterns and "npc" not in cell_tags:
             kinds[cell] = WALKABLE

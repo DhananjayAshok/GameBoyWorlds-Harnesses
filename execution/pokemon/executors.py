@@ -493,6 +493,39 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             saw_neighbor = True
             cur = (cur[0] + dx, cur[1] + dy)
         return saw_neighbor
+
+    def _screen_scrolled_along(self, before_frame: np.ndarray, after_frame: np.ndarray, direction: str) -> bool:
+        from execution.strategist.pokemon.global_map.registration import register
+
+        placed = register(before_frame, after_frame, direction, max(1, self._steps_taken))
+        if placed is None:
+            return False
+        dx, dy = DIRECTIONS[direction]
+        shift_x, shift_y = placed[0]
+        return (shift_x * dx + shift_y * dy) > 0
+
+    def _can_step_from_current(self, direction: str) -> Optional[bool]:
+        tiles = getattr(self._env, "_tiles", None)
+        if tiles is None or not hasattr(tiles, "identify_tiles"):
+            return None
+        frame = self._get_state()["core"]["current_frame"]
+        identified = tiles.identify_tiles(frame)
+        kinds = cell_kinds(
+            identified,
+            getattr(self._env, "ledge_patterns", None),
+            getattr(self._env, "walk_patterns", None),
+        )
+        dx, dy = DIRECTIONS[direction]
+        nxt = (dx, dy)
+        kind = kinds.get(nxt)
+        if kind == WALKABLE:
+            return True
+        if kind == LEDGE and direction == "down":
+            return kinds.get((dx, dy - 1)) == WALKABLE
+        if kind in (BLOCKED, LEDGE):
+            return False
+        return None
+
     LOCATE_PROMPT = """You are helping a player walk off the edge of the screen in a Game Boy Pokemon game.
 
 The player wants to: "[TARGET]"
@@ -503,7 +536,9 @@ The image is the current game screen. [GRID_DESCRIPTION] Here is what has been r
 These cells on each edge of the screen can be walked on:
 [EDGE_CELLS]
 
-Choose the edge cell the player should walk to so that they can then keep walking off the screen as described. Pick a cell from the list above on the edge in the direction the player wants to go. If no listed cell fits the description, answer Not Found.
+Choose the edge cell the player should walk to so that they can then keep walking off the screen as described. Pick a cell from the list above on the edge in the direction the player wants to go.
+- Look carefully at the image along the chosen edge: if a cell on that edge is visibly aligned with or right below/above/beside a signpost, fence post, tree, ledge, or narrow corridor wall at the edge, pick an adjacent open edge cell in the clear lane or gap instead of the cell aligned with the obstacle.
+- If no listed cell fits the description, answer Not Found.
 
 Respond in exactly this format:
 Reasoning: <which edge and which cell, and why>
@@ -546,12 +581,35 @@ Location: <(x, y) or Not Found>
             return self._fail(MOVE_BAD_LOCATION, "bad_location",
                               f"{location!r} is not a walkable cell on the {direction} edge")
         self.target_cell = target
+        initial_frame = self._get_state()["core"]["current_frame"]
         code = self._walk({target: None})
         if code is not None:
             return code
+        after_walk_frame = self._get_state()["core"]["current_frame"]
+        scrolled_to_edge = self._steps_taken > 0 and (
+            self._screen_scrolled_along(initial_frame, after_walk_frame, direction)
+            or self._at_exterior_boundary(direction)
+        )
+        can_step = self._can_step_from_current(direction)
+        if can_step is False:
+            if scrolled_to_edge:
+                self._settle_free_roam()
+                if self._last_terminated:
+                    return self._fail(MOVE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._fail(MOVE_TRUNCATED, "truncated")
+                self.report.termination_reason = "left_screen"
+                self.report.notes = f"Walked to {target} at the {direction} edge"
+                return MOVE_OK
+            return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked at {target} moving {direction}")
         code = self._step(direction, 1)
         if code is not None:
-            if code == MOVE_BLOCKED and self._steps_taken > 0 and self._at_exterior_boundary(direction):
+            if code == MOVE_BLOCKED and scrolled_to_edge:
+                self._settle_free_roam()
+                if self._last_terminated:
+                    return self._fail(MOVE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._fail(MOVE_TRUNCATED, "truncated")
                 self.report.termination_reason = "left_screen"
                 self.report.notes = f"Walked to {target} at the {direction} boundary"
                 return MOVE_OK
