@@ -421,8 +421,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     and not self._out_of_calls()
                     and not self._env_done()):
                 follow_up = self.call_executor("dialogue", "clear the dialogue that followed the battle")
-                combined_text = "
-".join(filter(None, [handled.get("dialogue"), follow_up.get("dialogue")]))
+                combined_text = "\n".join(filter(None, [handled.get("dialogue"), follow_up.get("dialogue")]))
                 if combined_text:
                     handled["dialogue"] = combined_text
                 handled["report"].final_state = follow_up["report"].final_state
