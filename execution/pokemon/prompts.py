@@ -16,19 +16,23 @@ What has happened so far, in order:
 [LOG]
 """
 
+PLAYTHROUGH_AREA_MAP_BLOCK = """
+[AREA_MAP]
+"""
+
 PLAYTHROUGH_PLAN_PROMPT = """You are playing [GAME] and are planning how to complete a task.
 
 Your task: "[TASK]"
 [GUIDANCE_BLOCK][LOG_BLOCK]
 The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
-[SCREEN_TILES]
+[SCREEN_TILES][AREA_MAP_BLOCK]
 
 These are the only things the player can be told to do:
 [PRIMITIVES]
 
 Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now. Because MoveTo on a doorway, staircase or boundary exit mat automatically steps through or off it to warp into the next room or outside, write leaving or entering through a visible entrance or exit mat as a single subgoal (reaching the new room or outside) rather than splitting it into standing on the mat and stepping off it. If a dialogue box or scripted cutscene is currently playing or about to continue (including when a text box at the bottom of the screen is blank, has only printed its first few characters, or is between consecutive lines), include finishing that dialogue/cutscene before any walking subgoal. If the task or guidance suggests a cardinal detour around a local obstacle (such as walking east or west around a ledge, tree row, NPC, or building) that is blocked on the current screen or contradicts the walkable screen edges and shortest paths listed above, trust the live screen and walkable edges to route toward the task's destination rather than following a blocked cardinal direction.
-Treat "Guidance for this task" as tactical advice and lookahead context rather than extra mandatory goals: only plan subgoals for what "Your task" asks, and do not append extra landmarks, trainers, or exits mentioned only in guidance. An episode has a budget of at most 10 actions (including any battles along the way), so when "Your task" asks for open-ended progression along a route or corridor (such as "continue heading <direction>" or "follow the path as it turns toward..."), scope the movement subgoals to the concrete turns or 1-2 screen transitions needed to make clear forward progress along that path rather than requiring an entire multi-screen route to be traversed in a single subgoal. If "Your task" contains a conditional fallback or alternative branch (such as "walk <direction> along the path, or if it ends in a dead end / is blocked, then..."), plan only the primary path up to the point where you can see on screen whether that condition holds; never include the fallback branch as sequential subgoals upfront unless the current screen already shows that the primary path is blocked or at a dead end.
+Treat "Guidance for this task" as tactical advice and lookahead context rather than extra mandatory goals: only plan subgoals for what "Your task" asks, and do not append extra landmarks, trainers, or exits mentioned only in guidance. An episode has a budget of at most 10 actions (including any battles along the way), so when "Your task" asks for open-ended progression along a route or corridor (such as "continue heading <direction>" or "follow the path as it turns toward..."), scope the movement subgoals to the concrete turns or 1-2 screen transitions needed to make clear forward progress along that path rather than requiring an entire multi-screen route to be traversed in a single subgoal. When a corridor or path continues off screen to an intersection or bend that is not yet visible on the current screen, never guess or pre-commit to a specific turn direction (such as "turns north" or "turns west") in a subgoal unless "Your task" or "Guidance for this task" explicitly specifies that turn direction or the area map above already shows the open continuation; instead, write the subgoal as reaching the end of the corridor or following the open continuation once the turn comes into view. If "Your task" contains a conditional fallback or alternative branch (such as "walk <direction> along the path, or if it ends in a dead end / is blocked, then..."), plan only the primary path up to the point where you can see on screen whether that condition holds; never include the fallback branch as sequential subgoals upfront unless the current screen already shows that the primary path is blocked or at a dead end.
 
 Respond in exactly this format:
 Reasoning: <what the screen shows and how you intend to get the task done>
@@ -49,12 +53,12 @@ You are working on this subgoal: "[SUBGOAL]"
 [LOG_BLOCK][ATTEMPTS_BLOCK]
 The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
-[SCREEN_TILES]
+[SCREEN_TILES][AREA_MAP_BLOCK]
 
 You can make the player do exactly one of the following:
 [PRIMITIVES]
 
-Pick the single action that makes the most progress on the subgoal from this screen and matches the current game state ([AGENT_STATE]). Always check the bottom of the screen for a dialogue box frame—even if it is blank or has only printed its first few letters—and check whether your previous movement attempt was just interrupted by dialogue without the player moving. While a dialogue box is visible or a multi-part scripted conversation/cutscene is still playing between text boxes, choose Dialogue() or Free(...) to advance it rather than MoveTo or MoveOff. When navigating around a local obstacle (a ledge, tree row, NPC, or building), trust the current screen and the walkable cells and shortest paths on each edge of the screen over any cardinal step direction suggested in the task or guidance if that direction leads into a dead end or blocked barrier.
+Pick the single action that makes the most progress on the subgoal from this screen and matches the current game state ([AGENT_STATE]). Always check the bottom of the screen for a dialogue box frame—even if it is blank or has only printed its first few letters—and check whether your previous movement attempt was just interrupted by dialogue without the player moving. While a dialogue box is visible or a multi-part scripted conversation/cutscene is still playing between text boxes, choose Dialogue() or Free(...) to advance it rather than MoveTo or MoveOff. When navigating around a local obstacle (a ledge, tree row, NPC, or building), trust the current screen, the area map and visited leg coordinates above, and the walkable cells and shortest paths on each edge of the screen over any cardinal step direction suggested in the task or guidance if that direction leads into a dead end or blocked barrier. Never use MoveOff towards an edge annotated as a mapped closed dead-end pocket or reverse back into a dead-end coordinate boundary you already reached earlier in this episode unless the task specifically requires an item or person inside that pocket; when an intersection branches into multiple directions, prefer the branch that leads toward unexplored map edges (`?`) or the task's destination rather than a short closed alcove.
 
 Respond in exactly this format:
 Reasoning: <what you see, and why this action is the best next step>
@@ -126,11 +130,11 @@ What you tried for this subgoal:
 
 The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
-[SCREEN_TILES]
+[SCREEN_TILES][AREA_MAP_BLOCK]
 
 Decide whether to carry on with a new plan or to give up. Give up only if the task cannot be done from here at all, for example because it needs something the player does not have and cannot get.
 
-If you carry on, write a fresh plan for what is left, starting from the current screen. It may drop the subgoal that failed, or reach it another way. Plan only for what remains of "Your task" (do not add extra goals from guidance, and keep open-ended directional progression scoped to 1-2 screen transitions).
+If you carry on, write a fresh plan for what is left, starting from the current screen. It may drop the subgoal that failed, or reach it another way. Plan only for what remains of "Your task" (do not add extra goals from guidance, and keep open-ended directional progression scoped to 1-2 screen transitions). Check the area map and visited leg coordinates above so your new plan does not send the player back into an already-visited dead-end boundary or closed pocket, and do not guess a specific turn direction for an off-screen intersection before that turn is visible.
 
 Respond in exactly this format:
 Reasoning: <why it is not working, and what to do about it>
@@ -148,7 +152,7 @@ Your task: "[TASK]"
 [GUIDANCE_BLOCK][LOG_BLOCK]
 The player is currently [AGENT_STATE].
 The image is the current game screen. Here is what has been recognised on it:
-[SCREEN_TILES]
+[SCREEN_TILES][AREA_MAP_BLOCK]
 
 Decide whether "Your task" is now complete.
 - Judge completion against "Your task" itself. Treat "Guidance for this task" as tactical advice and lookahead context, not as mandatory extra requirements: if the player has done what "Your task" asks, answer yes even if further landmarks, trainers, or exits mentioned only in guidance have not been reached yet.

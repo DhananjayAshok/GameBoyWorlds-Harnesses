@@ -1,3 +1,4 @@
+from collections import deque
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
@@ -6,7 +7,9 @@ from execution.game_api import AgentState, WaitAction
 from execution.executors import Executor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_modal_preview_box,
                                                  is_cutscene_frame_changing)
-from execution.perception.pokemon.navigation import cell_kinds, verbalize_edges
+from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, WALKABLE, X_RANGE, Y_RANGE,
+                                                     cell_kinds, compress_path, edge_cells,
+                                                     format_path_runs, shortest_path, verbalize_edges)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
                                          InteractionExecutor, MenuExecutor,
@@ -17,7 +20,7 @@ from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeE
                                          MOVE_OK, MOVE_TARGET_AMBIGUOUS,
                                          OffScreenMoveExecutor, OnScreenMoveExecutor)
 from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUGH_AFTER_BLOCK,
-                                       PLAYTHROUGH_ATTEMPTS_BLOCK,
+                                       PLAYTHROUGH_AREA_MAP_BLOCK, PLAYTHROUGH_ATTEMPTS_BLOCK,
                                        PLAYTHROUGH_BATTLE_INSTRUCTIONS_PROMPT, PLAYTHROUGH_BATTLE_TIPS_BLOCK,
                                        PLAYTHROUGH_CLARIFY_TARGET_PROMPT, PLAYTHROUGH_GUIDANCE_BLOCK,
                                        PLAYTHROUGH_JUDGE_PROMPT, PLAYTHROUGH_LOG_BLOCK,
@@ -25,6 +28,8 @@ from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUG
                                        PLAYTHROUGH_REMAINING_SUBGOALS_BLOCK, PLAYTHROUGH_REMAINING_SUBGOALS_LINE,
                                        PLAYTHROUGH_SUBGOAL_DECISION_PROMPT, PLAYTHROUGH_TASK_CHECK_PROMPT,
                                        PLAYTHROUGH_TEXT_BLOCK, PRIMITIVES)
+from execution.strategist.pokemon.global_map.model import UNKNOWN, is_door
+from execution.strategist.pokemon.global_map.text import LEGEND, ascii_window, frontier_targets
 from execution.report import ExecutorReport
 from execution.supervisors.base import Supervisor
 from utils import log_error, log_warn, parse_int, parse_key_value, parse_list, parse_yes_no
@@ -108,11 +113,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._screen_tiles: Optional[str] = None
         self._identified = None
         self._calls = 0
+        self._start_place: Optional[Tuple[int, Tuple[int, int]]] = None
+        self._leg_stops: List[Tuple[int, Tuple[int, int]]] = []
         self.last_executor = None
         self.plan: List[str] = []
         super().__init__(task=task, executor_class=None, env=env, game=game,
                          max_steps=max_steps, **kwargs)
         self._tile_recognizer.set_vlm_call(self._vlm_caller("perception"))
+        self._record_map_stop()
 
     def _run_config(self) -> dict:
         config = super()._run_config()
@@ -140,7 +148,221 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return has_bottom_dialogue_box(frame) or has_modal_preview_box(frame)
         return False
 
+    def _global_map(self):
+        return getattr(self._env, "_map", None)
+
+    def _current_map_place(self) -> Optional[Tuple[int, Tuple[int, int]]]:
+        gmap = self._global_map()
+        if gmap is None or not getattr(gmap, "current", None) or getattr(gmap, "pos", None) is None:
+            return None
+        try:
+            return gmap.resolve(gmap.segment, gmap.pos)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _record_map_stop(self) -> Optional[Tuple[int, Tuple[int, int]]]:
+        place = self._current_map_place()
+        if place is None:
+            return None
+        if self._start_place is None:
+            self._start_place = place
+        if not self._leg_stops or self._leg_stops[-1] != place:
+            self._leg_stops.append(place)
+        return place
+
+    def _edge_pocket_note(self, direction: str, local_edge_cells: List[Tuple[int, int]]) -> Optional[str]:
+        gmap = self._global_map()
+        place = self._current_map_place()
+        if gmap is None or place is None or not local_edge_cells:
+            return None
+        seg = gmap.current
+        px, py = place[1]
+        gx_min, gx_max = px + min(X_RANGE), px + max(X_RANGE)
+        gy_min, gy_max = py + min(Y_RANGE), py + max(Y_RANGE)
+
+        def in_screen(g: Tuple[int, int]) -> bool:
+            return gx_min <= g[0] <= gx_max and gy_min <= g[1] <= gy_max
+
+        def in_half_plane(g: Tuple[int, int]) -> bool:
+            if direction == "up":
+                return g[1] >= gy_max
+            if direction == "down":
+                return g[1] <= gy_min
+            if direction == "left":
+                return g[0] <= gx_min
+            return g[0] >= gx_max
+
+        def strictly_beyond(g: Tuple[int, int]) -> bool:
+            if direction == "up":
+                return g[1] > gy_max
+            if direction == "down":
+                return g[1] < gy_min
+            if direction == "left":
+                return g[0] < gx_min
+            return g[0] > gx_max
+
+        seeds = []
+        for lx, ly in local_edge_cells:
+            eg = (px + lx, py + ly)
+            c = seg.get(eg)
+            if c is None or c.kind == UNKNOWN or is_door(c):
+                return None
+            if c.kind == WALKABLE:
+                seeds.append(eg)
+        if not seeds:
+            return None
+
+        visited = set(seeds)
+        queue = deque(seeds)
+        beyond_cells = set()
+
+        while queue:
+            cur = queue.popleft()
+            if strictly_beyond(cur):
+                beyond_cells.add(cur)
+            c = seg.get(cur)
+            if c is not None and is_door(c):
+                return None
+            for d, (nx_d, ny_d) in DIRECTIONS.items():
+                nxt = (cur[0] + nx_d, cur[1] + ny_d)
+                if in_screen(nxt):
+                    if nxt not in seeds:
+                        continue
+                if not in_half_plane(nxt):
+                    nc = seg.get(nxt)
+                    if nc is None or nc.kind in (WALKABLE, UNKNOWN) or (nc.kind == LEDGE and d == "down"):
+                        return None
+                    continue
+                nc = seg.get(nxt)
+                if nc is None or nc.kind == UNKNOWN or is_door(nc):
+                    return None
+                if nc.kind == WALKABLE:
+                    landing = nxt
+                elif nc.kind == LEDGE and d == "down":
+                    landing = (nxt[0], nxt[1] - 1)
+                    if in_screen(landing) and landing not in seeds:
+                        continue
+                    if not in_half_plane(landing):
+                        return None
+                    lc = seg.get(landing)
+                    if lc is None or lc.kind == UNKNOWN or is_door(lc):
+                        return None
+                    if lc.kind != WALKABLE:
+                        continue
+                else:
+                    continue
+                if landing not in visited:
+                    visited.add(landing)
+                    queue.append(landing)
+
+        xs = [c[0] - px for c in visited]
+        ys = [c[1] - py for c in visited]
+        return (f" [mapped closed dead-end pocket beyond {direction} edge: "
+                f"{len(beyond_cells)} off-screen walkable tile(s), relative x in [{min(xs)}, {max(xs)}], "
+                f"y in [{min(ys)}, {max(ys)}], no unexplored tiles or doors]")
+
+    def _describe_edges(self, kinds: Dict[Tuple[int, int], str]) -> str:
+        lines = []
+        for direction in DIRECTIONS:
+            cells = edge_cells(kinds, direction)
+            if cells:
+                listed = ", ".join(f"({x}, {y})" for x, y in cells)
+                path = shortest_path(kinds, (0, 0), cells)
+                if path:
+                    target = path[-1][2]
+                    runs_text = format_path_runs(compress_path(path))
+                    listed += f" (shortest path to {target}: {runs_text})"
+                note = self._edge_pocket_note(direction, cells)
+                if note:
+                    listed += note
+            else:
+                listed = "none"
+            lines.append(f"- {direction} edge: {listed}")
+        return "\n".join(lines)
+
+    def _area_map_block(self, local_kinds: Optional[Dict[Tuple[int, int], str]] = None) -> str:
+        gmap = self._global_map()
+        place = self._current_map_place()
+        if gmap is None or place is None:
+            return ""
+        if self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue():
+            return ""
+        cur_seg, cur_pos = place
+        lines = []
+        if self._start_place is not None:
+            s_seg, s_pos = gmap.resolve(self._start_place[0], self._start_place[1])
+            if s_seg == cur_seg:
+                dx, dy = cur_pos[0] - s_pos[0], cur_pos[1] - s_pos[1]
+                lines.append(
+                    f"Current area coordinate: {cur_pos} (episode start: {s_pos}; "
+                    f"net displacement: ({dx:+d}, {dy:+d}), where +x is right/east and +y is up/north)."
+                )
+            else:
+                lines.append(f"Current area coordinate: {cur_pos} (entered a new area since episode start).")
+        else:
+            lines.append(f"Current area coordinate: {cur_pos} (+x is right/east, +y is up/north).")
+        same_seg_stops = []
+        for seg, pos in self._leg_stops:
+            r_seg, r_pos = gmap.resolve(seg, pos)
+            if r_seg == cur_seg and (not same_seg_stops or same_seg_stops[-1] != r_pos):
+                same_seg_stops.append(r_pos)
+        if not same_seg_stops or same_seg_stops[-1] != cur_pos:
+            same_seg_stops.append(cur_pos)
+        if len(same_seg_stops) > 1:
+            xs = [p[0] for p in same_seg_stops]
+            ys = [p[1] for p in same_seg_stops]
+            trail_str = " -> ".join(f"({x}, {y})" for x, y in same_seg_stops)
+            lines.append(
+                f"Leg positions visited in this area during this episode: {trail_str} "
+                f"(x span [{min(xs)}, {max(xs)}], y span [{min(ys)}, {max(ys)}])."
+            )
+        lines.append(
+            "Map of what has been seen in this area around the player "
+            "(@ is the player at (0, 0) on the current screen, north is up, one character per tile):"
+        )
+        lines.append(ascii_window(gmap))
+        lines.append("Legend: " + LEGEND)
+        targets, _ = frontier_targets(gmap, local_kinds)
+        if targets:
+            lines.append("Nearest unexplored map edges in this area (x = steps right, y = steps up from the player):")
+            for t in targets[:6]:
+                where = "on screen, reachable" if t["on_screen"] else "off screen"
+                lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({where})")
+        return PLAYTHROUGH_AREA_MAP_BLOCK.replace("[AREA_MAP]", "\n".join(lines))
+
+    def _format_leg_movement(
+        self,
+        before_place: Optional[Tuple[int, Tuple[int, int]]],
+        after_place: Optional[Tuple[int, Tuple[int, int]]],
+        prior_stops: List[Tuple[int, Tuple[int, int]]],
+        is_move_action: bool = False,
+    ) -> str:
+        gmap = self._global_map()
+        if gmap is None or before_place is None or after_place is None:
+            return ""
+        b_seg, b_pos = gmap.resolve(before_place[0], before_place[1])
+        a_seg, a_pos = gmap.resolve(after_place[0], after_place[1])
+        if b_seg != a_seg:
+            return f"[Area coordinate: {b_pos} -> {a_pos} (entered new area)]"
+        if b_pos == a_pos and not is_move_action:
+            return ""
+        dx, dy = a_pos[0] - b_pos[0], a_pos[1] - b_pos[1]
+        prior_same = [gmap.resolve(seg, pos)[1] for seg, pos in prior_stops if gmap.resolve(seg, pos)[0] == a_seg]
+        revisit = ""
+        if a_pos != b_pos and a_pos in prior_same:
+            revisit = "; revisited an earlier coordinate from this episode"
+        if self._start_place is not None:
+            s_seg, s_pos = gmap.resolve(self._start_place[0], self._start_place[1])
+            if s_seg == a_seg:
+                net_dx, net_dy = a_pos[0] - s_pos[0], a_pos[1] - s_pos[1]
+                return (
+                    f"[Area coordinate: {b_pos} -> {a_pos} "
+                    f"(step delta ({dx:+d}, {dy:+d}); net from episode start {s_pos}: ({net_dx:+d}, {net_dy:+d}){revisit})]"
+                )
+        return f"[Area coordinate: {b_pos} -> {a_pos} (step delta ({dx:+d}, {dy:+d}){revisit})]"
+
     def _perceive(self, frame) -> str:
+        self._record_map_stop()
         state = self._agent_state()
         if state != AgentState.FREE_ROAM:
             self._identified = {}
@@ -157,7 +379,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                            getattr(self._env, "walk_patterns", None), people)
         self._screen_tiles = (verbalize_tiles(self._identified, people)
                               + "\nWalkable cells on each edge of the screen:\n"
-                              + verbalize_edges(kinds))
+                              + self._describe_edges(kinds))
         return self._screen_tiles
 
     def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
@@ -182,11 +404,16 @@ class PokemonPlayThroughSupervisor(Supervisor):
         plan = "\n".join(f"{n + 1}. {subgoal}" for n, subgoal in enumerate(self.plan))
         raw_state = AgentState.IN_DIALOGUE if self._is_in_dialogue() else self._agent_state()
         state = raw_state.name.lower().replace("_", " ")
+        local_kinds = None
+        if raw_state == AgentState.FREE_ROAM and self._identified:
+            local_kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
+                                     getattr(self._env, "walk_patterns", None), self._people_now())
         return (prompt.replace("[GAME]", self._game)
                 .replace("[TASK]", self._task)
                 .replace("[GUIDANCE_BLOCK]", guidance_block)
                 .replace("[LOG_BLOCK]", self._log_block())
                 .replace("[SCREEN_TILES]", self._screen_tiles)
+                .replace("[AREA_MAP_BLOCK]", self._area_map_block(local_kinds))
                 .replace("[AGENT_STATE]", state)
                 .replace("[PRIMITIVES]", PRIMITIVES)
                 .replace("[PLAN]", plan))
@@ -306,7 +533,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return decision
 
     def _judge(self, subgoal: str, request: str, result: Dict[str, Any],
-               subgoal_index: int = 0) -> Tuple[bool, str, int]:
+               subgoal_index: int = 0, move_tag: str = "") -> Tuple[bool, str, int]:
         report = result["report"]
         before = report.initial_state["core"]["current_frame"]
         after = report.final_state["core"]["current_frame"]
@@ -321,10 +548,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                      getattr(self._env, "walk_patterns", None), after_people)
             after_tiles = (verbalize_tiles(after_identified, after_people)
                            + "\nWalkable cells on each edge of the screen:\n"
-                           + verbalize_edges(after_kinds))
+                           + self._describe_edges(after_kinds))
+            if move_tag:
+                after_tiles += f"\n{move_tag}"
             after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", after_tiles)
         else:
-            after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", describe_state_screen(after_state))
+            after_desc = describe_state_screen(after_state)
+            if move_tag:
+                after_desc += f"\n{move_tag}"
+            after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", after_desc)
         text = result.get("dialogue") or ""
         text_block = PLAYTHROUGH_TEXT_BLOCK.replace("[TEXT]", text) if text.strip() else ""
         executor_report = f"{result['reason']} (code {result['code']})"
@@ -563,12 +795,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     return "out_of_calls", attempts, subgoal_index
             frame = self._current_frame()
             self._perceive(frame)
+            before_place = self._current_map_place()
+            prior_stops = list(self._leg_stops)
             decision = self._decide(subgoal, attempts, frame)
             if decision is None:
                 attempts.append("the reply could not be read, so nothing was done")
                 continue
             action, argument = decision
+            is_move_action = ACTIONS[action][0] in MOVE_TAGS
             result, task = self._run_action(action, argument, frame)
+            after_place = self._record_map_stop()
+            move_tag = self._format_leg_movement(before_place, after_place, prior_stops, is_move_action=is_move_action)
             request = f"{action}({task})"
             if self._battles_lost():
                 note = f"{request}: the player lost a battle and blacked out"
@@ -596,12 +833,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     if combined_text:
                         follow_up["dialogue"] = combined_text
                     result = follow_up
+                after_place = self._record_map_stop()
+                move_tag = self._format_leg_movement(
+                    before_place, after_place, prior_stops, is_move_action=is_move_action)
 
             if not result["succeeded"] and (self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue()):
                 state, handled = self._handle_interruption()
                 handled["report"].initial_state = result["report"].initial_state
+                after_place = self._record_map_stop()
+                move_tag = self._format_leg_movement(
+                    before_place, after_place, prior_stops, is_move_action=is_move_action)
                 note = (f"{request} was interrupted while the game was in {state}; "
                         f"dealt with it ({handled['reason']}){self._dialogue_snippet(handled)}")
+                if move_tag:
+                    note = f"{move_tag} {note}"
                 self._note(note)
                 attempts.append(note)
                 if self._battles_lost():
@@ -609,7 +854,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     return "lost_battle", attempts, subgoal_index
                 if handled.get("succeeded"):
                     complete, summary, reached = self._judge(
-                        subgoal, f"{request} (cleared {state})", handled, subgoal_index)
+                        subgoal, f"{request} (cleared {state})", handled, subgoal_index, move_tag=move_tag)
+                    if move_tag and move_tag not in summary:
+                        summary = f"{move_tag} {summary}"
                     self._note(summary)
                     attempts.append(f"{request}: {summary}")
                     if complete:
@@ -619,11 +866,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if not result["succeeded"]:
                 note = f"{request} did not work: {result['reason']}" + (
                     f" ({result['notes']})" if result.get("notes") else "")
+                if move_tag:
+                    note = f"{move_tag} {note}"
                 self._note(note)
                 attempts.append(note)
                 continue
 
-            complete, summary, reached = self._judge(subgoal, request, result, subgoal_index)
+            complete, summary, reached = self._judge(subgoal, request, result, subgoal_index, move_tag=move_tag)
+            if move_tag and move_tag not in summary:
+                summary = f"{move_tag} {summary}"
             self._note(summary)
             attempts.append(f"{request}: {summary}")
             if complete:
