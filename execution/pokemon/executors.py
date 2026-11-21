@@ -1090,7 +1090,7 @@ Press: <one of up, down, left, right, confirm, back>
                       .replace("[HISTORY]", self._history_block()))
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
-            if parse_yes_no(output, "Complete"):
+            if parse_yes_no(output, "Complete") and (self.presses or self.is_start_menu):
                 return self._finish(MENU_OK, "objective_complete")
             press = (parse_key_value(output, "Press") or "").strip().lower()
             press = next((option for option in MENU_PRESSES if option in press), None)
@@ -1128,6 +1128,7 @@ DIALOGUE_MAX_CUTSCENE_WAIT = 24
 DIALOGUE_POST_MOTION_WAIT = 4
 DIALOGUE_FANFARE_RETRY_LIMIT = 4
 DIALOGUE_BUTTON_SETTLE_WAIT = 2
+FREE_SETTLE_WAIT = 4
 MENU_SETTLE_WAIT = 1
 
 LEFT_DIALOGUE_CODES = {
@@ -1137,32 +1138,14 @@ LEFT_DIALOGUE_CODES = {
 }
 
 
-class DialogueExecutor(PolicyExecutor):
-    def __init__(self, env, task, max_steps: int = 10, **kwargs):
-        self.dialogue_crops: List[Any] = []
-        self.dialogue_text: str = ""
-        super().__init__(env, task, max_steps, **kwargs)
-
-    def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
-        self.report.termination_reason = reason
-        self.report.notes = notes
-        return code
-
+class _DialogueSettlingExecutor(PolicyExecutor):
     def _agent_state(self):
         return self._get_state()["pokemon_core"]["agent_state"]
 
     def _current_frame(self):
         return self._get_state()["core"]["current_frame"]
 
-    def _finish(self, code: int, reason: str) -> int:
-        if self.dialogue_crops:
-            self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
-                                               parameters=self._parameters))
-        self.report.termination_reason = reason
-        self.report.notes = self.dialogue_text
-        return code
-
-    def _wait_for_next_box(self):
+    def _wait_for_next_box(self, settle_wait: int = DIALOGUE_SETTLE_WAIT):
         state = self._agent_state()
         waited = 0
         post_motion_remaining = 0
@@ -1170,7 +1153,7 @@ class DialogueExecutor(PolicyExecutor):
                and not (self._last_terminated or self._last_truncated)
                and waited < DIALOGUE_MAX_CUTSCENE_WAIT):
             box_open = has_bottom_dialogue_box(self._current_frame())
-            if waited >= DIALOGUE_SETTLE_WAIT and not box_open and post_motion_remaining <= 0:
+            if waited >= settle_wait and not box_open and post_motion_remaining <= 0:
                 break
             wait_record = self._take_action(WaitAction)
             waited += 1
@@ -1195,13 +1178,75 @@ class DialogueExecutor(PolicyExecutor):
             state = self._agent_state()
         return state
 
-    def _settle_after_step(self):
+    def _settle_after_step(self, settle_wait: int = DIALOGUE_SETTLE_WAIT):
         state = self._agent_state()
         if state == AgentState.FREE_ROAM:
-            state = self._wait_for_next_box()
+            state = self._wait_for_next_box(settle_wait=settle_wait)
         if state == AgentState.IN_MENU:
             state = self._settle_state()
         return state
+
+    def _advance_dialogue_box(self, button: str = "a") -> bool:
+        record = self._take_action(PassDialogueAction)
+        drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
+        if self._last_terminated or self._last_truncated:
+            return True
+        state = self._settle_after_step()
+        if self._last_terminated or self._last_truncated or state != AgentState.IN_DIALOGUE:
+            return True
+        if record.action_success != -1:
+            return True
+        for _ in range(DIALOGUE_FANFARE_RETRY_LIMIT):
+            before_btn = self._current_frame()
+            btn_record = self._take_action_string(f"button({button})")
+            if btn_record is None:
+                return False
+            drop_prefix_crops(captured_dialogue_crops([btn_record]), self.dialogue_crops)
+            if self._last_terminated or self._last_truncated:
+                return True
+            state = self._settle_after_step()
+            if self._last_terminated or self._last_truncated or state != AgentState.IN_DIALOGUE:
+                return True
+            if btn_record.frame_changed or is_cutscene_frame_changing(before_btn, self._current_frame()):
+                for _ in range(DIALOGUE_BUTTON_SETTLE_WAIT):
+                    if self._agent_state() != AgentState.IN_DIALOGUE or self._last_terminated or self._last_truncated:
+                        break
+                    wait_record = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
+                if self._last_terminated or self._last_truncated:
+                    return True
+                self._settle_after_step()
+                return True
+            retry = self._take_action(PassDialogueAction)
+            drop_prefix_crops(captured_dialogue_crops([retry]), self.dialogue_crops)
+            if self._last_terminated or self._last_truncated:
+                return True
+            state = self._settle_after_step()
+            if self._last_terminated or self._last_truncated or state != AgentState.IN_DIALOGUE:
+                return True
+            if retry.action_success != -1 or retry.frame_changed:
+                return True
+        return False
+
+
+class DialogueExecutor(_DialogueSettlingExecutor):
+    def __init__(self, env, task, max_steps: int = 10, **kwargs):
+        self.dialogue_crops: List[Any] = []
+        self.dialogue_text: str = ""
+        super().__init__(env, task, max_steps, **kwargs)
+
+    def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
+        self.report.termination_reason = reason
+        self.report.notes = notes
+        return code
+
+    def _finish(self, code: int, reason: str) -> int:
+        if self.dialogue_crops:
+            self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
+                                               parameters=self._parameters))
+        self.report.termination_reason = reason
+        self.report.notes = self.dialogue_text
+        return code
 
     def _execute(self) -> int:
         self._last_terminated = False
@@ -1240,17 +1285,12 @@ class DialogueExecutor(PolicyExecutor):
                                   f"The player is {state.name.lower()}, not in dialogue.")
 
         for _ in range(self._max_steps):
-            record = self._take_action(PassDialogueAction)
-            drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
+            advanced = self._advance_dialogue_box("a")
             if self._last_terminated:
                 return self._finish(DIALOGUE_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(DIALOGUE_TRUNCATED, "truncated")
-            state = self._settle_after_step()
-            if self._last_terminated:
-                return self._finish(DIALOGUE_TERMINATED, "terminated")
-            if self._last_truncated:
-                return self._finish(DIALOGUE_TRUNCATED, "truncated")
+            state = self._agent_state()
             if state != AgentState.IN_DIALOGUE:
                 code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
                 return self._finish(code, {
@@ -1258,77 +1298,8 @@ class DialogueExecutor(PolicyExecutor):
                     DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
                     DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
                 }[code])
-            if record.action_success == -1:
-                advanced = False
-                for _ in range(DIALOGUE_FANFARE_RETRY_LIMIT):
-                    before_a = self._current_frame()
-                    a_record = self._take_action_string("button(a)")
-                    if a_record is None:
-                        return self._finish(DIALOGUE_STUCK, "dialogue_stuck")
-                    drop_prefix_crops(captured_dialogue_crops([a_record]), self.dialogue_crops)
-                    if self._last_terminated:
-                        return self._finish(DIALOGUE_TERMINATED, "terminated")
-                    if self._last_truncated:
-                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                    state = self._settle_after_step()
-                    if self._last_terminated:
-                        return self._finish(DIALOGUE_TERMINATED, "terminated")
-                    if self._last_truncated:
-                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                    if state != AgentState.IN_DIALOGUE:
-                        code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
-                        return self._finish(code, {
-                            DIALOGUE_CLEARED: "dialogue_cleared",
-                            DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
-                            DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
-                        }[code])
-                    if a_record.frame_changed or is_cutscene_frame_changing(before_a, self._current_frame()):
-                        for _ in range(DIALOGUE_BUTTON_SETTLE_WAIT):
-                            if self._agent_state() != AgentState.IN_DIALOGUE or self._last_terminated or self._last_truncated:
-                                break
-                            wait_record = self._take_action(WaitAction)
-                            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
-                        if self._last_terminated:
-                            return self._finish(DIALOGUE_TERMINATED, "terminated")
-                        if self._last_truncated:
-                            return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                        state = self._settle_after_step()
-                        if self._last_terminated:
-                            return self._finish(DIALOGUE_TERMINATED, "terminated")
-                        if self._last_truncated:
-                            return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                        if state != AgentState.IN_DIALOGUE:
-                            code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
-                            return self._finish(code, {
-                                DIALOGUE_CLEARED: "dialogue_cleared",
-                                DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
-                                DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
-                            }[code])
-                        advanced = True
-                        break
-                    retry = self._take_action(PassDialogueAction)
-                    drop_prefix_crops(captured_dialogue_crops([retry]), self.dialogue_crops)
-                    if self._last_terminated:
-                        return self._finish(DIALOGUE_TERMINATED, "terminated")
-                    if self._last_truncated:
-                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                    state = self._settle_after_step()
-                    if self._last_terminated:
-                        return self._finish(DIALOGUE_TERMINATED, "terminated")
-                    if self._last_truncated:
-                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                    if state != AgentState.IN_DIALOGUE:
-                        code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
-                        return self._finish(code, {
-                            DIALOGUE_CLEARED: "dialogue_cleared",
-                            DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
-                            DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
-                        }[code])
-                    if retry.action_success != -1 or retry.frame_changed:
-                        advanced = True
-                        break
-                if not advanced:
-                    return self._finish(DIALOGUE_STUCK, "dialogue_stuck")
+            if not advanced:
+                return self._finish(DIALOGUE_STUCK, "dialogue_stuck")
         return self._finish(DIALOGUE_STUCK, "out_of_steps")
 
 
@@ -1337,12 +1308,29 @@ FREE_TERMINATED = 1
 FREE_TRUNCATED = 2
 FREE_UNREADABLE = -1
 FREE_OUT_OF_STEPS = -2
+FREE_BUTTONS = ("a", "b", "start", "up", "down", "left", "right")
 
 
-class FreeExecutor(PolicyExecutor):
+class FreeExecutor(_DialogueSettlingExecutor):
     MAX_NEW_TOKENS = 4000
     MAX_INVALID = 3
     STEP_TAG = "free_step"
+
+    FIRST_STEP_PROMPT = """You are playing a Game Boy Pokemon game, pressing one button at a time.
+
+What you have been asked to do: "[TASK]"
+
+Stop when: [TERMINATION]
+
+The image is the current screen.
+Choose the single button press that best moves towards what you have been asked to do.
+
+The buttons are: a, b, start, up, down, left, right.
+
+Respond in exactly this format:
+Reasoning: <what is on the screen, and which button to press first>
+Press: <one of a, b, start, up, down, left, right>
+[STOP]"""
 
     STEP_PROMPT = """You are playing a Game Boy Pokemon game, pressing one button at a time.
 
@@ -1352,7 +1340,7 @@ Stop when: [TERMINATION]
 
 The image is the current screen.
 [HISTORY]
-First decide, from this screen, whether the condition to stop at has been met. If it has not, choose the single button press that best moves towards it.
+First decide, from this screen, whether the condition to stop at has been met (a bordered dialogue box at the bottom of the screen—even if blank or mid-text—means dialogue is still open). If it has not, choose the single button press that best moves towards it.
 
 The buttons are: a, b, start, up, down, left, right.
 
@@ -1398,28 +1386,42 @@ Press: <one of a, b, start, up, down, left, right>
                 return btn
         return None
 
+    def _step_press(self, press: str) -> bool:
+        state = self._agent_state()
+        if press in ("a", "b") and state == AgentState.IN_DIALOGUE:
+            self._advance_dialogue_box(press)
+            return True
+        record = self._take_action_string(f"button({press})") if press in FREE_BUTTONS else None
+        if record is None:
+            return False
+        drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
+        if self._last_terminated or self._last_truncated:
+            return True
+        if press in ("a", "b") and self._agent_state() == AgentState.FREE_ROAM:
+            self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
+        elif self._agent_state() == AgentState.IN_MENU:
+            self._settle_state()
+        return True
+
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
         consecutive_invalid = 0
         for _ in range(self._max_steps):
             frame = self._get_state()["core"]["current_frame"]
-            prompt = (self.STEP_PROMPT.replace("[TASK]", self._task.strip())
+            template = self.STEP_PROMPT if self.presses else self.FIRST_STEP_PROMPT
+            prompt = (template.replace("[TASK]", self._task.strip())
                       .replace("[TERMINATION]", self.termination)
                       .replace("[HISTORY]", self._history_block()))
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
+            if self.presses and parse_yes_no(output, "Complete"):
+                return self._finish(FREE_OK, "termination_met")
             answer = (parse_key_value(output, "Press") or "").strip().lower().strip(".")
             press = answer.split()[0] if answer else ""
-            if parse_yes_no(output, "Complete"):
-                if self.presses:
-                    return self._finish(FREE_OK, "termination_met")
-                fallback = press if (press in ("a", "b", "start", "up", "down", "left", "right")) else self._default_first_press(self._task)
-                if fallback is None:
-                    return self._finish(FREE_OK, "termination_met")
-                press = fallback
-            record = self._take_action_string(f"button({press})") if press.isalpha() else None
-            if record is None:
+            if press not in FREE_BUTTONS and not self.presses:
+                press = self._default_first_press(self._task) or ""
+            if not self._step_press(press):
                 self._record_invalid(output)
                 consecutive_invalid += 1
                 if consecutive_invalid >= self.MAX_INVALID:
@@ -1427,7 +1429,6 @@ Press: <one of a, b, start, up, down, left, right>
                 continue
             consecutive_invalid = 0
             self.presses.append(press)
-            drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
             if self._last_terminated:
                 return self._finish(FREE_TERMINATED, "terminated")
             if self._last_truncated:

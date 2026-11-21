@@ -261,8 +261,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             left_battle=report.outcome in (BATTLE_LEFT_TO_DIALOGUE, BATTLE_LEFT_TO_MENU))
 
     def _process_menu(self, report: ExecutorReport) -> Dict[str, Any]:
+        succeeded = (report.outcome in (MENU_OK, MENU_LEFT_TO_DIALOGUE, MENU_LEFT_TO_BATTLE)
+                     and bool(report.steps))
         return self._result("menu", report,
-                            report.outcome in (MENU_OK, MENU_LEFT_TO_DIALOGUE, MENU_LEFT_TO_BATTLE),
+                            succeeded,
                             dialogue=report.notes,
                             left_menu=report.outcome in (MENU_LEFT_TO_DIALOGUE, MENU_LEFT_TO_BATTLE))
 
@@ -273,7 +275,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             left_dialogue=report.outcome in (DIALOGUE_LEFT_TO_MENU, DIALOGUE_LEFT_TO_BATTLE))
 
     def _process_free(self, report: ExecutorReport) -> Dict[str, Any]:
-        return self._result("free", report, report.outcome == FREE_OK)
+        dialogue = getattr(self.last_executor, "dialogue_text", None) or None
+        return self._result("free", report,
+                            report.outcome == FREE_OK and bool(report.steps),
+                            dialogue=dialogue)
 
     def _plan_subgoals(self, frame) -> List[str]:
         output = self._vlm_call("plan", texts=self._fill_prompt(PLAYTHROUGH_PLAN_PROMPT), images=[frame])
@@ -646,6 +651,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 index += 1
                 if index < len(self.plan):
                     continue
+                self._settle_free_roam()
+                if self._is_in_dialogue() and not self._out_of_calls() and not self._env_done():
+                    self._clear_pending_dialogue()
                 frame = self._current_frame()
                 self._perceive(frame)
                 complete, summary = self._task_check(frame)
