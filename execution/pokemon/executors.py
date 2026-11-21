@@ -1126,6 +1126,8 @@ DIALOGUE_STUCK = -2
 DIALOGUE_SETTLE_WAIT = 6
 DIALOGUE_MAX_CUTSCENE_WAIT = 24
 DIALOGUE_POST_MOTION_WAIT = 4
+DIALOGUE_FANFARE_RETRY_LIMIT = 4
+DIALOGUE_BUTTON_SETTLE_WAIT = 2
 MENU_SETTLE_WAIT = 1
 
 LEFT_DIALOGUE_CODES = {
@@ -1257,27 +1259,75 @@ class DialogueExecutor(PolicyExecutor):
                     DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
                 }[code])
             if record.action_success == -1:
-                a_record = self._take_action_string("button(a)")
-                if a_record is None:
-                    return self._finish(DIALOGUE_STUCK, "dialogue_stuck")
-                drop_prefix_crops(captured_dialogue_crops([a_record]), self.dialogue_crops)
-                if self._last_terminated:
-                    return self._finish(DIALOGUE_TERMINATED, "terminated")
-                if self._last_truncated:
-                    return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                state = self._settle_after_step()
-                if self._last_terminated:
-                    return self._finish(DIALOGUE_TERMINATED, "terminated")
-                if self._last_truncated:
-                    return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                if state != AgentState.IN_DIALOGUE:
-                    code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
-                    return self._finish(code, {
-                        DIALOGUE_CLEARED: "dialogue_cleared",
-                        DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
-                        DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
-                    }[code])
-                if not a_record.frame_changed:
+                advanced = False
+                for _ in range(DIALOGUE_FANFARE_RETRY_LIMIT):
+                    before_a = self._current_frame()
+                    a_record = self._take_action_string("button(a)")
+                    if a_record is None:
+                        return self._finish(DIALOGUE_STUCK, "dialogue_stuck")
+                    drop_prefix_crops(captured_dialogue_crops([a_record]), self.dialogue_crops)
+                    if self._last_terminated:
+                        return self._finish(DIALOGUE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
+                    state = self._settle_after_step()
+                    if self._last_terminated:
+                        return self._finish(DIALOGUE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
+                    if state != AgentState.IN_DIALOGUE:
+                        code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
+                        return self._finish(code, {
+                            DIALOGUE_CLEARED: "dialogue_cleared",
+                            DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
+                            DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
+                        }[code])
+                    if a_record.frame_changed or is_cutscene_frame_changing(before_a, self._current_frame()):
+                        for _ in range(DIALOGUE_BUTTON_SETTLE_WAIT):
+                            if self._agent_state() != AgentState.IN_DIALOGUE or self._last_terminated or self._last_truncated:
+                                break
+                            wait_record = self._take_action(WaitAction)
+                            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
+                        if self._last_terminated:
+                            return self._finish(DIALOGUE_TERMINATED, "terminated")
+                        if self._last_truncated:
+                            return self._finish(DIALOGUE_TRUNCATED, "truncated")
+                        state = self._settle_after_step()
+                        if self._last_terminated:
+                            return self._finish(DIALOGUE_TERMINATED, "terminated")
+                        if self._last_truncated:
+                            return self._finish(DIALOGUE_TRUNCATED, "truncated")
+                        if state != AgentState.IN_DIALOGUE:
+                            code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
+                            return self._finish(code, {
+                                DIALOGUE_CLEARED: "dialogue_cleared",
+                                DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
+                                DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
+                            }[code])
+                        advanced = True
+                        break
+                    retry = self._take_action(PassDialogueAction)
+                    drop_prefix_crops(captured_dialogue_crops([retry]), self.dialogue_crops)
+                    if self._last_terminated:
+                        return self._finish(DIALOGUE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
+                    state = self._settle_after_step()
+                    if self._last_terminated:
+                        return self._finish(DIALOGUE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(DIALOGUE_TRUNCATED, "truncated")
+                    if state != AgentState.IN_DIALOGUE:
+                        code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
+                        return self._finish(code, {
+                            DIALOGUE_CLEARED: "dialogue_cleared",
+                            DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
+                            DIALOGUE_LEFT_TO_BATTLE: "left_dialogue_to_battle",
+                        }[code])
+                    if retry.action_success != -1 or retry.frame_changed:
+                        advanced = True
+                        break
+                if not advanced:
                     return self._finish(DIALOGUE_STUCK, "dialogue_stuck")
         return self._finish(DIALOGUE_STUCK, "out_of_steps")
 
