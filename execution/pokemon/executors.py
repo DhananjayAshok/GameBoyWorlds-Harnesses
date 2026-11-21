@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from execution.game_api import (AgentState, BattleMenuAction, InteractAction, MenuAction, MoveStepsAction,
-                                OpenMenuAction, PassDialogueAction, PickAttackAction, WaitAction)
+                                OpenMenuAction, PassDialogueAction, PickAttackAction)
 
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.navigation import (DIRECTIONS, WALKABLE, approach_cells,
@@ -711,8 +711,6 @@ DIALOGUE_LEFT_TO_BATTLE = 4
 DIALOGUE_NOT_IN_DIALOGUE = -1
 DIALOGUE_STUCK = -2
 
-DIALOGUE_SETTLE_WAIT = 2
-
 LEFT_DIALOGUE_CODES = {
     AgentState.FREE_ROAM: DIALOGUE_CLEARED,
     AgentState.IN_MENU: DIALOGUE_LEFT_TO_MENU,
@@ -742,27 +740,15 @@ class DialogueExecutor(PolicyExecutor):
         self.report.notes = self.dialogue_text
         return code
 
-    def _wait_for_next_box(self) -> Any:
-        state = self._agent_state()
-        for _ in range(DIALOGUE_SETTLE_WAIT):
-            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
-                break
-            wait_record = self._take_action(WaitAction)
-            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
-            state = self._agent_state()
-        return state
-
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
-        self._begin_scripted(f"pass the dialogue: {self._task}")
         state = self._agent_state()
-        if state == AgentState.FREE_ROAM:
-            state = self._wait_for_next_box()
         if state != AgentState.IN_DIALOGUE:
             return self._fail(DIALOGUE_NOT_IN_DIALOGUE, "not_in_dialogue",
                               f"The player is {state.name.lower()}, not in dialogue.")
 
+        self._begin_scripted(f"pass the dialogue: {self._task}")
         for _ in range(self._max_steps):
             record = self._take_action(PassDialogueAction)
             drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
@@ -771,12 +757,6 @@ class DialogueExecutor(PolicyExecutor):
             if self._last_truncated:
                 return self._finish(DIALOGUE_TRUNCATED, "truncated")
             state = self._agent_state()
-            if state == AgentState.FREE_ROAM:
-                state = self._wait_for_next_box()
-                if self._last_terminated:
-                    return self._finish(DIALOGUE_TERMINATED, "terminated")
-                if self._last_truncated:
-                    return self._finish(DIALOGUE_TRUNCATED, "truncated")
             if state != AgentState.IN_DIALOGUE:
                 code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
                 return self._finish(code, {

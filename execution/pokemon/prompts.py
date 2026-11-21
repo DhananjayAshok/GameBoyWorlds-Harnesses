@@ -26,7 +26,7 @@ The image is the current game screen. Here is what has been recognised on it:
 These are the only things the player can be told to do:
 [PRIMITIVES]
 
-Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now. If a dialogue box or scripted cutscene is currently playing or about to continue (including when a text box at the bottom of the screen is blank, has only printed its first few characters, or is between consecutive lines), include finishing that dialogue/cutscene before any walking subgoal.
+Break the task into subgoals, in order. Write each subgoal as the state of the game to reach, in plain words, not as one of the calls above: "the player is standing in front of the nurse", never "Interact(nurse)". Each subgoal should be a small step that one of the above can plausibly achieve from the screen it starts on, and should be worth checking off on its own. Write as few as the task needs. Start from where the player is now.
 
 Respond in exactly this format:
 Reasoning: <what the screen shows and how you intend to get the task done>
@@ -51,7 +51,7 @@ The image is the current game screen. Here is what has been recognised on it:
 You can make the player do exactly one of the following:
 [PRIMITIVES]
 
-Pick the single action that makes the most progress on the subgoal from this screen. Always check the bottom of the screen for a dialogue box frame—even if it is blank or has only printed its first few letters—and check whether your previous movement attempt was just interrupted by dialogue without the player moving. While a dialogue box is visible or a multi-part scripted conversation/cutscene is still playing between text boxes, choose Dialogue() or Free(...) to advance it rather than MoveTo or MoveOff.
+Pick the single action that makes the most progress on the subgoal from this screen.
 
 Respond in exactly this format:
 Reasoning: <what you see, and why this action is the best next step>
