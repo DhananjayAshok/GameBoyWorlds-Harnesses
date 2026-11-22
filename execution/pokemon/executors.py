@@ -1807,7 +1807,7 @@ Stop when: [TERMINATION]
 
 The image is the current screen.
 [HISTORY]
-First decide, from this screen, whether the condition to stop at has been met (a bordered dialogue box at the bottom of the screen—even if blank or mid-text—means dialogue is still open). If it has not, choose the single button press that best moves towards it.
+First decide, from this screen, whether the condition to stop at has been met (a bordered dialogue box at the bottom of the screen—even if blank or mid-text—means dialogue is still open). If it has not, choose the single button press that best moves towards it. Keep Reasoning concise (at most 3-4 sentences) and never repeat a direction listed as blocked at your current position.
 
 The buttons are: a, b, start, up, down, left, right.
 
@@ -1820,13 +1820,17 @@ Press: <one of a, b, start, up, down, left, right>
     DEFAULT_TERMINATION = "what you were asked to do has visibly happened on screen"
 
     MAX_REPEATED_BLOCKED_PRESSES = 2
+    MAX_NO_DISPLACEMENT_DIRECTIONAL_PRESSES = 3
 
     def __init__(self, env, task, max_steps: int = 15, termination: Optional[str] = None, **kwargs):
         self.presses: List[str] = []
+        self.press_outcomes: List[str] = []
         self.dialogue_crops: List[Any] = []
         self.dialogue_text: str = ""
         self._blocked_at_place: Dict[Any, List[str]] = {}
+        self._zero_disp_at_place: Dict[Any, List[str]] = {}
         self._repeated_blocked_presses: int = 0
+        self._no_displacement_directional_presses: int = 0
         self.termination = (termination or "").strip() or self.DEFAULT_TERMINATION
         super().__init__(env, task, max_steps, termination=self.termination, **kwargs)
 
@@ -1838,8 +1842,13 @@ Press: <one of a, b, start, up, down, left, right>
     def _history_block(self) -> str:
         if not self.presses:
             return ""
-        lines = [f"Buttons pressed so far, in order: {', '.join(self.presses)}."]
+        outcomes = self.press_outcomes if len(self.press_outcomes) == len(self.presses) else self.presses
+        lines = [f"Buttons pressed so far, in order: {', '.join(outcomes)}."]
         cur_place = self._current_map_place()
+        if cur_place is not None:
+            facing = getattr(self._env, "facing", None)
+            facing_note = f", facing {facing}" if facing in DIRECTIONS else ""
+            lines.append(f"Current position: {cur_place[1]}{facing_note}.")
         blocked_here = self._blocked_at_place.get(cur_place, []) if cur_place is not None else []
         if blocked_here:
             lines.append(
@@ -1856,6 +1865,10 @@ Press: <one of a, b, start, up, down, left, right>
         cur_place = self._current_map_place()
         blocked_here = self._blocked_at_place.get(cur_place, []) if cur_place is not None else []
         blocked_note = f"Blocked moving {', '.join(blocked_here)} at {cur_place[1]}" if blocked_here else ""
+        if not blocked_note and self._blocked_at_place:
+            parts = [f"{', '.join(dirs)} at {place[1]}" for place, dirs in self._blocked_at_place.items() if dirs]
+            if parts:
+                blocked_note = f"Blocked moving {'; '.join(parts)}"
         self.report.notes = "\n".join(filter(None, [f"Presses: {', '.join(self.presses) or 'none'}",
                                                     blocked_note,
                                                     self.dialogue_text]))
@@ -1878,11 +1891,26 @@ Press: <one of a, b, start, up, down, left, right>
         except Exception:  # noqa: BLE001
             return None
 
+    def _record_blocked_direction(self, place: Tuple[int, Tuple[int, int]], direction: str) -> None:
+        blocked_list = self._blocked_at_place.setdefault(place, [])
+        if direction in blocked_list:
+            self._repeated_blocked_presses += 1
+        else:
+            blocked_list.append(direction)
+        if getattr(self._current_map_place(), "__eq__", lambda _: False)(place):
+            recorder = getattr(self._env, "record_blocked_step", None)
+            if callable(recorder):
+                try:
+                    recorder(direction=direction)
+                except Exception:  # noqa: BLE001
+                    pass
+
     def _step_press(self, press: str) -> bool:
         state = self._agent_state()
         if press in ("a", "b") and (state == AgentState.IN_DIALOGUE
                                     or (state == AgentState.IN_MENU and self._is_top_box_dialogue())):
             self._advance_dialogue_box(press)
+            self.press_outcomes.append(f"{press} (advanced dialogue)")
             return True
         was_free = (
             state == AgentState.FREE_ROAM
@@ -1896,29 +1924,35 @@ Press: <one of a, b, start, up, down, left, right>
             return False
         drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
         if self._last_terminated or self._last_truncated:
+            self.press_outcomes.append(press)
             return True
         after_place = self._current_map_place() if before_place is not None else None
-        if before_place is not None and after_place != before_place:
-            self._repeated_blocked_presses = 0
-        elif (
-            before_place is not None
-            and ((self.presses and self.presses[-1] == press) or was_facing == press)
-            and self._agent_state() == AgentState.FREE_ROAM
+        still_free = (
+            self._agent_state() == AgentState.FREE_ROAM
             and not has_bottom_dialogue_box(self._current_frame())
             and not self._is_top_box_dialogue()
-            and after_place == before_place
-        ):
-            blocked_list = self._blocked_at_place.setdefault(before_place, [])
-            if press in blocked_list:
-                self._repeated_blocked_presses += 1
+        )
+        outcome_label = press
+        if before_place is not None and after_place is not None and after_place != before_place:
+            self._repeated_blocked_presses = 0
+            self._no_displacement_directional_presses = 0
+            outcome_label = f"{press} (moved {before_place[1]} -> {after_place[1]})"
+        elif before_place is not None and still_free and after_place == before_place:
+            self._no_displacement_directional_presses += 1
+            zero_list = self._zero_disp_at_place.setdefault(before_place, [])
+            is_known_blocked = (
+                (self.presses and self.presses[-1] == press)
+                or was_facing == press
+                or press in zero_list
+            )
+            if press not in zero_list:
+                zero_list.append(press)
+            if is_known_blocked:
+                self._record_blocked_direction(before_place, press)
+                outcome_label = f"{press} (blocked at {before_place[1]}, 0 steps)"
             else:
-                blocked_list.append(press)
-            recorder = getattr(self._env, "record_blocked_step", None)
-            if callable(recorder):
-                try:
-                    recorder(direction=press)
-                except Exception:  # noqa: BLE001
-                    pass
+                outcome_label = f"{press} (0 steps at {before_place[1]} — turned or blocked)"
+        self.press_outcomes.append(outcome_label)
         if press in ("a", "b") and self._agent_state() == AgentState.FREE_ROAM:
             self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
         elif self._agent_state() == AgentState.IN_MENU:
@@ -1941,8 +1975,11 @@ Press: <one of a, b, start, up, down, left, right>
                 return self._finish(FREE_OK, "termination_met")
             answer = (parse_key_value(output, "Press") or "").strip().lower().strip(".")
             press = answer.split()[0] if answer else ""
-            if press not in FREE_BUTTONS and not self.presses:
-                press = self._default_first_press(self._task) or ""
+            if press not in FREE_BUTTONS:
+                if not self.presses:
+                    press = self._default_first_press(self._task) or ""
+                elif self._repeated_blocked_presses > 0 or self._no_displacement_directional_presses >= 2:
+                    return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")
             if not self._step_press(press):
                 self._record_invalid(output)
                 consecutive_invalid += 1
@@ -1955,6 +1992,9 @@ Press: <one of a, b, start, up, down, left, right>
                 return self._finish(FREE_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(FREE_TRUNCATED, "truncated")
-            if self._repeated_blocked_presses >= self.MAX_REPEATED_BLOCKED_PRESSES:
+            if (
+                self._repeated_blocked_presses >= self.MAX_REPEATED_BLOCKED_PRESSES
+                or self._no_displacement_directional_presses >= self.MAX_NO_DISPLACEMENT_DIRECTIONAL_PRESSES
+            ):
                 return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")
         return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")
