@@ -10,8 +10,10 @@ from execution.perception.pokemon.battle import (BANNER_TOP, TILE_SIZE, find_mod
                                                  has_bottom_dialogue_box, has_bottom_location_banner)
 from execution.perception.pokemon.grid import GRID_SKIP, cell_box, draw_box, split_grid
 from execution.perception.pokemon.navigation import (FURNITURE_OVERHANG_TOP_TAGS, OVERHANG_TOP_TAGS,
-                                                     is_npc_head_overhang_floor_cell, is_overhang_floor_cell,
-                                                     is_player_overhang_floor_cell, is_top_overhang_floor_cell)
+                                                     is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
+                                                     is_overhang_floor_cell, is_player_overhang_floor_cell,
+                                                     is_south_ledge_cell, is_top_overhang_floor_cell,
+                                                     is_west_ledge_cell)
 from execution.perception.pokemon.prompts import PLAYER_SIDES, TILE_IN_CELL_PROMPT, TILE_TAGS, fill_player_note
 from utils import log_error, parse_key_value
 
@@ -105,10 +107,38 @@ def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple
     top_overhang_cells = {
         cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     }
-    player_overhang_cells = {cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags)}
+    player_overhang_cells = {
+        cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+    }
     npc_head_overhang_cells = {cell for cell in quarter_tags if is_npc_head_overhang_floor_cell(cell, quarter_tags)}
+    south_ledge_cells = {
+        cell for cell in quarter_tags if is_south_ledge_cell(cell, quarter_tags, quarter_descriptions)
+    }
+    west_ledge_cells = {
+        cell for cell in quarter_tags if is_west_ledge_cell(cell, quarter_tags, quarter_descriptions)
+    }
+    east_cliff_cells = {
+        cell for cell in quarter_tags if is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions)
+    }
     by_cell: Dict[Tuple[int, int], Dict[str, Dict[str, Any]]] = {}
+    for cell in south_ledge_cells:
+        by_cell.setdefault(cell, {})["ledge"] = {
+            "quarters": {"bottom_left", "bottom_right"},
+            "descriptions": ["one-way ledge (jump down only; blocks moving up)"],
+        }
+    for cell in west_ledge_cells:
+        by_cell.setdefault(cell, {})["ledge"] = {
+            "quarters": {"top_left", "bottom_left"},
+            "descriptions": ["one-way vertical ledge (jump left only; blocks moving right)"],
+        }
+    for cell in east_cliff_cells:
+        by_cell.setdefault(cell, {})["obstacle"] = {
+            "quarters": {"top_right", "bottom_right"},
+            "descriptions": ["vertical cliff wall (blocks moving left or right)"],
+        }
     for (x, y, quarter), tile in identified.items():
+        if (x, y) in south_ledge_cells or (x, y) in west_ledge_cells or (x, y) in east_cliff_cells:
+            continue
         tag = normalize_tabletop_tag(tile.tag, tile.description)
         if (x, y) in top_overhang_cells and quarter in ("top_left", "top_right") and tag in FURNITURE_OVERHANG_TOP_TAGS:
             continue
@@ -189,8 +219,14 @@ PLAYER_NEIGHBOURS = {
 
 def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> str:
     quarter_tags, quarter_descriptions = _quarter_tag_map(identified)
+    if is_south_ledge_cell(cell, quarter_tags, quarter_descriptions):
+        return "ledge (one-way ledge, jump down only; blocks moving up) in the bottom half"
+    if is_west_ledge_cell(cell, quarter_tags, quarter_descriptions):
+        return "ledge (one-way vertical ledge, jump left only; blocks moving right) in the left half"
+    if is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions):
+        return "obstacle (vertical cliff wall; blocks moving left or right) in the right half"
     is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-    is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags)
+    is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     is_npc_head_overhang = is_npc_head_overhang_floor_cell(cell, quarter_tags)
     groups: Dict[Tuple[str, Optional[str]], set] = {}
     for quarter in QUARTER_OFFSETS:

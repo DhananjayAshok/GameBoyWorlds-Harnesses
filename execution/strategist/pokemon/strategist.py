@@ -399,7 +399,7 @@ class PokemonStrategist:
             people = self._screen_people()
             if self._identified:
                 kinds = cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
-                                   people)
+                                   people, self.global_map.left_ledge_patterns)
                 self._screen_tiles = (verbalize_tiles(self._identified, people)
                                       + "\nWalkable cells on each edge of the screen:\n"
                                       + verbalize_edges(kinds))
@@ -511,7 +511,7 @@ class PokemonStrategist:
         if not self.global_map.current:
             return ""
         local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
-                            self._screen_people())
+                            self._screen_people(), self.global_map.left_ledge_patterns)
                  if self._identified else None)
         self.global_map.prune_routes()
         _, failed = self._failure_streak()

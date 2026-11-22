@@ -11,6 +11,7 @@ Cell = Tuple[int, int]
 WALKABLE = "walkable"
 BLOCKED = "blocked"
 LEDGE = "ledge"
+LEDGE_LEFT = "ledge_left"
 
 WALKABLE_TAGS = {
     "ground", "ground decoration", "tall grass", "entrance", "staircase", "elevator",
@@ -22,6 +23,18 @@ FURNITURE_OVERHANG_TOP_TAGS = {"interactable object", "obstacle"}
 OVERHANG_TOP_TAGS = {"interactable object", "obstacle", "npc", "item", "sign"}
 QUARTERS = ("top_left", "top_right", "bottom_left", "bottom_right")
 FURNITURE_OVERHANG_DESC_PATTERN = re.compile(r"\b(?:table|desk|counter|shelf|bookshelf|machine|computer|pc|tv|television|sink|stove|bed)\b", re.IGNORECASE)
+RIDGE_DESCRIPTION_PATTERN = re.compile(
+    r"\b(?:ledge|cliff|ridge)\b|rocky\s+fence|horizontal\s+fence",
+    re.IGNORECASE,
+)
+WEST_LEDGE_DESCRIPTION_PATTERN = re.compile(
+    r"\bledge\b|rocky\s+fence",
+    re.IGNORECASE,
+)
+WATER_BORDER_DESCRIPTION_PATTERN = re.compile(
+    r"\b(?:water|water's|shoreline)\b",
+    re.IGNORECASE,
+)
 
 X_RANGE = range(LEFT_COL, LEFT_COL + 10)
 Y_RANGE = range(TOP_ROW - 8, TOP_ROW + 1)
@@ -67,30 +80,124 @@ def is_top_overhang_floor_cell(
     return True
 
 
-def is_player_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+def is_ridge_quarter(tag: Optional[str], description: Optional[str] = None) -> bool:
+    if tag in LEDGE_TAGS:
+        return True
+    if tag != "obstacle" or not description:
+        return False
+    if WATER_BORDER_DESCRIPTION_PATTERN.search(description):
+        return False
+    return bool(RIDGE_DESCRIPTION_PATTERN.search(description))
+
+
+def is_west_ledge_quarter(tag: Optional[str], description: Optional[str] = None) -> bool:
+    if tag in LEDGE_TAGS:
+        return True
+    if tag != "obstacle" or not description:
+        return False
+    if WATER_BORDER_DESCRIPTION_PATTERN.search(description):
+        return False
+    return bool(WEST_LEDGE_DESCRIPTION_PATTERN.search(description))
+
+
+def is_south_ledge_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    top_tags = {cell_q["top_left"], cell_q["top_right"]}
+    if not (top_tags <= WALKABLE_TAGS | LEDGE_TAGS):
+        return False
+    bot_left_ridge = is_ridge_quarter(cell_q["bottom_left"], cell_d.get("bottom_left"))
+    bot_right_ridge = is_ridge_quarter(cell_q["bottom_right"], cell_d.get("bottom_right"))
+    if bot_left_ridge and bot_right_ridge:
+        return True
+    if cell == (0, 1) and (bot_left_ridge or bot_right_ridge):
+        bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
+        if bottom_tags <= WALKABLE_TAGS | LEDGE_TAGS | OVERHANG_TOP_TAGS:
+            return True
+    return False
+
+
+def is_west_ledge_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    right_tags = {cell_q["top_right"], cell_q["bottom_right"]}
+    if not (right_tags <= WALKABLE_TAGS):
+        return False
+    return (
+        is_west_ledge_quarter(cell_q["top_left"], cell_d.get("top_left"))
+        and is_west_ledge_quarter(cell_q["bottom_left"], cell_d.get("bottom_left"))
+    )
+
+
+def is_east_cliff_barrier_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    left_tags = {cell_q["top_left"], cell_q["bottom_left"]}
+    if not (left_tags <= WALKABLE_TAGS):
+        return False
+    return (
+        is_ridge_quarter(cell_q["top_right"], cell_d.get("top_right"))
+        and is_ridge_quarter(cell_q["bottom_right"], cell_d.get("bottom_right"))
+    )
+
+
+def is_player_overhang_floor_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
     if cell != (0, 1):
         return False
     cell_q = quarter_tags.get(cell, {})
     if len(cell_q) < 4:
+        return False
+    if (
+        is_south_ledge_cell(cell, quarter_tags, quarter_descriptions)
+        or is_west_ledge_cell(cell, quarter_tags, quarter_descriptions)
+        or is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions)
+    ):
         return False
     top_tags = {cell_q["top_left"], cell_q["top_right"]}
     bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
     if not (top_tags <= WALKABLE_TAGS) or (bottom_tags <= WALKABLE_TAGS):
         return False
-    return bottom_tags <= WALKABLE_TAGS | OVERHANG_TOP_TAGS
+    if not (bottom_tags <= WALKABLE_TAGS | OVERHANG_TOP_TAGS):
+        return False
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    for q in ("bottom_left", "bottom_right"):
+        if is_ridge_quarter(cell_q.get(q), cell_d.get(q)):
+            return False
+    if cell_q["bottom_left"] == "obstacle" and cell_q["bottom_right"] == "obstacle":
+        return False
+    return True
 
 
-def is_player_overhang_ledge_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+def is_player_overhang_ledge_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
     if cell != (0, 1):
         return False
-    cell_q = quarter_tags.get(cell, {})
-    if len(cell_q) < 4:
-        return False
-    top_tags = {cell_q["top_left"], cell_q["top_right"]}
-    bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
-    if not (top_tags <= WALKABLE_TAGS | LEDGE_TAGS) or (bottom_tags <= WALKABLE_TAGS | LEDGE_TAGS):
-        return False
-    return bool(bottom_tags & LEDGE_TAGS) and (bottom_tags <= WALKABLE_TAGS | LEDGE_TAGS | OVERHANG_TOP_TAGS)
+    return is_south_ledge_cell(cell, quarter_tags, quarter_descriptions)
 
 
 def is_npc_head_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
@@ -117,7 +224,7 @@ def is_overhang_floor_cell(
 ) -> bool:
     return (
         is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-        or is_player_overhang_floor_cell(cell, quarter_tags)
+        or is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
         or is_npc_head_overhang_floor_cell(cell, quarter_tags)
     )
 
@@ -127,16 +234,21 @@ def cell_kinds(
     ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
     walk_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
     people: Optional[Dict[Cell, str]] = None,
+    left_ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
 ) -> Dict[Cell, str]:
+    from execution.perception.pokemon.tiles import normalize_tabletop_tag
+
     # ``ledge_patterns`` / ``walk_patterns``: quarter hashes (QUARTERS order) learned from movement.
     tags: Dict[Cell, set] = {}
     quarter_tags: Dict[Cell, Dict[str, str]] = {}
     quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
-        tags.setdefault((x, y), set()).add(tile.tag)
-        quarter_tags.setdefault((x, y), {})[quarter] = tile.tag
-        quarter_descriptions.setdefault((x, y), {})[quarter] = getattr(tile, "description", None)
+        desc = getattr(tile, "description", None)
+        norm_tag = normalize_tabletop_tag(tile.tag, desc)
+        tags.setdefault((x, y), set()).add(norm_tag)
+        quarter_tags.setdefault((x, y), {})[quarter] = norm_tag
+        quarter_descriptions.setdefault((x, y), {})[quarter] = desc
         hashes.setdefault((x, y), {})[quarter] = tile.hash
     confirmed_occupied: set = set()
     for cell, label in (people or {}).items():
@@ -157,17 +269,24 @@ def cell_kinds(
             or is_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
         ):
             kinds[cell] = WALKABLE
+        elif is_south_ledge_cell(cell, quarter_tags, quarter_descriptions) or (
+            cell_tags <= WALKABLE_TAGS | LEDGE_TAGS
+        ):
+            kinds[cell] = LEDGE
+        elif is_west_ledge_cell(cell, quarter_tags, quarter_descriptions):
+            kinds[cell] = LEDGE_LEFT
+        elif ledge_patterns and pattern in ledge_patterns:
+            kinds[cell] = LEDGE
+        elif left_ledge_patterns and pattern in left_ledge_patterns:
+            kinds[cell] = LEDGE_LEFT
         elif (
             walk_patterns
             and pattern in walk_patterns
             and "npc" not in cell_tags
             and bool(cell_tags & WALKABLE_TAGS)
+            and not is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions)
         ):
             kinds[cell] = WALKABLE
-        elif cell_tags <= WALKABLE_TAGS | LEDGE_TAGS or is_player_overhang_ledge_cell(cell, quarter_tags):
-            kinds[cell] = LEDGE
-        elif ledge_patterns and pattern in ledge_patterns:
-            kinds[cell] = LEDGE
         else:
             kinds[cell] = BLOCKED
     return kinds
@@ -191,8 +310,9 @@ def shortest_path(kinds: Dict[Cell, str], start: Cell, goals: Iterable[Cell]) ->
             kind = kinds.get(nxt, BLOCKED)
             if kind == WALKABLE:
                 landing, move = nxt, "walk"
-            elif kind == LEDGE and direction == "down":
-                landing, move = (nxt[0], nxt[1] - 1), "jump"
+            elif (kind == LEDGE and direction == "down") or (kind == LEDGE_LEFT and direction == "left"):
+                dx, dy = DIRECTIONS[direction]
+                landing, move = (nxt[0] + dx, nxt[1] + dy), "jump"
                 if not in_bounds(landing) or kinds.get(landing, BLOCKED) != WALKABLE:
                     continue
             else:
@@ -322,7 +442,7 @@ def filter_open_lane_edge_cells(
                 beyond_clear.append(c)
             elif beyond.kind == WALKABLE:
                 beyond_clear.append(c)
-            elif beyond.kind == LEDGE and direction == "down":
+            elif (beyond.kind == LEDGE and direction == "down") or (beyond.kind == LEDGE_LEFT and direction == "left"):
                 landing = seg.get((px + c[0] + 2 * dx, py + c[1] + 2 * dy))
                 if landing is None or landing.kind == WALKABLE:
                     beyond_clear.append(c)
@@ -333,6 +453,7 @@ def filter_open_lane_edge_cells(
         c for c in cells_list
         if kinds.get((c[0] - dx, c[1] - dy)) == WALKABLE
         or (kinds.get((c[0] - dx, c[1] - dy)) == LEDGE and direction == "down")
+        or (kinds.get((c[0] - dx, c[1] - dy)) == LEDGE_LEFT and direction == "left")
     ]
     if inward_clear:
         cells_list = inward_clear

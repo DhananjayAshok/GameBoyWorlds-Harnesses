@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
-from .model import DIRECTIONS, LEDGE, OCCUPIED, UNKNOWN, WALKABLE
+from .model import DIRECTIONS, LEDGE, LEDGE_LEFT, OCCUPIED, UNKNOWN, WALKABLE
 
 if TYPE_CHECKING:
     from .model import Cell, GlobalMap
@@ -69,8 +69,8 @@ def path_in_segment(gmap: GlobalMap, segment: int, start: Cell,
                 step = 1
             elif c is None:
                 continue
-            elif c.kind == LEDGE and direction == "down":
-                nxt, move, step = (nxt[0], nxt[1] - 1), "jump", 2
+            elif (c.kind == LEDGE and direction == "down") or (c.kind == LEDGE_LEFT and direction == "left"):
+                nxt, move, step = (nxt[0] + dx, nxt[1] + dy), "jump", 2
                 landing = seg.get(nxt)
                 if nxt != goal and nxt not in walked and (landing is None or landing.kind not in STEP_COSTS):
                     continue

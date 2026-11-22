@@ -113,6 +113,10 @@ class MappingEnvironment:
         return self._map.ledge_patterns
 
     @property
+    def left_ledge_patterns(self) -> set:
+        return self._map.left_ledge_patterns
+
+    @property
     def walk_patterns(self) -> set:
         return self._map.walk_patterns
 

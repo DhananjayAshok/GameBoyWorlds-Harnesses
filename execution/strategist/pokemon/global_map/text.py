@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from .model import BLOCKED, LEDGE, OCCUPIED, UNKNOWN, WALKABLE, is_door
+from .model import BLOCKED, LEDGE, LEDGE_LEFT, OCCUPIED, UNKNOWN, WALKABLE, is_door
 from .render import segment_bounds
 from .routes import plan_route, render_plan
 
@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     from .model import Cell, GlobalMap, MapCell
 
 
-LEGEND = ('@ you   . walkable   # blocked   = ledge (jump down only)   D door/stairs   " tall grass   '
-          '~ water   n person   % not yet recognised   ? never seen')
+LEGEND = ('@ you   . walkable   # blocked   = ledge (jump down only)   < ledge (jump left only)   D door/stairs   '
+          '" tall grass   ~ water   n person   % not yet recognised   ? never seen')
 SECTORS = ("east", "north-east", "north", "north-west", "west", "south-west", "south", "south-east")
 
 
@@ -28,7 +28,7 @@ def glyph(c: Optional[MapCell]) -> str:
         return "~"
     if c.kind == WALKABLE and "tall grass" in tags:
         return '"'
-    return {WALKABLE: ".", BLOCKED: "#", LEDGE: "=", UNKNOWN: "%"}.get(c.kind, "?")
+    return {WALKABLE: ".", BLOCKED: "#", LEDGE: "=", LEDGE_LEFT: "<", UNKNOWN: "%"}.get(c.kind, "?")
 
 
 def ascii_window(gmap: GlobalMap, rx: int = 12, ry: int = 7) -> str:

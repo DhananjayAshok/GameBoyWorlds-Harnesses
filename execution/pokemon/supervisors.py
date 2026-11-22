@@ -8,7 +8,7 @@ from execution.executors import Executor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
                                                  has_modal_preview_box, has_top_dialogue_box,
                                                  is_cutscene_frame_changing)
-from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, WALKABLE, X_RANGE, Y_RANGE,
+from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      cell_kinds, compress_path, edge_cells,
                                                      format_path_runs, shortest_path, verbalize_edges)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
@@ -240,7 +240,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         continue
                 if not in_half_plane(nxt):
                     nc = seg.get(nxt)
-                    if nc is None or nc.kind in (WALKABLE, UNKNOWN) or (nc.kind == LEDGE and d == "down"):
+                    if (
+                        nc is None
+                        or nc.kind in (WALKABLE, UNKNOWN)
+                        or (nc.kind == LEDGE and d == "down")
+                        or (nc.kind == LEDGE_LEFT and d == "left")
+                    ):
                         return None
                     continue
                 nc = seg.get(nxt)
@@ -248,8 +253,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     return None
                 if nc.kind == WALKABLE:
                     landing = nxt
-                elif nc.kind == LEDGE and d == "down":
-                    landing = (nxt[0], nxt[1] - 1)
+                elif (nc.kind == LEDGE and d == "down") or (nc.kind == LEDGE_LEFT and d == "left"):
+                    landing = (nxt[0] + nx_d, nxt[1] + ny_d)
                     if in_screen(landing) and landing not in seeds:
                         continue
                     if not in_half_plane(landing):
@@ -382,7 +387,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._identified = self._tile_recognizer.identify_tiles(frame)
         people = self._people_now()
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
-                           getattr(self._env, "walk_patterns", None), people)
+                           getattr(self._env, "walk_patterns", None), people,
+                           getattr(self._env, "left_ledge_patterns", None))
         self._screen_tiles = (verbalize_tiles(self._identified, people)
                               + "\nWalkable cells on each edge of the screen:\n"
                               + self._describe_edges(kinds))
@@ -413,7 +419,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         local_kinds = None
         if raw_state == AgentState.FREE_ROAM and self._identified:
             local_kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
-                                     getattr(self._env, "walk_patterns", None), self._people_now())
+                                     getattr(self._env, "walk_patterns", None), self._people_now(),
+                                     getattr(self._env, "left_ledge_patterns", None))
         return (prompt.replace("[GAME]", self._game)
                 .replace("[TASK]", self._task)
                 .replace("[GUIDANCE_BLOCK]", guidance_block)
@@ -552,7 +559,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             after_identified = self._tile_recognizer.identify_tiles(after)
             after_people = self._people_now()
             after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None),
-                                     getattr(self._env, "walk_patterns", None), after_people)
+                                     getattr(self._env, "walk_patterns", None), after_people,
+                                     getattr(self._env, "left_ledge_patterns", None))
             after_tiles = (verbalize_tiles(after_identified, after_people)
                            + "\nWalkable cells on each edge of the screen:\n"
                            + self._describe_edges(after_kinds))
@@ -690,7 +698,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _move(self, tag: str, task: str, *, counted: bool = True) -> Any:
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
-                           getattr(self._env, "walk_patterns", None), self._people_now())
+                           getattr(self._env, "walk_patterns", None), self._people_now(),
+                           getattr(self._env, "left_ledge_patterns", None))
         return self.call_executor(tag, task, counted=counted, screen_tiles=self._screen_tiles,
                                   cell_kinds=kinds,
                                   identified=self._identified,

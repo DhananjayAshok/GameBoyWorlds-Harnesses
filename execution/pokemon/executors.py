@@ -10,7 +10,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_me
                                                  has_modal_preview_box, has_top_dialogue_box,
                                                  is_battle_decision_screen, is_battle_screen,
                                                  is_cutscene_frame_changing, is_same_battle_frame)
-from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, WALKABLE, approach_cells,
+from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path, edge_cells,
                                                      edge_runs, filter_forward_edge_cells,
                                                      filter_open_lane_edge_cells, in_bounds,
@@ -351,6 +351,7 @@ class GridMoveExecutor(PolicyExecutor):
             getattr(self._env, "ledge_patterns", None),
             getattr(self._env, "walk_patterns", None),
             people,
+            getattr(self._env, "left_ledge_patterns", None),
         )
         if blocked_neighbor is not None:
             kinds[blocked_neighbor] = BLOCKED
@@ -641,15 +642,16 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             getattr(self._env, "ledge_patterns", None),
             getattr(self._env, "walk_patterns", None),
             people,
+            getattr(self._env, "left_ledge_patterns", None),
         )
         dx, dy = DIRECTIONS[direction]
         nxt = (dx, dy)
         kind = kinds.get(nxt)
         if kind == WALKABLE:
             return True
-        if kind == LEDGE and direction == "down":
-            return kinds.get((dx, dy - 1)) == WALKABLE
-        if kind in (BLOCKED, LEDGE):
+        if (kind == LEDGE and direction == "down") or (kind == LEDGE_LEFT and direction == "left"):
+            return kinds.get((2 * dx, 2 * dy)) == WALKABLE
+        if kind in (BLOCKED, LEDGE, LEDGE_LEFT):
             return False
         return None
 
