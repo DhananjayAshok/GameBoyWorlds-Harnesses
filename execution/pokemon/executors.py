@@ -23,7 +23,7 @@ from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE,
                                                      is_boundary_exit_direction, parse_all_cells, parse_cell,
                                                      parse_edge_direction, shortest_path, verbalize_edges)
 from execution.pokemon.executor_actions import CheckInteractionAction
-from execution.report import EnvironmentStepRecord
+from execution.report import EnvironmentStepRecord, ExecutorVLMCallRecord
 from utils import log_error, ocr, parse_int, parse_key_value, parse_yes_no
 
 
