@@ -144,6 +144,9 @@ class GlobalMap(StrategistArtifact):
         self.lost = 0
         self.faded = False
         self.in_battle = False
+        self.battle_place: Optional[Tuple[int, Cell]] = None
+        self.battle_start_step: int = 0
+        self.since_battle_moved: bool = True
         self.merged_into: Dict[int, Tuple[int, Cell]] = {}
         self.pending: Optional[Tuple[str, int, Optional[int]]] = None
         self.step = 0
@@ -179,6 +182,9 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("warps", [])
         self.__dict__.setdefault("warp_moves", [None] * len(self.warps))
         self.__dict__.setdefault("in_battle", False)
+        self.__dict__.setdefault("battle_place", None)
+        self.__dict__.setdefault("battle_start_step", 0)
+        self.__dict__.setdefault("since_battle_moved", True)
         self.__dict__.setdefault("fade_direction", None)
         self.__dict__.setdefault("routes", [])
         self.__dict__.setdefault("segment_info", {})
@@ -559,11 +565,17 @@ class GlobalMap(StrategistArtifact):
                 faded: bool = False, in_battle: bool = False) -> str:
         self.step += 1
         if in_battle or (not free_roam and is_battle_screen(frame)):
+            if not self.in_battle or self.battle_place is None:
+                self.battle_place = self.resolve(self.segment, self.pos)
+                self.battle_start_step = self.step
             self.in_battle = True
+            self.since_battle_moved = False
             self.faded = False
             self.fade_direction = None
             self.lost = 0
-        elif faded and not self.in_battle:
+        elif free_roam and direction in DIRECTIONS and not self.in_battle:
+            self.since_battle_moved = True
+        if faded and not self.in_battle and self.since_battle_moved:
             # after a blank screen the position must be recognised from the map, not slid from the last frame
             self.faded = True
             self.fade_direction = direction
@@ -613,7 +625,8 @@ class GlobalMap(StrategistArtifact):
             self.pending, self.lost = None, 0
             if not structural or delta != (0, 0):
                 self.anchor = _screen(frame)
-            self.in_battle = False
+            if not structural:
+                self.in_battle = False
             self.stats["placed_by_edges" if structural else "placed"] += 1
             if structural:
                 # recoloured (a flash or fade): the position holds, the colours do not
@@ -675,7 +688,7 @@ class GlobalMap(StrategistArtifact):
         return "new_segment"
 
     def _link(self, segment: int, pos: Cell) -> None:
-        if not self.faded or self.in_battle or segment == self.segment:
+        if not self.faded or self.in_battle or not self.since_battle_moved or segment == self.segment:
             return
         self.warps.append((self.step, self.segment, self.pos, segment, pos))
         self.warp_moves.append(self.fade_direction if self.fade_direction in DIRECTIONS else None)
@@ -1310,8 +1323,27 @@ class GlobalMap(StrategistArtifact):
             "doors": self._new_doors(old),
         }
 
-    def record_defeat(self) -> None:
-        self.defeats.append({"step": self.step, "segment": self.segment, "pos": self.pos})
+    def record_defeat(self, place: Optional[Tuple[int, Cell]] = None) -> None:
+        if place is None:
+            place = self.battle_place if self.battle_place is not None else (self.segment, self.pos)
+        seg, pos = self.resolve(place[0], place[1])
+        if self.defeats:
+            last = self.defeats[-1]
+            last_seg, last_pos = self.resolve(last["segment"], last["pos"])
+            if (last_seg, last_pos) == (seg, pos) and last.get("step", 0) >= max(1, self.battle_start_step):
+                return
+        if self.battle_start_step > 0 and self.warps:
+            kept_warps: List[Tuple[int, int, Cell, int, Cell]] = []
+            kept_moves: List[Optional[str]] = []
+            for w, m in zip(self.warps, self.warp_moves):
+                t, a, pa, b, pb = w
+                ra, rpa = self.resolve(a, pa)
+                if t >= self.battle_start_step and (ra, rpa) == (seg, pos):
+                    continue
+                kept_warps.append(w)
+                kept_moves.append(m)
+            self.warps, self.warp_moves = kept_warps, kept_moves
+        self.defeats.append({"step": self.step, "segment": seg, "pos": pos})
         self.stats["defeats"] += 1
 
     def defeat_route(self, defeat: Dict[str, Any]) -> str:

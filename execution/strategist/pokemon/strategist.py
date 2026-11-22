@@ -608,7 +608,7 @@ class PokemonStrategist:
                 continue
             lines.append(f"Orders for the fight: {executor.task}")
             for call in executor.vlm_call_log:
-                if not isinstance(call, ExecutorVLMCallRecord) or call.tag != "action":
+                if not isinstance(call, ExecutorVLMCallRecord) or call.tag not in ("action", CombatExecutor.STEP_TAG):
                     continue
                 response = str(call.response)
                 action = clean_value(parse_key_value(response, "Action")) or "?"

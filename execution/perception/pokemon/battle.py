@@ -1,3 +1,6 @@
+import re
+from typing import Iterable
+
 import numpy as np
 
 TILE_SIZE = 8
@@ -82,7 +85,16 @@ def has_battle_menu_box(frame: np.ndarray) -> bool:
         return False
     col_dark = (interior < DARK_INK).mean(axis=0)
     n_border_cols = int((col_dark >= BORDER_DARK_FRACTION).sum())
-    return 1 <= n_border_cols <= MAX_BORDER_COLS
+    if 1 <= n_border_cols <= MAX_BORDER_COLS:
+        return True
+    for tx in (4, 8):
+        x0 = tx * TILE_SIZE
+        if all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, x0:x0 + TILE_SIZE])
+               for ty in range(13, 17)):
+            gutter = img[BOTTOM_BOX_INNER_TOP:BOTTOM_BOX_INNER_BOTTOM, TILE_SIZE:x0]
+            if gutter.size > 0 and float((gutter >= DIALOGUE_BOX_WHITE).mean()) >= 0.85:
+                return True
+    return False
 
 
 def is_battle_decision_screen(frame: np.ndarray) -> bool:
@@ -320,3 +332,92 @@ def is_battle_screen(frame: np.ndarray) -> bool:
     if float((upper[:, BATTLE_MID_X:] >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_HALF_WHITE_FRACTION:
         return False
     return True
+
+
+def is_move_selection_screen(frame: np.ndarray) -> bool:
+    """Return True when the 4-move selection menu and TYPE/PP overlay box are open in battle."""
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 4 * TILE_SIZE:5 * TILE_SIZE])
+               for ty in range(13, 17)):
+        return False
+    if float((img[BOTTOM_BOX_INNER_TOP:BOTTOM_BOX_INNER_BOTTOM, TILE_SIZE:4 * TILE_SIZE]
+              >= DIALOGUE_BOX_WHITE).mean()) < 0.90:
+        return False
+    if not any(is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE])
+               for ty in range(13, 17)):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, :TILE_SIZE])
+               and is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 10 * TILE_SIZE:11 * TILE_SIZE])
+               for ty in range(8, 11)):
+        return False
+    if float((img[8 * TILE_SIZE:11 * TILE_SIZE, TILE_SIZE:10 * TILE_SIZE] >= LIGHT_BACKGROUND).mean()) < 0.65:
+        return False
+    return True
+
+
+def is_battle_menu_crop(crop: np.ndarray) -> bool:
+    """Return True if a bottom-box crop shows a battle command menu or move selection menu rather than dialogue."""
+    if crop is None or crop.size == 0:
+        return False
+    img = _grey_frame(crop)
+    h, w = img.shape[:2]
+    max_ty = h // TILE_SIZE
+    max_tx = w // TILE_SIZE
+    for ty in range(max_ty):
+        y0 = ty * TILE_SIZE
+        for tx in range(max_tx):
+            x0 = tx * TILE_SIZE
+            if is_cursor_tile(img[y0:y0 + TILE_SIZE, x0:x0 + TILE_SIZE]):
+                return True
+    if h < 32 or w < 64:
+        return False
+    y0 = (h - 32) // 2 if h > 32 else 0
+    inner = img[y0:y0 + 32, :]
+    for x in range(16, w - 24, 2):
+        strip = inner[:, x:x + TILE_SIZE]
+        if all(is_vertical_border_tile(strip[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, :]) for ty in range(4)):
+            left_pad = inner[:, max(0, x - 16):x]
+            if left_pad.size > 0 and float((left_pad >= DIALOGUE_BOX_WHITE).mean()) >= 0.85:
+                return True
+    return False
+
+
+def is_empty_battle_bag_menu(frame: np.ndarray) -> bool:
+    """Return True when the in-battle item sub-menu is open with only CANCEL at row 1 and blank rows below."""
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    if not is_cursor_tile(img[4 * TILE_SIZE:5 * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE]):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 4 * TILE_SIZE:5 * TILE_SIZE])
+               for ty in range(3, 11)):
+        return False
+    if not all(is_horizontal_border_tile(img[2 * TILE_SIZE:3 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+               for tx in range(5, 19)):
+        return False
+    if not bool((img[4 * TILE_SIZE:5 * TILE_SIZE, 6 * TILE_SIZE:12 * TILE_SIZE] < DARK_INK).any()):
+        return False
+    below = img[5 * TILE_SIZE:11 * TILE_SIZE, 5 * TILE_SIZE:18 * TILE_SIZE]
+    return int((below < DARK_INK).sum()) == 0 and float((below >= DIALOGUE_BOX_WHITE).mean()) >= 0.98
+
+
+DEFEAT_TEXT_PATTERNS = (
+    re.compile(r"\bout\s+of\s+us(?:e?able)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:blacked|whited)\s+out\b", re.IGNORECASE),
+    re.compile(r"\b(?:you|player)\s+(?:black(?:ed)?|whit(?:ed)?)\b", re.IGNORECASE),
+    re.compile(r"\bscurried\s+(?:to|back)\b", re.IGNORECASE),
+)
+
+
+def is_battle_defeat_text(texts: Iterable[str]) -> bool:
+    """Return True if any dialogue string indicates the player lost all usable Pokemon and blacked/whited out."""
+    combined = " ".join(str(t) for t in (texts or ()) if t)
+    if not combined:
+        return False
+    return any(pattern.search(combined) is not None for pattern in DEFEAT_TEXT_PATTERNS)

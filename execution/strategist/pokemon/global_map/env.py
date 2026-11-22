@@ -139,6 +139,9 @@ class MappingEnvironment:
     def record_blocked_step(self, direction: Optional[str] = None, cell: Optional[Tuple[int, int]] = None):
         return self._map.record_blocked_step(direction=direction, cell=cell)
 
+    def record_defeat(self, place: Optional[Tuple[int, Tuple[int, int]]] = None) -> None:
+        self._map.record_defeat(place=place)
+
     def step_str(self, input_str: str):
         action, kwargs = self._env.string_to_high_level_action(input_str)
         if action is None:

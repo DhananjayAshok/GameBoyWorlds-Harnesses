@@ -114,6 +114,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._guidance = guidance
         self._battle_tips = list(battle_tips or [])
         self._losses_at_start = env.get_info()["pokemon_core"].get("n_battles_lost", 0)
+        gmap_init = getattr(env, "_map", None)
+        self._defeats_at_start = len(getattr(gmap_init, "defeats", ()) or ())
         self._tile_recognizer = tile_recognizer
         self._episode_number = episode_number
         self._screen_tiles: Optional[str] = None
@@ -765,7 +767,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return self.call_executor("combat", task, counted=counted)
 
     def _battles_lost(self) -> int:
-        return self._env.get_info()["pokemon_core"].get("n_battles_lost", 0) - self._losses_at_start
+        env_losses = self._env.get_info()["pokemon_core"].get("n_battles_lost", 0) - self._losses_at_start
+        gmap = self._global_map()
+        map_losses = (len(gmap.defeats) - self._defeats_at_start) if gmap is not None else 0
+        return max(env_losses, map_losses)
 
     def _run_action(self, action: str, argument: Optional[str], frame) -> Tuple[Dict[str, Any], str]:
         tag, _, default_task = ACTIONS[action]
@@ -879,7 +884,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _env_done(self) -> bool:
         return bool(self._env._emulator.check_if_done())
 
-    def _settle_free_roam(self, ticks: int = 2, max_cutscene_ticks: int = 16, post_motion_ticks: int = 2) -> None:
+    def _settle_free_roam(self, ticks: int = 2, max_cutscene_ticks: int = 24, post_motion_ticks: int = 4) -> None:
         waited = 0
         post_motion_remaining = 0
         while (self._agent_state() == AgentState.FREE_ROAM
