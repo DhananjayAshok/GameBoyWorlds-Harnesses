@@ -112,9 +112,12 @@ MAX_INTERACT_DIALOGUE_STEPS = 10
 
 class InteractionExecutor(PolicyExecutor):
     CARDINAL_DIRECTIONS = {cell: name for name, cell in CheckInteractionAction.cardinals.items()}
+    MAX_ALIGN_STEPS = 4
 
-    def __init__(self, env, task, max_steps: int = 3, identified=None, **kwargs):
+    def __init__(self, env, task, max_steps: int = 3, identified=None, cell_kinds=None, people_fn=None, **kwargs):
         self.identified = identified
+        self.cell_kinds = cell_kinds
+        self.people_fn = people_fn
         self.check_result: Optional[dict] = None
         self.dialogue_text: Optional[str] = None
         self.dialogue_crops: List[Any] = []
@@ -198,6 +201,49 @@ class InteractionExecutor(PolicyExecutor):
             elif pass_record.action_success == -1:
                 break
 
+    def _align_to_target(self, target_cell: Tuple[int, int], records: List[EnvironmentStepRecord]) -> Optional[str]:
+        people = None
+        if callable(self.people_fn):
+            try:
+                people = self.people_fn()
+            except Exception:  # noqa: BLE001
+                people = None
+        kinds = self.cell_kinds
+        if kinds is None and self.identified is not None:
+            kinds = cell_kinds(
+                self.identified,
+                getattr(self._env, "ledge_patterns", None),
+                getattr(self._env, "walk_patterns", None),
+                people,
+                getattr(self._env, "left_ledge_patterns", None),
+                getattr(self._env, "blocked_cells", None),
+            )
+        if not kinds:
+            return None
+        goals = approach_cells(kinds, target_cell, identified=self.identified, people=people)
+        if not goals:
+            return None
+        path = shortest_path(kinds, (0, 0), goals)
+        if path is None or len(path) > self.MAX_ALIGN_STEPS:
+            return None
+        if not path:
+            return goals.get((0, 0))
+        runs = compress_path(path)
+        end_cell = path[-1][2]
+        facing = goals[end_cell]
+        self._begin_scripted(f"walk to {end_cell} to align with {self._task} at {target_cell}")
+        for move_dir, n_steps, _ in runs:
+            step_rec = self._take_action(MoveStepsAction, direction=move_dir, steps=n_steps)
+            records.append(step_rec)
+            if self._last_terminated or self._last_truncated:
+                return facing
+            if self._agent_state() != AgentState.FREE_ROAM:
+                return facing
+            action_return = (step_rec.transition_states[-1]["core"].get("action_return") or {}) if step_rec.transition_states else {}
+            if action_return.get("n_steps_taken", 0) < n_steps:
+                return None
+        return facing
+
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
@@ -205,19 +251,46 @@ class InteractionExecutor(PolicyExecutor):
         if info["pokemon_core"]["agent_state"] != AgentState.FREE_ROAM:
             return self._fail("not_free_roam")
 
-        check = CheckInteractionAction(self._vlm_call, self._parameters)
-        result, code = check.execute(info, target=self._task, identified=self.identified)
-        self.check_result = result
-        if code is None:
-            return self._fail("invalid_check", result["invalid"])
-        if code == -1:
-            return self._fail("target_not_found")
-        if code == 1:
-            return self._fail("target_only_diagonal",
-                              f"Target found at {result['found_cells_str']}, which cannot be faced")
-
-        direction = result["direction"]
         records = []
+        explicit_coords = [c for c in parse_all_cells(self._task) if in_bounds(c) and c != (0, 0)]
+        direction = None
+        if (
+            len(explicit_coords) == 1
+            and explicit_coords[0] not in CheckInteractionAction.cardinals.values()
+            and explicit_coords[0] not in CheckInteractionAction.counter_cardinals.values()
+        ):
+            direction = self._align_to_target(explicit_coords[0], records)
+            if self._last_terminated or self._last_truncated:
+                return self._finish(records)
+            if self._agent_state() != AgentState.FREE_ROAM:
+                if self._agent_state() == AgentState.IN_DIALOGUE:
+                    self._clear_interaction_dialogue(records)
+                return self._finish(records)
+
+        if direction is None:
+            check = CheckInteractionAction(self._vlm_call, self._parameters)
+            result, code = check.execute(info, target=self._task, identified=self.identified)
+            self.check_result = result
+            if code is None:
+                return self._fail("invalid_check", result["invalid"])
+            if code == -1:
+                return self._fail("target_not_found")
+            if code == 1:
+                cell = result.get("cell")
+                if cell is not None:
+                    direction = self._align_to_target(cell, records)
+                    if self._last_terminated or self._last_truncated:
+                        return self._finish(records)
+                    if self._agent_state() != AgentState.FREE_ROAM:
+                        if self._agent_state() == AgentState.IN_DIALOGUE:
+                            self._clear_interaction_dialogue(records)
+                        return self._finish(records)
+                if direction is None:
+                    return self._fail("target_only_diagonal",
+                                      f"Target found at {result['found_cells_str']}, which cannot be faced")
+            else:
+                direction = result["direction"]
+
         self._begin_scripted(f"face {direction} and interact with {self._task}")
         if getattr(self._env, "facing", None) != direction:
             turn = self._take_action(MoveStepsAction, direction=direction, steps=1)
@@ -378,7 +451,8 @@ class GridMoveExecutor(PolicyExecutor):
                 self.cell_kinds[blocked_neighbor] = BLOCKED
             return False
         frame = self._get_state()["core"]["current_frame"]
-        self.identified = tiles.identify_tiles(frame)
+        gmap = getattr(self._env, "_map", None)
+        self.identified = tiles.identify_tiles(frame, global_map=gmap)
         people = None
         if callable(self.people_fn):
             try:
@@ -633,6 +707,14 @@ Location: <(x, y), Ambiguous, or Not Found>
 Candidates: <if Ambiguous, each candidate with its coordinates and what sets it apart from the others; otherwise None>
 [STOP]"""
 
+    def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
+        if not callable(self.people_fn):
+            return None
+        try:
+            return self.people_fn()
+        except Exception:  # noqa: BLE001
+            return None
+
     def _resolve_explicit_target(self) -> Optional[Tuple[int, int]]:
         coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
         if len(coords) != 1:
@@ -644,7 +726,7 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
             if shortest_path(self.cell_kinds, (0, 0), [target]) is not None:
                 return target
         else:
-            goals = approach_cells(self.cell_kinds, target)
+            goals = approach_cells(self.cell_kinds, target, identified=self.identified, people=self._people_now())
             if goals and shortest_path(self.cell_kinds, (0, 0), goals) is not None:
                 return target
         return target
@@ -676,7 +758,7 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
             exit_dir = boundary_exit_direction(self.cell_kinds, self.identified, target)
             goals = {target: None}
         else:
-            goals = approach_cells(self.cell_kinds, target)
+            goals = approach_cells(self.cell_kinds, target, identified=self.identified, people=self._people_now())
             if not goals:
                 return self._fail(MOVE_NO_PATH, "no_path", f"Nothing walkable next to the target at {target}")
         code = self._walk(goals)
@@ -749,7 +831,8 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         if tiles is None or not hasattr(tiles, "identify_tiles"):
             return None
         frame = self._get_state()["core"]["current_frame"]
-        identified = tiles.identify_tiles(frame)
+        gmap = getattr(self._env, "_map", None)
+        identified = tiles.identify_tiles(frame, global_map=gmap)
         people = None
         if callable(self.people_fn):
             try:

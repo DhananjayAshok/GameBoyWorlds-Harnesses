@@ -93,6 +93,8 @@ class MappingEnvironment:
                 status = self._map.on_step(
                     frame, identified, free, direction, max_steps, reported, was_free, faded, in_battle=in_battle
                 )
+                if free and identified and hasattr(self._tiles, "backfill_masked_tiles"):
+                    identified = self._tiles.backfill_masked_tiles(identified, frame, self._map)
                 if was_free and direction is not None:
                     self.facing = direction
                 elif status in ("relocalised", "new_segment"):

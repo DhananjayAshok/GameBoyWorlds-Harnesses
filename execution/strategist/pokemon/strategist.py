@@ -499,7 +499,8 @@ class PokemonStrategist:
             return self._screen_tiles
         self.tiles.set_vlm_call(self._vlm_caller("perception"))
         self.tiles.record_tiles(frame, episode_number)
-        self._identified = self.tiles.identify_tiles(frame)
+        self.global_map.refresh(self.tiles._by_hash)
+        self._identified = self.tiles.identify_tiles(frame, global_map=self.global_map)
         self._screen_tiles = verbalize_tiles(self._identified)
         return self._screen_tiles
 
@@ -542,6 +543,8 @@ class PokemonStrategist:
         self._map_placed = status in PLACED_STATUS
         self._people_where = ("here" if self._map_placed
                               else "held" if not free and not self.global_map.faded else "away")
+        if free and self._map_placed and self._identified:
+            self._identified = self.tiles.backfill_masked_tiles(self._identified, frame, self.global_map)
         if self.npcs is not None:
             try:
                 self.npcs.on_opening_screen(frame, self._identified if free else {}, free and self._map_placed)

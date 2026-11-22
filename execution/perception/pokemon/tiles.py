@@ -231,7 +231,11 @@ def verbalize_tiles(
     for (x, y) in sorted(by_cell, key=lambda c: (-c[1], c[0])):
         for tag, entry in by_cell[(x, y)].items():
             details = f": {'; '.join(entry['descriptions'])}" if entry["descriptions"] else ""
-            reach = describe_target_reachability(kinds, (x, y)) if tag in REACHABILITY_OBJECT_TAGS else ""
+            reach = (
+                describe_target_reachability(kinds, (x, y), identified=identified, people=people)
+                if tag in REACHABILITY_OBJECT_TAGS
+                else ""
+            )
             lines.append(f"({x}, {y}){cell_part(entry['quarters'])} {tag}{details}{reach}")
     return "\n".join(lines)
 
@@ -270,6 +274,12 @@ PLAYER_NEIGHBOURS = {
     (0, -1): "directly below",
     (1, -1): "diagonally down and to the right of",
 }
+COUNTER_NEIGHBOURS = {
+    (0, 2): "two cells above (across a 1-tile counter/desk directly above)",
+    (0, -2): "two cells below (across a 1-tile counter/desk directly below)",
+    (-2, 0): "two cells to the left (across a 1-tile counter/desk directly to the left)",
+    (2, 0): "two cells to the right (across a 1-tile counter/desk directly to the right)",
+}
 
 
 def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> str:
@@ -305,10 +315,15 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
 
 
 def verbalize_neighbourhood(identified: Dict[TileKey, Tile]) -> str:
-    return "\n".join(
+    lines = [
         f"- ({x}, {y}), {position} the player: {verbalize_cell(identified, (x, y))}"
         for (x, y), position in PLAYER_NEIGHBOURS.items()
-    )
+    ]
+    for (x, y), position in COUNTER_NEIGHBOURS.items():
+        cell_text = verbalize_cell(identified, (x, y))
+        if "npc" in cell_text:
+            lines.append(f"- ({x}, {y}), {position} the player: {cell_text}")
+    return "\n".join(lines)
 
 
 class TileRecognizer(StrategistArtifact):
@@ -432,7 +447,78 @@ class TileRecognizer(StrategistArtifact):
                             masked.add((x, y, q))
         return masked
 
-    def identify_tiles(self, frame: np.ndarray) -> Dict[TileKey, Tile]:
+    def _backfill_tile_from_map_cell(self, map_cell: Any, quarter: str) -> Tile:
+        from execution.perception.pokemon.navigation import BLOCKED, LEDGE, LEDGE_LEFT, QUARTERS, WALKABLE
+
+        hashes = getattr(map_cell, "hashes", None) or ()
+        if quarter in QUARTERS:
+            qi = QUARTERS.index(quarter)
+            if qi < len(hashes) and hashes[qi]:
+                tile = self._by_hash.get(hashes[qi])
+                if tile is not None and tile.tag != "unknown":
+                    return tile
+        tags = tuple(t for t in (getattr(map_cell, "tags", None) or ()) if t != "unknown")
+        kind = getattr(map_cell, "kind", None)
+        if "tall grass" in tags:
+            return Tile(image=None, hash=None, tag="tall grass", description="patch of tall grass")
+        if "entrance" in tags:
+            return Tile(image=None, hash=None, tag="entrance", description="doorway")
+        if "staircase" in tags:
+            return Tile(image=None, hash=None, tag="staircase", description="staircase")
+        if "sign" in tags:
+            return Tile(image=None, hash=None, tag="sign", description="signpost")
+        if "npc" in tags or kind == "occupied":
+            return Tile(image=None, hash=None, tag="npc", description="person")
+        if kind == LEDGE:
+            tag = "ledge" if quarter in ("bottom_left", "bottom_right") else "ground"
+            return Tile(image=None, hash=None, tag=tag, description=None)
+        if kind == LEDGE_LEFT:
+            tag = "ledge" if quarter in ("top_left", "bottom_left") else "ground"
+            return Tile(image=None, hash=None, tag=tag, description=None)
+        if kind == WALKABLE:
+            tag = "ground decoration" if "ground decoration" in tags else "ground"
+            return Tile(image=None, hash=None, tag=tag, description=None)
+        if kind == BLOCKED:
+            return Tile(image=None, hash=None, tag="obstacle", description=None)
+        return UNKNOWN_TILE
+
+    def backfill_masked_tiles(
+        self,
+        identified: Dict[TileKey, Tile],
+        frame: np.ndarray,
+        global_map: Optional[Any] = None,
+    ) -> Dict[TileKey, Tile]:
+        if (
+            global_map is None
+            or has_bottom_dialogue_box(frame)
+            or find_modal_preview_boxes(frame)
+            or not has_bottom_location_banner(frame)
+        ):
+            return identified
+        seg = getattr(global_map, "current", None)
+        pos = getattr(global_map, "pos", None)
+        if not seg or pos is None or getattr(global_map, "faded", False):
+            return identified
+        px, py = pos
+        masked = self.overlay_tile_keys(frame)
+        if not masked:
+            return identified
+        out = dict(identified)
+        for (x, y, quarter) in masked:
+            if (x, y) == PLAYER_CELL:
+                continue
+            cur = out.get((x, y, quarter))
+            if cur is not None and cur.tag != "unknown":
+                continue
+            map_cell = seg.get((px + x, py + y))
+            if map_cell is None or getattr(map_cell, "kind", None) == "unknown":
+                continue
+            backfilled = self._backfill_tile_from_map_cell(map_cell, quarter)
+            if backfilled.tag != "unknown":
+                out[(x, y, quarter)] = backfilled
+        return out
+
+    def identify_tiles(self, frame: np.ndarray, global_map: Optional[Any] = None) -> Dict[TileKey, Tile]:
         all_pieces = self._split(frame)
         masked = self.overlay_tile_keys(frame)
         pieces = {key: piece for key, piece in all_pieces.items()
@@ -444,6 +530,8 @@ class TileRecognizer(StrategistArtifact):
         for key in all_pieces:
             if key[:2] == PLAYER_CELL:
                 identified[key] = PLAYER_TILE
+        if global_map is not None:
+            identified = self.backfill_masked_tiles(identified, frame, global_map)
         return identified
 
     def record_tiles(self, frame: np.ndarray, episode_number: int) -> None:

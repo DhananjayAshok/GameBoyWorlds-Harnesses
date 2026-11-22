@@ -481,10 +481,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._screen_tiles = describe_state_screen(state)
             return self._screen_tiles
         self._tile_recognizer.record_tiles(frame, self._episode_number)
-        self._identified = self._tile_recognizer.identify_tiles(frame)
         gmap = self._global_map()
         if gmap is not None:
             gmap.refresh(self._tile_recognizer._by_hash)
+        self._identified = self._tile_recognizer.identify_tiles(frame, global_map=gmap)
         people = self._people_now()
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), people,
@@ -658,10 +658,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
         after_state = self._effective_state(after, raw_state=report.final_state["pokemon_core"]["agent_state"])
         if after_state == AgentState.FREE_ROAM:
             self._tile_recognizer.record_tiles(after, self._episode_number)
-            after_identified = self._tile_recognizer.identify_tiles(after)
             gmap = self._global_map()
             if gmap is not None:
                 gmap.refresh(self._tile_recognizer._by_hash)
+            after_identified = self._tile_recognizer.identify_tiles(after, global_map=gmap)
             after_people = self._people_now()
             after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None),
                                      getattr(self._env, "walk_patterns", None), after_people,
@@ -791,7 +791,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 task = clarified
                 result = self._move(tag, task, counted=False)
         elif tag == "interaction":
-            result = self.call_executor(tag, task, identified=self._identified)
+            kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
+                               getattr(self._env, "walk_patterns", None), self._people_now(),
+                               getattr(self._env, "left_ledge_patterns", None),
+                               getattr(self._env, "blocked_cells", None))
+            result = self.call_executor(tag, task, identified=self._identified,
+                                        cell_kinds=kinds, people_fn=self._people_now)
         elif tag == "menu":
             task, is_start_menu = self._menu_objective(task, frame)
             result = self.call_executor(tag, task, is_start_menu=is_start_menu)

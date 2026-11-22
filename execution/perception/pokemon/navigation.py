@@ -374,12 +374,77 @@ def compress_path(path: List[Tuple[str, str, Cell]]) -> List[Tuple[str, int, str
     return runs
 
 
-def approach_cells(kinds: Dict[Cell, str], target: Cell) -> Dict[Cell, str]:
+COUNTER_SEPARATOR_DESC_PATTERN = re.compile(
+    r"\b(?:counter|desk|table|window|booth)\b",
+    re.IGNORECASE,
+)
+
+
+def is_counter_separator_cell(
+    cell: Cell,
+    kinds: Dict[Cell, str],
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+) -> bool:
+    if not in_bounds(cell) or kinds.get(cell) != BLOCKED:
+        return False
+    if identified is None:
+        return True
+    from execution.perception.pokemon.tiles import normalize_tabletop_tag
+
+    has_counter_desc = False
+    for q in QUARTERS:
+        tile = identified.get((cell[0], cell[1], q))
+        if tile is None:
+            continue
+        desc = getattr(tile, "description", None) or ""
+        tag = normalize_tabletop_tag(tile.tag, desc, getattr(tile, "image", None))
+        if tag in ("npc", "sign"):
+            return False
+        if COUNTER_SEPARATOR_DESC_PATTERN.search(desc):
+            has_counter_desc = True
+    return has_counter_desc
+
+
+def _is_npc_target_cell(
+    target: Cell,
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    people: Optional[Dict[Cell, str]] = None,
+) -> bool:
+    if people and target in people:
+        label = str(people[target] or "")
+        if not label.startswith("sign:"):
+            return True
+    if identified is not None:
+        for q in QUARTERS:
+            tile = identified.get((target[0], target[1], q))
+            if tile is not None and getattr(tile, "tag", None) == "npc":
+                return True
+    return identified is None and people is None
+
+
+def approach_cells(
+    kinds: Dict[Cell, str],
+    target: Cell,
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    people: Optional[Dict[Cell, str]] = None,
+) -> Dict[Cell, str]:
     cells = {}
     for direction, cell in neighbours(target):
         if in_bounds(cell) and kinds.get(cell) == WALKABLE:
             facing = next(d for d, (dx, dy) in DIRECTIONS.items() if (cell[0] + dx, cell[1] + dy) == target)
             cells[cell] = facing
+    if _is_npc_target_cell(target, identified, people):
+        for direction, (dx, dy) in DIRECTIONS.items():
+            mid = (target[0] + dx, target[1] + dy)
+            far = (target[0] + 2 * dx, target[1] + 2 * dy)
+            if not (in_bounds(mid) and in_bounds(far)):
+                continue
+            if kinds.get(far) != WALKABLE:
+                continue
+            if not is_counter_separator_cell(mid, kinds, identified):
+                continue
+            facing = next(d for d, (ox, oy) in DIRECTIONS.items() if (ox, oy) == (-dx, -dy))
+            cells[far] = facing
     return cells
 
 
@@ -665,18 +730,25 @@ def diagonal_barrier_pairs(kinds: Dict[Cell, str], goals: Iterable[Cell]) -> Lis
     return pinches
 
 
-def describe_target_reachability(kinds: Optional[Dict[Cell, str]], target: Cell) -> str:
+def describe_target_reachability(
+    kinds: Optional[Dict[Cell, str]],
+    target: Cell,
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    people: Optional[Dict[Cell, str]] = None,
+) -> str:
     if not kinds or target == (0, 0):
         return ""
     if kinds.get(target) == WALKABLE:
         goals = [target]
     else:
-        goals = list(approach_cells(kinds, target))
+        goals = list(approach_cells(kinds, target, identified=identified, people=people))
     if not goals:
         return " [no walkable approach tile adjacent on current screen]"
     path = shortest_path(kinds, (0, 0), goals)
     if path is not None:
         if not path:
+            if abs(target[0]) + abs(target[1]) == 2:
+                return " [adjacent across counter]"
             return " [adjacent to player]"
         runs_text = format_path_runs(compress_path(path))
         return f" [on-screen path: {runs_text}]"
