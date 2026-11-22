@@ -1185,8 +1185,6 @@ class NPCRegistry(StrategistArtifact):
     def _model_steps(self, vlm_caller: Callable[[str], Callable[..., Any]], gmap: GlobalMap) -> None:
         for label, step in (("cards and judges", lambda: self.run_model(vlm_caller("npc_card"),
                                                                        vlm_caller("npc_judge"), gmap)),
-                            ("hidden people", lambda: npc_model.run_confirm(self, vlm_caller("npc_confirm"), self.game,
-                                                                            gmap, self._p["y_offset"])),
                             ("summaries", lambda: self.run_summaries(vlm_caller("npc_summary"), gmap)),
                             ("real names", self.apply_real_names),
                             ("text attribution", self.attribute_conversations)):

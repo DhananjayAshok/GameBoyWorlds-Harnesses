@@ -419,9 +419,21 @@ def create_subgoals(goals: GoalTree, knowledge: KnowledgeTree, current: str, exp
         return
 
 
+def _should_decide_goal(subtree: GoalSubtree, episode_number: int,
+                        episode_status: Optional[str] = None, subgoal_every: int = 5) -> bool:
+    if subtree.root.source == "override":
+        return False
+    if episode_status == "completed":
+        since = subtree.root.frontier_since
+        if since is None or episode_number - since < subgoal_every:
+            return False
+    return True
+
+
 def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCaller, game: str,
                 episode_number: int, current: str = "Unknown",
-                parameters: Optional[dict] = None) -> List[Tuple[GoalPath, str]]:
+                parameters: Optional[dict] = None, episode_status: Optional[str] = None,
+                subgoal_every: int = 5) -> List[Tuple[GoalPath, str]]:
     closed: List[Tuple[GoalPath, str]] = []
     subtree = goals.frontier()
     checked_active = False
@@ -434,8 +446,10 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
             log_warn(f"No usable completion check for {path[-1]!r}; treating it as not achieved.", parameters)
             achieved = False
         if not achieved:
-            if not checked_active and subtree.root.source != "override" and _decide(
-                    goals, path, subtree, digest, notepad, vlm_caller, game, episode_number, current, parameters):
+            if (not checked_active
+                    and _should_decide_goal(subtree, episode_number, episode_status, subgoal_every)
+                    and _decide(goals, path, subtree, digest, notepad, vlm_caller, game, episode_number,
+                                current, parameters)):
                 closed.append((path, "abandoned"))
             return closed
         goals.set_status(path, "complete", episode_number=episode_number)

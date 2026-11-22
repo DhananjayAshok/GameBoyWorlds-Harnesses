@@ -22,8 +22,9 @@ from execution.strategist.pokemon import prompts as P
 from execution.strategist.pokemon.asking import ask, single_value
 from execution.strategist.pokemon.goals import (GoalNode, GoalSubtree, PokemonGoalTree, check_goals,
                                                 create_subgoals, frontier_text, goal_path_text)
-from execution.strategist.pokemon.guide import (StrategyGuide, battle_tips, guide_block, load_seeds, record_events,
-                                                record_new_town, reflect_on_defeat, town_question, update_guide)
+from execution.strategist.pokemon.guide import (NEW_TOWN, StrategyGuide, battle_tips, guide_block, load_seeds,
+                                                record_events, record_new_town, reflect_on_defeat, town_question,
+                                                update_guide)
 from execution.strategist.pokemon.knowledge import PokemonKnowledgeTree, remember, remember_all
 from execution.strategist.pokemon.notepad import ThoughtNotepad
 from execution.strategist.pokemon.npc_map import with_people
@@ -592,6 +593,24 @@ class PokemonStrategist:
                      f"answer: {town}.", self._parameters)
         return summary, None if town is None or town.strip().rstrip(".").lower() == "none" else town
 
+    def _should_extract_knowledge(self, report: SupervisorReport, conversation_digest: str,
+                                  closed: List[Tuple[Tuple[str, ...], str]], town_event: Any) -> bool:
+        if not (report.narrative or any(r.notes and r.notes.strip() for r in report.executor_reports)):
+            return False
+        if conversation_digest.strip():
+            return True
+        if town_event is not None:
+            return True
+        if closed and not self.notepad.text.strip():
+            return True
+        return False
+
+    @staticmethod
+    def _should_update_guide(events: List[Any], episode_status: str) -> bool:
+        if any(getattr(e, "trigger", None) == NEW_TOWN for e in events):
+            return True
+        return episode_status != "completed"
+
     def _extract_knowledge(self, digest: str, before: np.ndarray, after: np.ndarray, n: int) -> None:
         prompt = (self._fill(P.KNOWLEDGE_EXTRACT_PROMPT)
                   .replace("[DIGEST]", digest)
@@ -827,15 +846,17 @@ class PokemonStrategist:
         self._perceive(frame, n)
 
         closed = check_goals(self.goals, report.digest, self.notepad.text, self._vlm_caller, self._game, n,
-                             current=self._current_place(), parameters=self._parameters)
+                             current=self._current_place(), parameters=self._parameters,
+                             episode_status=record.status, subgoal_every=self._subgoal_every)
         summary, town = self._review(report.digest)
         record.summary = summary or record.summary
         town_event = record_new_town(self.guide, town, self._current_place(), n, self._parameters)
         if town_event is not None:
             events.append(town_event)
+        conversation_digest = self._conversation_digest(n)
         extracted = False
-        if report.narrative or any(r.notes and r.notes.strip() for r in report.executor_reports):
-            self._extract_knowledge(report.digest + self._conversation_digest(n), before, frame, n)
+        if self._should_extract_knowledge(report, conversation_digest, closed, town_event):
+            self._extract_knowledge(report.digest + conversation_digest, before, frame, n)
             extracted = True
         self._update_notepad(report.digest, summary, n)
         if closed:
@@ -845,7 +866,7 @@ class PokemonStrategist:
                 self.notepad.clear(episode_number=n)
             else:
                 self._absorb_notepad(closed, n)
-        if events:
+        if events and self._should_update_guide(events, record.status):
             update_guide(self.guide, events, report.digest, self._vlm_caller("guide_update"), self._game, n,
                          self._parameters)
         if record.status == "lost_battle":

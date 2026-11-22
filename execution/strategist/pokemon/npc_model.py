@@ -217,9 +217,17 @@ def try_merge(reg, keep, drop) -> bool:
     return True
 
 
+def _interacted_with(reg, npc) -> bool:
+    for cid in npc.conversations:
+        conv = reg.conversations.get(cid)
+        if conv is not None and (conv.text or conv.crops or conv.trigger == "a_press" or conv.complete):
+            return True
+    return False
+
+
 def run_model(reg, vlm_card: Callable[..., Any], vlm_judge: Callable[..., Any], game: str, gmap) -> None:
-    cards = [n for n in reg.live_npcs() if n.needs == "card"][:MAX_BATCH]
-    judges = [n for n in reg.live_npcs() if n.needs == "judge"][:MAX_BATCH]
+    cards = [n for n in reg.live_npcs() if n.needs == "card" and _interacted_with(reg, n)][:MAX_BATCH]
+    judges = [n for n in reg.live_npcs() if n.needs == "judge" and _interacted_with(reg, n)][:MAX_BATCH]
     if cards:
         _cards(reg, cards, vlm_card, game, gmap)
     if judges:
