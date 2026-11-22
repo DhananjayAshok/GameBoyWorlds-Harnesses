@@ -715,12 +715,12 @@ class GlobalMap(StrategistArtifact):
         bot_black = sum(1 for x in range(-4, 6) if (x, -4) in cells_by_xy and cells_by_xy[(x, -4)].max() <= BLACK_LEVEL)
         left_black = sum(1 for y in range(-4, 5) if (-4, y) in cells_by_xy and cells_by_xy[(-4, y)].max() <= BLACK_LEVEL)
         right_black = sum(1 for y in range(-4, 5) if (5, y) in cells_by_xy and cells_by_xy[(5, y)].max() <= BLACK_LEVEL)
-        black = white = darkened = 0
+        black = white = darkened = compressed = 0
         best_same = 0
         best_changed = 999
         for dx in (-2, -1, 0, 1, 2):
             for dy in (-2, -1, 0, 1, 2):
-                same = changed = b = w = d = 0
+                same = changed = b = w = d = c = 0
                 for (x, y), piece in cells_by_xy.items():
                     old = seg.get((self.pos[0] + dx + x, self.pos[1] + dy + y))
                     if old is None or old.pixels is None or (x, y) == (0, 0):
@@ -733,6 +733,10 @@ class GlobalMap(StrategistArtifact):
                         w += 1
                     if new.max() <= DARK_LEVEL and prior.max() >= BRIGHT_LEVEL:
                         d += 1
+                    old_span = int(prior.max()) - int(prior.min())
+                    new_span = int(new.max()) - int(new.min())
+                    if old_span >= 24 and new_span <= old_span - 16:
+                        c += 1
                     if not lit.any():
                         continue
                     if np.mean(np.abs(new - prior)[lit] > BLACK_LEVEL) < WIPE_CELL_CHANGE:
@@ -740,7 +744,7 @@ class GlobalMap(StrategistArtifact):
                     else:
                         changed += 1
                 if (dx, dy) == (0, 0):
-                    black, white, darkened = b, w, d
+                    black, white, darkened, compressed = b, w, d, c
                 if (same, -changed) > (best_same, -best_changed):
                     best_same, best_changed = same, changed
         if black >= BLACKOUT_CELLS and best_same >= WIPE_SAME_RATIO * best_changed:
@@ -751,7 +755,10 @@ class GlobalMap(StrategistArtifact):
             return True
         if black + white >= TRANSITION_FLASH_CELLS and best_same == 0:
             return True
-        if darkened >= TRANSITION_FLASH_CELLS and np.percentile(a, 98) <= DARK_LEVEL:
+        p2, p98 = np.percentile(a, (2, 98))
+        if darkened >= TRANSITION_FLASH_CELLS and p98 <= DARK_LEVEL:
+            return True
+        if compressed >= TRANSITION_FLASH_CELLS and (p98 - p2) <= 96:
             return True
         mid_tone = sum(1 for piece in cells_by_xy.values() if np.any((piece > BLACK_LEVEL) & (piece < WHITE_LEVEL)))
         if cells_by_xy and mid_tone < MIN_MID_TONE_CELLS:

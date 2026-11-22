@@ -414,6 +414,11 @@ DEFEAT_TEXT_PATTERNS = (
     re.compile(r"\bscurried\s+(?:to|back)\b", re.IGNORECASE),
 )
 
+PLAYER_FAINT_PATTERN = re.compile(
+    r"(?:^|[\n.!])\s*(?!enemy\b|wild\b|foe\b)[A-Za-z0-9_.'♀♂-]+\s+fainted\b",
+    re.IGNORECASE,
+)
+
 
 def is_battle_defeat_text(texts: Iterable[str]) -> bool:
     """Return True if any dialogue string indicates the player lost all usable Pokemon and blacked/whited out."""
@@ -421,3 +426,11 @@ def is_battle_defeat_text(texts: Iterable[str]) -> bool:
     if not combined:
         return False
     return any(pattern.search(combined) is not None for pattern in DEFEAT_TEXT_PATTERNS)
+
+
+def has_player_pokemon_fainted_text(texts: Iterable[str]) -> bool:
+    """Return True if any dialogue string reports one of the player's own Pokemon fainting (excluding Enemy/Wild/Foe)."""
+    for text in (texts or ()):
+        if text and PLAYER_FAINT_PATTERN.search(str(text)) is not None:
+            return True
+    return False

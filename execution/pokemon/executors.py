@@ -8,11 +8,12 @@ from execution.game_api import (AgentState, BattleMenuAction, InteractAction, Lo
 
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
-                                                 has_modal_preview_box, has_top_dialogue_box,
-                                                 is_battle_decision_screen, is_battle_defeat_text,
-                                                 is_battle_menu_crop, is_battle_screen,
-                                                 is_cutscene_frame_changing, is_empty_battle_bag_menu,
-                                                 is_move_selection_screen, is_same_battle_frame)
+                                                 has_modal_preview_box, has_player_pokemon_fainted_text,
+                                                 has_top_dialogue_box, is_battle_decision_screen,
+                                                 is_battle_defeat_text, is_battle_menu_crop,
+                                                 is_battle_screen, is_cutscene_frame_changing,
+                                                 is_empty_battle_bag_menu, is_move_selection_screen,
+                                                 is_same_battle_frame)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
@@ -1215,7 +1216,8 @@ Press: <one of up, down, left, right, confirm, back>
             gmap = getattr(self._env, "_map", None)
             if gmap is not None and getattr(gmap, "current", None) and getattr(gmap, "pos", None) is not None:
                 after_place = gmap.resolve(gmap.segment, gmap.pos)
-                if after_place[0] != self._battle_place[0] and any("faint" in t.lower() for t in self.dialogue_text):
+                if (after_place[0] != self._battle_place[0]
+                        and has_player_pokemon_fainted_text(self.dialogue_text)):
                     self.battle_lost = True
                     return True
         return False
@@ -2108,8 +2110,24 @@ Press: <one of a, b, start, up, down, left, right>
             else:
                 outcome_label = f"{press} (0 steps at {before_place[1]} — turned or blocked)"
         self.press_outcomes.append(outcome_label)
-        if press in ("a", "b") and self._agent_state() == AgentState.FREE_ROAM:
-            self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
+        if self._agent_state() == AgentState.FREE_ROAM:
+            if press in ("a", "b"):
+                self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
+            elif press in DIRECTIONS:
+                passed = record.transition_states[-1]["core"].get("transition_passed_frames") if record.transition_states else None
+                faded = passed is not None and any(
+                    is_cutscene_frame_changing(record.frame_before, f) for f in passed
+                )
+                if (faded
+                        or is_cutscene_frame_changing(record.frame_before, record.frame_after)
+                        or has_bottom_dialogue_box(record.frame_after)
+                        or self._is_top_box_dialogue(record.frame_after)):
+                    if (before_place is None
+                            or after_place is None
+                            or after_place == before_place
+                            or has_bottom_dialogue_box(record.frame_after)
+                            or self._is_top_box_dialogue(record.frame_after)):
+                        self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
         elif self._agent_state() == AgentState.IN_MENU:
             self._settle_state()
         return True
@@ -2120,6 +2138,8 @@ Press: <one of a, b, start, up, down, left, right>
         consecutive_invalid = 0
         for _ in range(self._max_steps):
             frame = self._get_state()["core"]["current_frame"]
+            if self.presses and (self._effective_state(frame) == AgentState.IN_BATTLE or is_battle_screen(frame)):
+                return self._finish(FREE_OK, "termination_met")
             template = self.STEP_PROMPT if self.presses else self.FIRST_STEP_PROMPT
             prompt = (template.replace("[TASK]", self._task.strip())
                       .replace("[TERMINATION]", self.termination)
