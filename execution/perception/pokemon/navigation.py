@@ -245,7 +245,7 @@ def cell_kinds(
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
         desc = getattr(tile, "description", None)
-        norm_tag = normalize_tabletop_tag(tile.tag, desc)
+        norm_tag = normalize_tabletop_tag(tile.tag, desc, getattr(tile, "image", None))
         tags.setdefault((x, y), set()).add(norm_tag)
         quarter_tags.setdefault((x, y), {})[quarter] = norm_tag
         quarter_descriptions.setdefault((x, y), {})[quarter] = desc

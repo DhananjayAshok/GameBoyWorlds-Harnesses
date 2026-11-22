@@ -81,7 +81,16 @@ WALKABLE_GROUND_OVERRIDE_PATTERN = re.compile(
 )
 
 
-def normalize_tabletop_tag(tag: str, description: Optional[str]) -> str:
+SOLID_SHADE_WARP_TAGS = ("entrance", "staircase", "elevator")
+
+
+def is_solid_shade_piece(image: Optional[np.ndarray]) -> bool:
+    return image is not None and image.size > 0 and int(image.min()) == int(image.max())
+
+
+def normalize_tabletop_tag(tag: str, description: Optional[str], image: Optional[np.ndarray] = None) -> str:
+    if tag in SOLID_SHADE_WARP_TAGS and is_solid_shade_piece(image):
+        return "ground"
     if description:
         stripped = description.strip()
         if tag == "obstacle" and TABLETOP_OBJECT_PATTERN.search(stripped):
@@ -97,7 +106,9 @@ def _quarter_tag_map(
     quarter_tags: Dict[Tuple[int, int], Dict[str, str]] = {}
     quarter_descriptions: Dict[Tuple[int, int], Dict[str, Optional[str]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
-        quarter_tags.setdefault((x, y), {})[quarter] = normalize_tabletop_tag(tile.tag, tile.description)
+        quarter_tags.setdefault((x, y), {})[quarter] = normalize_tabletop_tag(
+            tile.tag, tile.description, getattr(tile, "image", None)
+        )
         quarter_descriptions.setdefault((x, y), {})[quarter] = tile.description
     return quarter_tags, quarter_descriptions
 
@@ -139,7 +150,7 @@ def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple
     for (x, y, quarter), tile in identified.items():
         if (x, y) in south_ledge_cells or (x, y) in west_ledge_cells or (x, y) in east_cliff_cells:
             continue
-        tag = normalize_tabletop_tag(tile.tag, tile.description)
+        tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
         if (x, y) in top_overhang_cells and quarter in ("top_left", "top_right") and tag in FURNITURE_OVERHANG_TOP_TAGS:
             continue
         if (x, y) in player_overhang_cells and quarter in ("bottom_left", "bottom_right") and tag in OVERHANG_TOP_TAGS:
@@ -232,7 +243,7 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
     for quarter in QUARTER_OFFSETS:
         tile = identified.get((cell[0], cell[1], quarter))
         if tile is not None:
-            tag = normalize_tabletop_tag(tile.tag, tile.description)
+            tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
             if is_top_overhang and quarter in ("top_left", "top_right") and tag in FURNITURE_OVERHANG_TOP_TAGS:
                 continue
             if is_player_overhang and quarter in ("bottom_left", "bottom_right") and tag in OVERHANG_TOP_TAGS:
@@ -425,7 +436,9 @@ class TileRecognizer(StrategistArtifact):
         outputs = self.vlm_call(texts=texts, images=images, max_new_tokens=self.max_new_tokens)
         self._add_tiles([
             Tile(image=np.array(pieces[new_groups[tile_hash][0]]), hash=tile_hash,
-                 tag=normalize_tabletop_tag(parse_tag(output), parse_description(output)),
+                 tag=normalize_tabletop_tag(
+                     parse_tag(output), parse_description(output), pieces[new_groups[tile_hash][0]]
+                 ),
                  description=parse_description(output))
             for tile_hash, output in zip(hashes, outputs)
         ], episode_number=episode_number)
@@ -433,11 +446,11 @@ class TileRecognizer(StrategistArtifact):
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
         for tile in getattr(self, "tiles", ()):
-            tile.tag = normalize_tabletop_tag(tile.tag, tile.description)
+            tile.tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
 
     @update
     def _add_tiles(self, tiles: List[Tile]) -> None:
         for tile in tiles:
-            tile.tag = normalize_tabletop_tag(tile.tag, tile.description)
+            tile.tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
             self.tiles.append(tile)
             self._by_hash[tile.hash] = tile
