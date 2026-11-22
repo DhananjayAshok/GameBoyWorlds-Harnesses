@@ -237,7 +237,7 @@ def cell_kinds(
     left_ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
     blocked_cells: Optional[Collection[Cell]] = None,
 ) -> Dict[Cell, str]:
-    from execution.perception.pokemon.tiles import normalize_tabletop_tag
+    from execution.perception.pokemon.tiles import filter_cell_warp_quarter_tags, normalize_tabletop_tag
 
     # ``ledge_patterns`` / ``walk_patterns``: quarter hashes (QUARTERS order) learned from movement.
     tags: Dict[Cell, set] = {}
@@ -246,11 +246,13 @@ def cell_kinds(
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
         desc = getattr(tile, "description", None)
-        norm_tag = normalize_tabletop_tag(tile.tag, desc)
-        tags.setdefault((x, y), set()).add(norm_tag)
+        norm_tag = normalize_tabletop_tag(tile.tag, desc, getattr(tile, "image", None))
         quarter_tags.setdefault((x, y), {})[quarter] = norm_tag
         quarter_descriptions.setdefault((x, y), {})[quarter] = desc
         hashes.setdefault((x, y), {})[quarter] = tile.hash
+    for cell in list(quarter_tags):
+        quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
+        tags[cell] = set(quarter_tags[cell].values())
     confirmed_occupied: set = set()
     for cell, label in (people or {}).items():
         if cell == (0, 0):
@@ -557,13 +559,20 @@ def is_boundary_exit_direction(kinds: Dict[Cell, str], cell: Cell, direction: st
 
 def boundary_exit_direction(kinds: Dict[Cell, str], identified: Optional[Dict[Tuple[int, int, str], object]],
                             cell: Cell, preferred: Optional[str] = None) -> Optional[str]:
+    from execution.perception.pokemon.tiles import filter_cell_warp_quarter_tags, normalize_tabletop_tag
+
     if identified is None:
         return None
-    tags = {
-        identified[(cell[0], cell[1], q)].tag
+    cell_q = {
+        q: normalize_tabletop_tag(
+            identified[(cell[0], cell[1], q)].tag,
+            getattr(identified[(cell[0], cell[1], q)], "description", None),
+            getattr(identified[(cell[0], cell[1], q)], "image", None),
+        )
         for q in QUARTERS
         if (cell[0], cell[1], q) in identified and hasattr(identified[(cell[0], cell[1], q)], "tag")
     }
+    tags = set(filter_cell_warp_quarter_tags(cell_q).values())
     if "entrance" not in tags:
         return None
     order = ("down", "up", "left", "right")

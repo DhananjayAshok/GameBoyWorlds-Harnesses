@@ -16,7 +16,8 @@ from execution.perception.pokemon.navigation import (LEDGE_LEFT, LEDGE_TAGS, OVE
                                                      is_overhang_floor_cell, is_player_overhang_floor_cell,
                                                      is_player_overhang_ledge_cell, is_south_ledge_cell,
                                                      is_top_overhang_floor_cell, is_west_ledge_cell)
-from execution.perception.pokemon.tiles import TileRecognizer, normalize_tabletop_tag
+from execution.perception.pokemon.tiles import (TileRecognizer, filter_cell_warp_quarter_tags,
+                                                normalize_tabletop_tag)
 
 from .registration import (BLACK_LEVEL, _local_cells, _screen, _still_lit, grid_offset, grid_residual, has_structure,
                            register)
@@ -413,8 +414,12 @@ class GlobalMap(StrategistArtifact):
         quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
         if shift == (0, 0):
             for (ix, iy, iq), tile in (identified or {}).items():
-                quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(tile.tag, tile.description)
+                quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(
+                    tile.tag, tile.description, getattr(tile, "image", None)
+                )
                 quarter_descriptions.setdefault((ix, iy), {})[iq] = tile.description
+            for cell in list(quarter_tags):
+                quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
         top_overhang_cells = {
             cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
         }
@@ -466,10 +471,18 @@ class GlobalMap(StrategistArtifact):
                 ))
                 kind = LEDGE_LEFT
             else:
-                tags = tuple(sorted({
-                    normalize_tabletop_tag(identified[(x, y, q)].tag, identified[(x, y, q)].description)
-                    for q in QUARTERS if (x, y, q) in identified
-                }))
+                cell_q = quarter_tags.get((x, y))
+                if cell_q:
+                    tags = tuple(sorted(set(cell_q.values())))
+                else:
+                    tags = tuple(sorted({
+                        normalize_tabletop_tag(
+                            identified[(x, y, q)].tag,
+                            identified[(x, y, q)].description,
+                            getattr(identified[(x, y, q)], "image", None),
+                        )
+                        for q in QUARTERS if (x, y, q) in identified
+                    }))
                 kind = BLOCKED if (x, y) in east_cliff_cells else self._classify(tags, hashes)
             g = (px + x, py + y)
             while len(self.blocked_cells) <= self.segment:
@@ -1102,7 +1115,9 @@ class GlobalMap(StrategistArtifact):
             for pattern in self.walk_patterns:
                 tiles = [tile_lookup.get(h) for h in pattern]
                 if all(t is not None for t in tiles):
-                    qtags = {normalize_tabletop_tag(t.tag, t.description) for t in tiles}
+                    qtags = {
+                        normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None)) for t in tiles
+                    }
                     if not self._can_learn_walkable(qtags):
                         continue
                 cleaned_patterns.add(pattern)
@@ -1125,12 +1140,18 @@ class GlobalMap(StrategistArtifact):
             quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
             for g, c in seg.items():
                 tiles = [tile_lookup.get(h) for h in c.hashes]
-                if all(t is not None for t in tiles):
-                    quarter_tags[g] = {
-                        q: normalize_tabletop_tag(t.tag, t.description) for q, t in zip(QUARTERS, tiles)
+                if any(t is not None for t in tiles):
+                    raw_qtags = {
+                        q: (
+                            normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None))
+                            if t is not None
+                            else "unknown"
+                        )
+                        for q, t in zip(QUARTERS, tiles)
                     }
+                    quarter_tags[g] = filter_cell_warp_quarter_tags(raw_qtags)
                     quarter_descriptions[g] = {
-                        q: t.description for q, t in zip(QUARTERS, tiles)
+                        q: (t.description if t is not None else None) for q, t in zip(QUARTERS, tiles)
                     }
             for g, c in seg.items():
                 if g not in quarter_tags or c.kind == OCCUPIED:
@@ -1158,6 +1179,9 @@ class GlobalMap(StrategistArtifact):
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1
+        if self.seen_entrances is not None:
+            valid = self.entrances()
+            self.seen_entrances = {key for key in self.seen_entrances if self.resolve(*key) in valid}
         return changed
 
     @update

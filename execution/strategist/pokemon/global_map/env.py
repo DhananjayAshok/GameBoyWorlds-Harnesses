@@ -97,6 +97,8 @@ class MappingEnvironment:
                     self.facing = direction
                 elif status in ("relocalised", "new_segment"):
                     self.facing = None
+                elif status == "moved" and direction is None:
+                    self.facing = None
                 for entry in self._map.naming_queue[queued:]:
                     entry["marker"] = self.marker() if self.marker is not None else None
                 if self._listeners:

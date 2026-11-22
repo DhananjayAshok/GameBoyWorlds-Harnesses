@@ -2,8 +2,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from execution.game_api import (AgentState, BattleMenuAction, InteractAction, MenuAction, MoveStepsAction,
-                                OpenMenuAction, PassDialogueAction, PickAttackAction, WaitAction)
+from execution.game_api import (AgentState, BattleMenuAction, InteractAction, LowLevelAction, LowLevelActions,
+                                MenuAction, MoveStepsAction, OpenMenuAction, PassDialogueAction, PickAttackAction,
+                                WaitAction)
 
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
@@ -394,12 +395,55 @@ class GridMoveExecutor(PolicyExecutor):
                 post_motion_remaining -= 1
         return state
 
+    ARROW_ACTIONS = {
+        "up": LowLevelActions.PRESS_ARROW_UP,
+        "down": LowLevelActions.PRESS_ARROW_DOWN,
+        "left": LowLevelActions.PRESS_ARROW_LEFT,
+        "right": LowLevelActions.PRESS_ARROW_RIGHT,
+    }
+
+    def _pre_turn(self, direction: str) -> Optional[int]:
+        if getattr(self._env, "facing", None) == direction:
+            return None
+        arrow = self.ARROW_ACTIONS.get(direction)
+        if arrow is None:
+            return None
+        before_place = self._current_map_place()
+        record = self._take_action(LowLevelAction, low_level_action=arrow)
+        if self._last_terminated:
+            return self._fail(MOVE_TERMINATED, "terminated")
+        if self._last_truncated:
+            return self._fail(MOVE_TRUNCATED, "truncated")
+        after_place = self._current_map_place()
+        taken = 0
+        if before_place is not None and after_place is not None:
+            if before_place[0] != after_place[0]:
+                taken = 1
+            else:
+                step_dx = after_place[1][0] - before_place[1][0]
+                step_dy = after_place[1][1] - before_place[1][1]
+                if (step_dx, step_dy) != (0, 0):
+                    taken = max(1, abs(step_dx) + abs(step_dy))
+                    self._displacement = (self._displacement[0] + step_dx, self._displacement[1] + step_dy)
+        self._steps_taken += taken
+        self._last_step_taken += taken
+        state = self._get_state()["pokemon_core"]["agent_state"]
+        if state != AgentState.FREE_ROAM or has_bottom_dialogue_box(self._get_state()["core"]["current_frame"]):
+            return self._fail(MOVE_INTERRUPTED, "move_interrupted",
+                              f"Left free roam after {taken} steps {direction}: {state.name}")
+        return taken
+
     def _step(self, direction: str, steps: int, move_kind: str = "walk") -> Optional[int]:
         remaining = steps
         attempts = 0
         retried_after_cutscene = False
         self._last_step_taken = 0
         dx, dy = DIRECTIONS[direction]
+        pre_turn = self._pre_turn(direction)
+        if pre_turn is not None:
+            if pre_turn < 0 or self._last_terminated or self._last_truncated:
+                return pre_turn
+            remaining = max(0, remaining - pre_turn)
         while remaining > 0:
             if attempts >= steps + 2:
                 return self._fail(MOVE_BLOCKED, "move_blocked", f"Could not finish moving {direction} {steps}")
@@ -517,9 +561,9 @@ class GridMoveExecutor(PolicyExecutor):
                 return failed_code
             break
         if facing is not None:
-            code = self._step(facing, 1)
-            if code is not None and code != MOVE_BLOCKED:
-                return code
+            pre_turn = self._pre_turn(facing)
+            if pre_turn is not None and (pre_turn < 0 or self._last_terminated or self._last_truncated):
+                return pre_turn
         return None
 
 
