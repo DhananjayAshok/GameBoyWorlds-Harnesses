@@ -190,6 +190,36 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("blocked_cells", [set() for _ in self.segments])
         while len(self.blocked_cells) < len(self.segments):
             self.blocked_cells.append(set())
+        for si in range(len(self.segments)):
+            self._heal_visited_ground(si)
+
+    def _heal_visited_ground(self, si: int) -> int:
+        seg = self.segments[si] if 0 <= si < len(self.segments) else None
+        if not seg or self.info(si).kind != OUTDOORS or si >= len(self.visits) or not self.visits[si]:
+            return 0
+        seg_blocked = self.blocked_cells[si] if si < len(self.blocked_cells) else set()
+        seen_box = {
+            (vx + lx, vy + ly)
+            for (vx, vy) in self.visits[si]
+            for lx in range(-4, 6)
+            for ly in range(-4, 5)
+        }
+        restored = 0
+        for _ in range(2):
+            added_pass = 0
+            for g in sorted(seen_box):
+                if g in seg or g in seg_blocked:
+                    continue
+                nbrs = [seg.get((g[0] + dx, g[1] + dy)) for dx, dy in DIRECTIONS.values()]
+                walkable_nbrs = sum(1 for c in nbrs if c is not None and c.kind == WALKABLE)
+                mapped_nbrs = sum(1 for c in nbrs if c is not None)
+                if walkable_nbrs >= 2 and mapped_nbrs >= 3:
+                    seg[g] = MapCell(WALKABLE, ("ground",), (None, None, None, None), self.step, self.step, None)
+                    restored += 1
+                    added_pass += 1
+            if not added_pass:
+                break
+        return restored
 
     @staticmethod
     def _can_learn_walkable(tags: Iterable[str]) -> bool:
@@ -495,7 +525,11 @@ class GlobalMap(StrategistArtifact):
                 kind = BLOCKED
             old = seg.get(g)
             if old is None:
-                if is_uniform_piece and self.info(self.segment).kind == OUTDOORS:
+                if (
+                    is_uniform_piece
+                    and self.info(self.segment).kind == OUTDOORS
+                    and (kind != WALKABLE or int(pixels.max()) <= BLACK_LEVEL)
+                ):
                     continue
                 seg[g] = MapCell(kind, tags, hashes, self.step, self.step, pixels)
                 added += 1
@@ -1132,10 +1166,15 @@ class GlobalMap(StrategistArtifact):
             if self.info(si).kind == OUTDOORS:
                 for g in list(seg):
                     c = seg[g]
-                    if c.pixels is not None and int(c.pixels.min()) == int(c.pixels.max()):
+                    if (
+                        c.pixels is not None
+                        and int(c.pixels.min()) == int(c.pixels.max())
+                        and (c.kind != WALKABLE or int(c.pixels.max()) <= BLACK_LEVEL)
+                    ):
                         del seg[g]
                         seg_blocked.discard(g)
                         changed += 1
+                changed += self._heal_visited_ground(si)
             quarter_tags: Dict[Cell, Dict[str, str]] = {}
             quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
             for g, c in seg.items():

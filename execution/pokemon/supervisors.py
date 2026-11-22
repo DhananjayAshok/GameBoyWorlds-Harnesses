@@ -421,7 +421,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if blocked_lines:
             lines.append("Blocked movement directions recorded in this area during this episode (do NOT repeat these from the same coordinate):")
             lines.extend(blocked_lines)
-        lines += door_lines(gmap)
+        lines += door_lines(gmap, local_kinds)
         targets, _ = frontier_targets(gmap, local_kinds)
         if targets:
             lines.append("Nearest unexplored map edges in this area (x = steps right, y = steps up from the player):")
@@ -481,7 +481,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                            getattr(self._env, "walk_patterns", None), people,
                            getattr(self._env, "left_ledge_patterns", None),
                            getattr(self._env, "blocked_cells", None))
-        self._screen_tiles = (verbalize_tiles(self._identified, people)
+        self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                               + "\nWalkable cells on each edge of the screen:\n"
                               + self._describe_edges(kinds))
         return self._screen_tiles
@@ -655,7 +655,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                      getattr(self._env, "walk_patterns", None), after_people,
                                      getattr(self._env, "left_ledge_patterns", None),
                                      getattr(self._env, "blocked_cells", None))
-            after_tiles = (verbalize_tiles(after_identified, after_people)
+            after_tiles = (verbalize_tiles(after_identified, after_people, after_kinds)
                            + "\nWalkable cells on each edge of the screen:\n"
                            + self._describe_edges(after_kinds))
             if move_tag:
@@ -1081,7 +1081,16 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 continue
 
             if not result["succeeded"]:
+                if is_move_action and not result["report"].steps and self._calls > 0:
+                    self._calls -= 1
                 if result["reason"] in ("move_blocked", "out_of_steps"):
+                    exec_blocked = getattr(self.last_executor, "_blocked_at_place", None) or {}
+                    for b_place, b_dirs in exec_blocked.items():
+                        for b_dir in b_dirs:
+                            detail = f"{request} -> blocked moving {b_dir}"
+                            dir_list = self._blocked_moves.setdefault(b_place, {}).setdefault(b_dir, [])
+                            if detail not in dir_list:
+                                dir_list.append(detail)
                     move_dir = parse_edge_direction(task) if action == "MoveOff" else None
                     if move_dir is None and result.get("notes"):
                         m_dir = re.search(r"Blocked.*moving\s+(up|down|left|right)", str(result.get("notes")), re.IGNORECASE)

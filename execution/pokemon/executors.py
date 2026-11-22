@@ -12,9 +12,9 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_me
                                                  is_battle_decision_screen, is_battle_screen,
                                                  is_cutscene_frame_changing, is_same_battle_frame)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
-                                                     boundary_exit_direction, cell_kinds, compress_path, edge_cells,
-                                                     edge_runs, filter_forward_edge_cells,
-                                                     filter_open_lane_edge_cells, in_bounds,
+                                                     boundary_exit_direction, cell_kinds, compress_path,
+                                                     diagonal_barrier_pairs, edge_cells, edge_runs,
+                                                     filter_forward_edge_cells, filter_open_lane_edge_cells, in_bounds,
                                                      is_boundary_exit_direction, parse_all_cells, parse_cell,
                                                      parse_edge_direction, shortest_path, verbalize_edges)
 from execution.pokemon.executor_actions import CheckInteractionAction
@@ -514,8 +514,21 @@ class GridMoveExecutor(PolicyExecutor):
                 if reroutes > 0:
                     return self._fail(MOVE_BLOCKED, "move_blocked",
                                       f"Blocked before reaching any of {sorted(current_goals)}")
-                return self._fail(MOVE_NO_PATH, "no_path",
-                                  f"No walkable path from (0, 0) to any of {sorted(current_goals)}")
+                pinches = diagonal_barrier_pairs(self.cell_kinds, current_goals)
+                if pinches:
+                    b1, b2 = pinches[0]
+                    note = (
+                        f"No walkable path from (0, 0) to any of {sorted(current_goals)} — "
+                        f"separated by an impassable obstacle barrier (obstacles at {b1} and {b2} meet diagonally "
+                        f"with no orthogonal passage); use MoveOff to route off screen around the obstacle rather than MoveTo or Free"
+                    )
+                else:
+                    note = (
+                        f"No walkable path from (0, 0) to any of {sorted(current_goals)} — "
+                        f"separated by an impassable obstacle barrier on the current screen; "
+                        f"use MoveOff to route off screen around the obstacle rather than MoveTo or Free"
+                    )
+                return self._fail(MOVE_NO_PATH, "no_path", note)
             self.plan = compress_path(path)
             end = path[-1][2] if path else (0, 0)
             facing = current_goals[end]
@@ -1806,10 +1819,14 @@ Press: <one of a, b, start, up, down, left, right>
 
     DEFAULT_TERMINATION = "what you were asked to do has visibly happened on screen"
 
+    MAX_REPEATED_BLOCKED_PRESSES = 2
+
     def __init__(self, env, task, max_steps: int = 15, termination: Optional[str] = None, **kwargs):
         self.presses: List[str] = []
         self.dialogue_crops: List[Any] = []
         self.dialogue_text: str = ""
+        self._blocked_at_place: Dict[Any, List[str]] = {}
+        self._repeated_blocked_presses: int = 0
         self.termination = (termination or "").strip() or self.DEFAULT_TERMINATION
         super().__init__(env, task, max_steps, termination=self.termination, **kwargs)
 
@@ -1821,14 +1838,26 @@ Press: <one of a, b, start, up, down, left, right>
     def _history_block(self) -> str:
         if not self.presses:
             return ""
-        return f"\nButtons pressed so far, in order: {', '.join(self.presses)}.\n"
+        lines = [f"Buttons pressed so far, in order: {', '.join(self.presses)}."]
+        cur_place = self._current_map_place()
+        blocked_here = self._blocked_at_place.get(cur_place, []) if cur_place is not None else []
+        if blocked_here:
+            lines.append(
+                f"Blocked directions at current position {cur_place[1]} (pressing these did NOT move the player — "
+                f"do NOT press them again from here): {', '.join(blocked_here)}."
+            )
+        return "\n" + "\n".join(lines) + "\n"
 
     def _finish(self, code: int, reason: str) -> int:
         if self.dialogue_crops:
             self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
                                                parameters=self._parameters))
         self.report.termination_reason = reason
+        cur_place = self._current_map_place()
+        blocked_here = self._blocked_at_place.get(cur_place, []) if cur_place is not None else []
+        blocked_note = f"Blocked moving {', '.join(blocked_here)} at {cur_place[1]}" if blocked_here else ""
         self.report.notes = "\n".join(filter(None, [f"Presses: {', '.join(self.presses) or 'none'}",
+                                                    blocked_note,
                                                     self.dialogue_text]))
         return code
 
@@ -1861,21 +1890,29 @@ Press: <one of a, b, start, up, down, left, right>
             and not self._is_top_box_dialogue()
         )
         before_place = self._current_map_place() if (was_free and press in DIRECTIONS) else None
+        was_facing = getattr(self._env, "facing", None) if (was_free and press in DIRECTIONS) else None
         record = self._take_action_string(f"button({press})") if press in FREE_BUTTONS else None
         if record is None:
             return False
         drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
         if self._last_terminated or self._last_truncated:
             return True
-        if (
+        after_place = self._current_map_place() if before_place is not None else None
+        if before_place is not None and after_place != before_place:
+            self._repeated_blocked_presses = 0
+        elif (
             before_place is not None
-            and self.presses
-            and self.presses[-1] == press
+            and ((self.presses and self.presses[-1] == press) or was_facing == press)
             and self._agent_state() == AgentState.FREE_ROAM
             and not has_bottom_dialogue_box(self._current_frame())
             and not self._is_top_box_dialogue()
-            and self._current_map_place() == before_place
+            and after_place == before_place
         ):
+            blocked_list = self._blocked_at_place.setdefault(before_place, [])
+            if press in blocked_list:
+                self._repeated_blocked_presses += 1
+            else:
+                blocked_list.append(press)
             recorder = getattr(self._env, "record_blocked_step", None)
             if callable(recorder):
                 try:
@@ -1918,4 +1955,6 @@ Press: <one of a, b, start, up, down, left, right>
                 return self._finish(FREE_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(FREE_TRUNCATED, "truncated")
+            if self._repeated_blocked_presses >= self.MAX_REPEATED_BLOCKED_PRESSES:
+                return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")
         return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")

@@ -93,7 +93,7 @@ def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
         f"{gmap.new_cells_by_episode.get(max(recent), 0) if recent else 0}; "
         f"episodes in a row with nothing new: {stale}.",
     ]
-    lines += door_lines(gmap)
+    lines += door_lines(gmap, local_kinds)
     lines += route_lines(gmap)
     if targets:
         lines.append("The nearest edge of the map you have NOT explored yet in each direction "

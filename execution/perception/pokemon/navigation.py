@@ -609,3 +609,59 @@ def verbalize_edges(kinds: Dict[Cell, str]) -> str:
             listed = "none"
         lines.append(f"- {direction} edge: {listed}")
     return "\n".join(lines)
+
+
+def diagonal_barrier_pairs(kinds: Dict[Cell, str], goals: Iterable[Cell]) -> List[Tuple[Cell, Cell]]:
+    goal_set = set(goals)
+    if not goal_set:
+        return []
+    r_player = {c for c in kinds if c == (0, 0) or shortest_path(kinds, (0, 0), [c]) is not None}
+    r_target = set(goal_set)
+    queue = deque(goal_set)
+    while queue:
+        cur = queue.popleft()
+        for _, nxt in neighbours(cur):
+            if in_bounds(nxt) and kinds.get(nxt) == WALKABLE and nxt not in r_target:
+                r_target.add(nxt)
+                queue.append(nxt)
+    pinches: List[Tuple[Cell, Cell]] = []
+    for (px, py) in sorted(r_player):
+        for dx in (-1, 1):
+            for dy in (-1, 1):
+                tx, ty = px + dx, py + dy
+                if (tx, ty) in r_target:
+                    b1, b2 = (px + dx, py), (px, py + dy)
+                    if kinds.get(b1, BLOCKED) != WALKABLE and kinds.get(b2, BLOCKED) != WALKABLE:
+                        pair = tuple(sorted((b1, b2)))
+                        if pair not in pinches:
+                            pinches.append(pair)
+    return pinches
+
+
+def describe_target_reachability(kinds: Optional[Dict[Cell, str]], target: Cell) -> str:
+    if not kinds or target == (0, 0):
+        return ""
+    if kinds.get(target) == WALKABLE:
+        goals = [target]
+    else:
+        goals = list(approach_cells(kinds, target))
+    if not goals:
+        return " [no walkable approach tile adjacent on current screen]"
+    path = shortest_path(kinds, (0, 0), goals)
+    if path is not None:
+        if not path:
+            return " [adjacent to player]"
+        runs_text = format_path_runs(compress_path(path))
+        return f" [on-screen path: {runs_text}]"
+    pinches = diagonal_barrier_pairs(kinds, goals)
+    if pinches:
+        b1, b2 = pinches[0]
+        return (
+            f" [no walkable path on current screen — separated by an obstacle barrier "
+            f"(obstacles at {b1} and {b2} meet diagonally with no orthogonal passage); "
+            f"MoveTo will fail with no_path, use MoveOff to route around the obstacle]"
+        )
+    return (
+        " [no walkable path on current screen — separated by an obstacle barrier; "
+        "MoveTo will fail with no_path, use MoveOff to route around the obstacle]"
+    )

@@ -10,6 +10,7 @@ from execution.perception.pokemon.battle import (BANNER_TOP, TILE_SIZE, find_mod
                                                  has_bottom_dialogue_box, has_bottom_location_banner)
 from execution.perception.pokemon.grid import GRID_SKIP, cell_box, draw_box, split_grid
 from execution.perception.pokemon.navigation import (FURNITURE_OVERHANG_TOP_TAGS, OVERHANG_TOP_TAGS,
+                                                     describe_target_reachability,
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
                                                      is_overhang_floor_cell, is_player_overhang_floor_cell,
                                                      is_south_ledge_cell, is_top_overhang_floor_cell,
@@ -71,6 +72,7 @@ def cell_part(quarters) -> str:
 
 SIGN_OBJECT_TAGS = ("sign", "interactable object", "item")
 WARP_QUARTER_TAGS = ("entrance", "staircase", "elevator")
+REACHABILITY_OBJECT_TAGS = ("entrance", "staircase", "elevator", "interactable object", "item", "npc", "sign")
 MIN_WARP_QUARTERS = 2
 TABLETOP_OBJECT_PATTERN = re.compile(
     r"\b(?:table|desk|counter)\b.*\b(?:with|holding|containing)\b"
@@ -127,7 +129,11 @@ def _quarter_tag_map(
     return quarter_tags, quarter_descriptions
 
 
-def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple[int, int], str]] = None) -> str:
+def verbalize_tiles(
+    identified: Dict[TileKey, Tile],
+    people: Optional[Dict[Tuple[int, int], str]] = None,
+    kinds: Optional[Dict[Tuple[int, int], str]] = None,
+) -> str:
     quarter_tags, quarter_descriptions = _quarter_tag_map(identified)
     top_overhang_cells = {
         cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
@@ -204,7 +210,8 @@ def verbalize_tiles(identified: Dict[TileKey, Tile], people: Optional[Dict[Tuple
     for (x, y) in sorted(by_cell, key=lambda c: (-c[1], c[0])):
         for tag, entry in by_cell[(x, y)].items():
             details = f": {'; '.join(entry['descriptions'])}" if entry["descriptions"] else ""
-            lines.append(f"({x}, {y}){cell_part(entry['quarters'])} {tag}{details}")
+            reach = describe_target_reachability(kinds, (x, y)) if tag in REACHABILITY_OBJECT_TAGS else ""
+            lines.append(f"({x}, {y}){cell_part(entry['quarters'])} {tag}{details}{reach}")
     return "\n".join(lines)
 
 

@@ -401,7 +401,7 @@ class PokemonStrategist:
                 kinds = cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
                                    people, self.global_map.left_ledge_patterns,
                                    self.global_map.local_blocked_cells())
-                self._screen_tiles = (verbalize_tiles(self._identified, people)
+                self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                                       + "\nWalkable cells on each edge of the screen:\n"
                                       + verbalize_edges(kinds))
         except Exception as e:

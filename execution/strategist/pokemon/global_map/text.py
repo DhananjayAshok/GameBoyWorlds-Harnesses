@@ -164,7 +164,83 @@ def route_lines(gmap: GlobalMap) -> List[str]:
 MAX_DOOR_LINES = 8
 
 
-def door_lines(gmap: GlobalMap) -> List[str]:
+def _obstacle_detour_edge(
+    gmap: GlobalMap,
+    goal_cell: Cell,
+    local_kinds: Optional[Dict[Cell, str]] = None,
+) -> Optional[Tuple[str, Cell]]:
+    import heapq
+    from execution.perception.pokemon.navigation import in_bounds
+    from .model import DIRECTIONS
+
+    seg = gmap.current
+    px, py = gmap.pos
+    start = (px, py)
+    if not seg or start == goal_cell:
+        return None
+
+    def kind_at(g: Cell) -> str:
+        if local_kinds is not None:
+            lx, ly = g[0] - px, g[1] - py
+            if in_bounds((lx, ly)):
+                return local_kinds.get((lx, ly), BLOCKED)
+        c = seg.get(g)
+        return c.kind if c is not None else "unexplored"
+
+    walkable_approaches = [
+        (goal_cell[0] + ox, goal_cell[1] + oy)
+        for ox, oy in DIRECTIONS.values()
+        if kind_at((goal_cell[0] + ox, goal_cell[1] + oy)) == WALKABLE
+    ]
+    targets = set(walkable_approaches) if walkable_approaches else {goal_cell}
+    xs = [g[0] for g in seg] + [start[0], goal_cell[0]]
+    ys = [g[1] for g in seg] + [start[1], goal_cell[1]]
+    x_min, x_max = min(xs) - 4, max(xs) + 4
+    y_min, y_max = min(ys) - 4, max(ys) + 4
+
+    best: Dict[Cell, int] = {start: 0}
+    prev: Dict[Cell, Optional[Tuple[Cell, str]]] = {start: None}
+    heap = [(0, start)]
+    while heap:
+        cost, cur = heapq.heappop(heap)
+        if cur in targets:
+            path: List[Tuple[str, Cell]] = []
+            c = cur
+            while prev[c] is not None:
+                p, d = prev[c]
+                path.append((d, c))
+                c = p
+            path.reverse()
+            for i, (d, (gx, gy)) in enumerate(path):
+                lx, ly = gx - px, gy - py
+                if not in_bounds((lx, ly)):
+                    prev_gx, prev_gy = start if i == 0 else path[i - 1][1]
+                    return d, (prev_gx - px, prev_gy - py)
+            return None
+        if cost > best[cur]:
+            continue
+        for d, (ox, oy) in DIRECTIONS.items():
+            nxt = (cur[0] + ox, cur[1] + oy)
+            if not (x_min <= nxt[0] <= x_max and y_min <= nxt[1] <= y_max):
+                continue
+            if walkable_approaches and nxt == goal_cell:
+                continue
+            k = kind_at(nxt)
+            if nxt in targets or k == WALKABLE:
+                step_cost = 1
+            elif k in ("unexplored", UNKNOWN):
+                step_cost = 4
+            else:
+                continue
+            if cost + step_cost < best.get(nxt, cost + step_cost + 1):
+                best[nxt] = cost + step_cost
+                prev[nxt] = (cur, d)
+                heapq.heappush(heap, (cost + step_cost, nxt))
+    return None
+
+
+def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -> List[str]:
+    from execution.perception.pokemon.navigation import approach_cells, in_bounds, shortest_path
     from .routes import _snap, compress_moves, path_in_segment, walked_squares
 
     px, py = gmap.pos
@@ -180,15 +256,33 @@ def door_lines(gmap: GlobalMap) -> List[str]:
         found = path_in_segment(gmap, gmap.segment, (px, py), snapped, walked) if snapped is not None else None
         path_moves = compress_moves(found[1]) if (found is not None and found[1]) else None
         path_steps = len(found[1]) if found is not None else None
-        doors.append((abs(dx) + abs(dy), dx, dy, leads_to, path_steps, path_moves))
+        on_screen_blocked = False
+        if local_kinds is not None and in_bounds((dx, dy)) and (dx, dy) != (0, 0):
+            goals = [(dx, dy)] if local_kinds.get((dx, dy)) == WALKABLE else list(approach_cells(local_kinds, (dx, dy)))
+            if not goals or shortest_path(local_kinds, (0, 0), goals) is None:
+                on_screen_blocked = True
+        detour_edge = _obstacle_detour_edge(gmap, goal_cell, local_kinds) if (path_moves is None or on_screen_blocked) else None
+        doors.append((abs(dx) + abs(dy), dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_edge))
     if not doors:
         return []
     lines = ["Doors and stairs in this area (x = steps to the right, y = steps up, measured from you):"]
-    for steps, dx, dy, leads_to, path_steps, path_moves in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
+    for steps, dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_edge in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
         behind = (f"leads to {gmap.area_label(leads_to)}"
                   + (", fully explored" if gmap.info(leads_to).explored is not None else "")
                   if leads_to is not None else "NOT entered yet")
-        route_suffix = f" (mapped route, {path_steps} moves: {path_moves})" if path_moves else ""
+        if path_moves:
+            if on_screen_blocked:
+                route_suffix = f" (separated by obstacle barrier on current screen — must route off screen first; mapped route, {path_steps} moves: {path_moves})"
+            else:
+                route_suffix = f" (mapped route, {path_steps} moves: {path_moves})"
+        elif detour_edge is not None:
+            d, edge_cell = detour_edge
+            prefix = "separated by obstacle barrier on current screen — " if on_screen_blocked else ""
+            route_suffix = f" ({prefix}no direct mapped path yet; shortest route around mapped obstacles leaves screen {d} via {edge_cell})"
+        elif on_screen_blocked:
+            route_suffix = " (separated by obstacle barrier on current screen — no direct mapped path yet)"
+        else:
+            route_suffix = ""
         lines.append(f"- ({dx}, {dy}), {steps} steps {sector(dx, dy) if steps else 'here'}: {behind}{route_suffix}")
     return lines
 
