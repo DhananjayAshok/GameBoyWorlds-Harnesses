@@ -123,6 +123,8 @@ DIALOGUE_BOX_WHITE = 240
 DIALOGUE_BOX_MIN_WHITE_FRACTION = 0.70
 
 CUTSCENE_DIFF_THRESHOLD = 40
+CUTSCENE_TILE_MIN_PIXELS = 10
+CUTSCENE_MAX_TILE_SHIFT = 2
 CUTSCENE_DIFF_MIN_PIXELS = 80
 
 
@@ -167,7 +169,37 @@ def is_cutscene_frame_changing(earlier: np.ndarray, later: np.ndarray) -> bool:
     b = _grey_frame(later).astype(int)
     diff = np.abs(a - b) > CUTSCENE_DIFF_THRESHOLD
     diff[88:, 104:] = False
-    return int(diff.sum()) >= CUTSCENE_DIFF_MIN_PIXELS
+    raw_sum = int(diff.sum())
+    if raw_sum < CUTSCENE_DIFF_MIN_PIXELS:
+        return False
+    n_rows = (diff.shape[0] // TILE_SIZE) * TILE_SIZE
+    n_cols = (diff.shape[1] // TILE_SIZE) * TILE_SIZE
+    if n_rows == 0 or n_cols == 0:
+        return raw_sum >= CUTSCENE_DIFF_MIN_PIXELS
+    ty, tx = n_rows // TILE_SIZE, n_cols // TILE_SIZE
+    t_min = diff[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+    for d in range(1, CUTSCENE_MAX_TILE_SHIFT + 1):
+        if d < n_cols:
+            diff_l = np.ones_like(diff)
+            diff_l[:, d:] = np.abs(b[:, d:] - a[:, :-d]) > CUTSCENE_DIFF_THRESHOLD
+            diff_l[88:, 104:] = False
+            diff_r = np.ones_like(diff)
+            diff_r[:, :-d] = np.abs(b[:, :-d] - a[:, d:]) > CUTSCENE_DIFF_THRESHOLD
+            diff_r[88:, 104:] = False
+            tl = diff_l[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+            tr = diff_r[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+            t_min = np.minimum(t_min, np.minimum(tl, tr))
+        if d < n_rows:
+            diff_u = np.ones_like(diff)
+            diff_u[d:, :] = np.abs(b[d:, :] - a[:-d, :]) > CUTSCENE_DIFF_THRESHOLD
+            diff_u[88:, 104:] = False
+            diff_d = np.ones_like(diff)
+            diff_d[:-d, :] = np.abs(b[:-d, :] - a[d:, :]) > CUTSCENE_DIFF_THRESHOLD
+            diff_d[88:, 104:] = False
+            tu = diff_u[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+            td = diff_d[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+            t_min = np.minimum(t_min, np.minimum(tu, td))
+    return int(t_min[t_min >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_DIFF_MIN_PIXELS
 
 
 BANNER_TOP = 112

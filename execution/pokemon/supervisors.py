@@ -126,6 +126,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._start_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self._leg_stops: List[Tuple[int, Tuple[int, int]]] = []
         self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {}
+        self._last_settled_step: Optional[int] = None
         self.last_executor = None
         self.plan: List[str] = []
         super().__init__(task=task, executor_class=None, env=env, game=game,
@@ -885,6 +886,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return bool(self._env._emulator.check_if_done())
 
     def _settle_free_roam(self, ticks: int = 2, max_cutscene_ticks: int = 24, post_motion_ticks: int = 4) -> None:
+        cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+        if cur_step is not None and cur_step == self._last_settled_step and self._agent_state() == AgentState.FREE_ROAM:
+            before = self._current_frame()
+            if not (has_bottom_dialogue_box(before) or (has_top_dialogue_box(before) and not has_menu_cursor(before))):
+                return
         waited = 0
         post_motion_remaining = 0
         while (self._agent_state() == AgentState.FREE_ROAM
@@ -905,6 +911,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 post_motion_remaining = post_motion_ticks
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
+        if self._agent_state() == AgentState.FREE_ROAM and not self._env_done():
+            self._last_settled_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
 
     @staticmethod
     def _dialogue_snippet(handled: Dict[str, Any], limit: int = 160) -> str:
