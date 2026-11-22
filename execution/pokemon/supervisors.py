@@ -5,7 +5,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from execution.game_api import AgentState, WaitAction
 
 from execution.executors import Executor
-from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_modal_preview_box,
+from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
+                                                 has_modal_preview_box, has_top_dialogue_box,
                                                  is_cutscene_frame_changing)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, WALKABLE, X_RANGE, Y_RANGE,
                                                      cell_kinds, compress_path, edge_cells,
@@ -18,7 +19,8 @@ from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeE
                                          FREE_OK, LOCATION_FAIL_CODES,
                                          MENU_LEFT_TO_BATTLE, MENU_LEFT_TO_DIALOGUE, MENU_OK,
                                          MOVE_OK, MOVE_TARGET_AMBIGUOUS,
-                                         OffScreenMoveExecutor, OnScreenMoveExecutor)
+                                         OffScreenMoveExecutor, OnScreenMoveExecutor,
+                                         effective_agent_state)
 from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUGH_AFTER_BLOCK,
                                        PLAYTHROUGH_AREA_MAP_BLOCK, PLAYTHROUGH_ATTEMPTS_BLOCK,
                                        PLAYTHROUGH_BATTLE_INSTRUCTIONS_PROMPT, PLAYTHROUGH_BATTLE_TIPS_BLOCK,
@@ -146,14 +148,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _agent_state(self):
         return self._env.get_info()["pokemon_core"]["agent_state"]
 
-    def _is_in_dialogue(self, frame=None) -> bool:
-        state = self._agent_state()
-        if state == AgentState.IN_DIALOGUE:
-            return True
-        if state == AgentState.FREE_ROAM:
+    def _effective_state(self, frame=None, raw_state=None) -> AgentState:
+        raw = self._agent_state() if raw_state is None else raw_state
+        if raw in (AgentState.IN_MENU, AgentState.FREE_ROAM):
             frame = self._current_frame() if frame is None else frame
-            return has_bottom_dialogue_box(frame) or has_modal_preview_box(frame)
-        return False
+            return effective_agent_state(raw, frame)
+        return raw
+
+    def _is_in_dialogue(self, frame=None) -> bool:
+        return self._effective_state(frame) == AgentState.IN_DIALOGUE
 
     def _global_map(self):
         return getattr(self._env, "_map", None)
@@ -370,14 +373,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _perceive(self, frame) -> str:
         self._record_map_stop()
-        state = self._agent_state()
+        state = self._effective_state(frame)
         if state != AgentState.FREE_ROAM:
             self._identified = {}
             self._screen_tiles = describe_state_screen(state)
-            return self._screen_tiles
-        if has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
-            self._identified = {}
-            self._screen_tiles = describe_state_screen(AgentState.IN_DIALOGUE)
             return self._screen_tiles
         self._tile_recognizer.record_tiles(frame, self._episode_number)
         self._identified = self._tile_recognizer.identify_tiles(frame)
@@ -409,7 +408,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             log_error("Supervisor prompt built before the screen was perceived.", self._parameters)
         guidance_block = PLAYTHROUGH_GUIDANCE_BLOCK.replace("[GUIDANCE]", self._guidance) if self._guidance else ""
         plan = "\n".join(f"{n + 1}. {subgoal}" for n, subgoal in enumerate(self.plan))
-        raw_state = AgentState.IN_DIALOGUE if self._is_in_dialogue() else self._agent_state()
+        raw_state = self._effective_state()
         state = raw_state.name.lower().replace("_", " ")
         local_kinds = None
         if raw_state == AgentState.FREE_ROAM and self._identified:
@@ -547,9 +546,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         report = result["report"]
         before = report.initial_state["core"]["current_frame"]
         after = report.final_state["core"]["current_frame"]
-        after_state = report.final_state["pokemon_core"]["agent_state"]
-        if after_state == AgentState.FREE_ROAM and (has_bottom_dialogue_box(after) or has_modal_preview_box(after)):
-            after_state = AgentState.IN_DIALOGUE
+        after_state = self._effective_state(after, raw_state=report.final_state["pokemon_core"]["agent_state"])
         if after_state == AgentState.FREE_ROAM:
             self._tile_recognizer.record_tiles(after, self._episode_number)
             after_identified = self._tile_recognizer.identify_tiles(after)
@@ -630,7 +627,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return clarified.strip().strip("\"'")
 
     def _menu_objective(self, instruction: str, frame) -> Tuple[str, bool]:
-        state = self._agent_state().name.lower().replace("_", " ")
+        state = self._effective_state(frame).name.lower().replace("_", " ")
         prompt = (self._fill_prompt(PLAYTHROUGH_MENU_OBJECTIVE_PROMPT)
                   .replace("[INSTRUCTION]", instruction)
                   .replace("[AGENT_STATE]", state))
@@ -722,7 +719,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if self._env_done() or self._battles_lost() or self._total_calls >= self._max_total_calls:
                 break
             frame = self._current_frame()
-            state = AgentState.IN_DIALOGUE if self._is_in_dialogue(frame) else self._agent_state()
+            state = self._effective_state(frame)
             if state == AgentState.FREE_ROAM and combined is not None:
                 break
             state_label = state.name.lower()
@@ -746,14 +743,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if self._agent_state() == AgentState.FREE_ROAM:
                 self._settle_free_roam()
             next_frame = self._current_frame()
-            next_state = AgentState.IN_DIALOGUE if self._is_in_dialogue(next_frame) else self._agent_state()
+            next_state = self._effective_state(next_frame)
             if next_state == AgentState.FREE_ROAM:
                 break
             if not handled.get("succeeded") and next_state == state:
                 break
         if combined is None:
             frame = self._current_frame()
-            state = AgentState.IN_DIALOGUE if self._is_in_dialogue(frame) else self._agent_state()
+            state = self._effective_state(frame)
             handled = self.call_executor("free", self.CLEAR_EVENT_INSTRUCTION,
                                          termination=self.CLEAR_EVENT_TERMINATION, counted=False)
             return state.name.lower(), handled
@@ -775,7 +772,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                and not self._env_done()
                and waited < max_cutscene_ticks):
             before = self._current_frame()
-            box_open = has_bottom_dialogue_box(before)
+            box_open = has_bottom_dialogue_box(before) or (has_top_dialogue_box(before) and not has_menu_cursor(before))
             if waited >= ticks and not box_open and post_motion_remaining <= 0:
                 break
             self._env.step_high_level_action(WaitAction)
@@ -783,7 +780,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if self._agent_state() != AgentState.FREE_ROAM or self._env_done():
                 break
             after = self._current_frame()
-            if is_cutscene_frame_changing(before, after) or has_bottom_dialogue_box(after):
+            if (is_cutscene_frame_changing(before, after)
+                    or has_bottom_dialogue_box(after)
+                    or (has_top_dialogue_box(after) and not has_menu_cursor(after))):
                 post_motion_remaining = post_motion_ticks
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
@@ -799,6 +798,22 @@ class PokemonPlayThroughSupervisor(Supervisor):
         state_chain, handled = self._handle_interruption(dialogue_task="clear the dialogue on screen")
         label = "open dialogue" if state_chain == "in_dialogue" else f"open dialogue ({state_chain})"
         note = f"Cleared {label} ({handled['reason']}){self._dialogue_snippet(handled)}"
+        self._note(note)
+        if attempts is not None:
+            attempts.append(note)
+        return handled
+
+    def _clear_pending_interruption(self, attempts: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        if self._out_of_calls() or self._env_done():
+            return None
+        if not (self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM):
+            return None
+        frame = self._current_frame()
+        self._perceive(frame)
+        if self._is_in_dialogue(frame):
+            return self._clear_pending_dialogue(attempts)
+        state_chain, handled = self._handle_interruption()
+        note = f"Cleared pending {state_chain} ({handled['reason']}){self._dialogue_snippet(handled)}"
         self._note(note)
         if attempts is not None:
             attempts.append(note)
@@ -1017,7 +1032,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _evaluate(self) -> Optional[dict]:
         self._settle_free_roam()
-        self._clear_pending_dialogue()
+        self._clear_pending_interruption()
+        if self._battles_lost():
+            return self._finish("lost_battle", "The player lost a battle and blacked out.")
         frame = self._current_frame()
         self._perceive(frame)
         self.plan = self._plan_subgoals(frame)
@@ -1047,8 +1064,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                             summary)
                     return self._finish("out_of_calls", self._out_of_calls_reason(), summary)
                 self._settle_free_roam()
-                if self._is_in_dialogue() and not self._out_of_calls() and not self._env_done():
-                    self._clear_pending_dialogue()
+                self._clear_pending_interruption()
+                if self._battles_lost():
+                    return self._finish("lost_battle", "The player lost a battle and blacked out.")
                 frame = self._current_frame()
                 self._perceive(frame)
                 complete, summary = self._task_check(frame)

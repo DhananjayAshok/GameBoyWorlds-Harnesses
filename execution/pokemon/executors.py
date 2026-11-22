@@ -7,7 +7,8 @@ from execution.game_api import (AgentState, BattleMenuAction, InteractAction, Me
 
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
-                                                 has_modal_preview_box, is_battle_decision_screen,
+                                                 has_modal_preview_box, has_top_dialogue_box,
+                                                 is_battle_decision_screen, is_battle_screen,
                                                  is_cutscene_frame_changing, is_same_battle_frame)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path, edge_cells,
@@ -831,8 +832,9 @@ BATTLE_ACTION_FAILED = -3
 BATTLE_OUT_OF_STEPS = -4
 
 BATTLE_EXIT_SETTLE_WAIT = 4
-MAX_TURN_PROGRESS_STEPS = 25
+MAX_TURN_PROGRESS_STEPS = 30
 MAX_IDLE_PROGRESS_STEPS = 3
+MAX_IDLE_INTRO_STEPS = 6
 MAX_STAT_DISMISS_STEPS = 4
 BATTLE_OPTIONS = ("fight", "bag", "pokemon", "run", "progress")
 MENU_PRESSES = ("up", "down", "left", "right", "confirm", "back")
@@ -841,6 +843,21 @@ LEFT_BATTLE_CODES = {
     AgentState.IN_DIALOGUE: BATTLE_LEFT_TO_DIALOGUE,
     AgentState.IN_MENU: BATTLE_LEFT_TO_MENU,
 }
+
+
+def effective_agent_state(raw_state: AgentState, frame: np.ndarray) -> AgentState:
+    if raw_state == AgentState.IN_MENU:
+        if not has_menu_cursor(frame):
+            if is_battle_screen(frame):
+                return AgentState.IN_BATTLE
+            if has_top_dialogue_box(frame):
+                return AgentState.IN_DIALOGUE
+    elif raw_state == AgentState.FREE_ROAM:
+        if (has_bottom_dialogue_box(frame)
+                or has_modal_preview_box(frame)
+                or (has_top_dialogue_box(frame) and not has_menu_cursor(frame))):
+            return AgentState.IN_DIALOGUE
+    return raw_state
 
 
 class CombatExecutor(PolicyExecutor):
@@ -958,7 +975,7 @@ Press: <one of up, down, left, right, confirm, back>
             wait_record = self._take_action(WaitAction)
             records.append(wait_record)
             state = self._agent_state()
-        if state != AgentState.IN_BATTLE:
+        if state != AgentState.IN_BATTLE and not is_battle_screen(self._current_frame()):
             self._exited_to_free_roam = True
             return True
         return False
@@ -979,15 +996,27 @@ Press: <one of up, down, left, right, confirm, back>
                     break
                 continue
             if state == AgentState.IN_MENU:
-                if has_menu_cursor(frame) or consecutive_dismisses >= MAX_STAT_DISMISS_STEPS:
+                if has_menu_cursor(frame):
+                    break
+                in_battle_intro = is_battle_screen(frame)
+                if not in_battle_intro and consecutive_dismisses >= MAX_STAT_DISMISS_STEPS:
                     break
                 extra = self._take_action(MenuAction, menu_action="confirm")
                 records.append(extra)
-                stat_dismisses += 1
-                consecutive_dismisses += 1
-                idle_steps = 0
+                if in_battle_intro:
+                    progress_presses += 1
+                    consecutive_dismisses = 0
+                else:
+                    stat_dismisses += 1
+                    consecutive_dismisses += 1
                 if extra.action_success == -1:
                     break
+                if is_same_battle_frame(extra.frame_before, extra.frame_after):
+                    idle_steps += 1
+                    if idle_steps >= (MAX_IDLE_INTRO_STEPS if in_battle_intro else MAX_IDLE_PROGRESS_STEPS):
+                        break
+                else:
+                    idle_steps = 0
                 continue
             if state == AgentState.IN_DIALOGUE:
                 extra = self._take_action(PassDialogueAction)
@@ -1068,7 +1097,7 @@ Press: <one of up, down, left, right, confirm, back>
         self._last_terminated = False
         self._last_truncated = False
         self._exited_to_free_roam = False
-        if self._agent_state() != AgentState.IN_BATTLE:
+        if self._agent_state() != AgentState.IN_BATTLE and not is_battle_screen(self._current_frame()):
             return self._fail(BATTLE_NOT_IN_BATTLE, "not_in_battle",
                               f"The player is {self._agent_state().name.lower()}, not in a battle.")
 
@@ -1408,11 +1437,11 @@ Press: <one of up, down, left, right, confirm, back>
 
         consecutive_invalid = 0
         for _ in range(self._max_steps):
-            state = self._agent_state()
+            frame = self._get_state()["core"]["current_frame"]
+            state = effective_agent_state(self._agent_state(), frame)
             if state != AgentState.IN_MENU:
                 code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                 return self._finish(code, reason)
-            frame = self._get_state()["core"]["current_frame"]
             prompt = (self.STEP_PROMPT.replace("[TASK]", self._task.strip())
                       .replace("[HISTORY]", self._history_block()))
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
@@ -1435,7 +1464,7 @@ Press: <one of up, down, left, right, confirm, back>
                 return self._finish(MENU_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(MENU_TRUNCATED, "truncated")
-            state = self._agent_state()
+            state = effective_agent_state(self._agent_state(), self._get_state()["core"]["current_frame"])
             if state != AgentState.IN_MENU:
                 code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                 return self._finish(code, reason)
@@ -1455,6 +1484,7 @@ DIALOGUE_MAX_CUTSCENE_WAIT = 24
 DIALOGUE_POST_MOTION_WAIT = 4
 DIALOGUE_FANFARE_RETRY_LIMIT = 4
 DIALOGUE_BUTTON_SETTLE_WAIT = 2
+DIALOGUE_TOP_BOX_PRESSES = 4
 FREE_SETTLE_WAIT = 4
 MENU_SETTLE_WAIT = 1
 
@@ -1472,6 +1502,15 @@ class _DialogueSettlingExecutor(PolicyExecutor):
     def _current_frame(self):
         return self._get_state()["core"]["current_frame"]
 
+    def _is_top_box_dialogue(self, frame=None) -> bool:
+        frame = self._current_frame() if frame is None else frame
+        return has_top_dialogue_box(frame) and not has_menu_cursor(frame)
+
+    def _effective_state(self, frame=None, raw_state=None) -> AgentState:
+        raw = self._agent_state() if raw_state is None else raw_state
+        frame = self._current_frame() if frame is None else frame
+        return effective_agent_state(raw, frame)
+
     def _wait_for_next_box(self, settle_wait: int = DIALOGUE_SETTLE_WAIT):
         state = self._agent_state()
         waited = 0
@@ -1479,7 +1518,8 @@ class _DialogueSettlingExecutor(PolicyExecutor):
         while (state == AgentState.FREE_ROAM
                and not (self._last_terminated or self._last_truncated)
                and waited < DIALOGUE_MAX_CUTSCENE_WAIT):
-            box_open = has_bottom_dialogue_box(self._current_frame())
+            frame = self._current_frame()
+            box_open = has_bottom_dialogue_box(frame) or self._is_top_box_dialogue(frame)
             if waited >= settle_wait and not box_open and post_motion_remaining <= 0:
                 break
             wait_record = self._take_action(WaitAction)
@@ -1489,7 +1529,8 @@ class _DialogueSettlingExecutor(PolicyExecutor):
             if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
                 break
             if (is_cutscene_frame_changing(wait_record.frame_before, wait_record.frame_after)
-                    or has_bottom_dialogue_box(wait_record.frame_after)):
+                    or has_bottom_dialogue_box(wait_record.frame_after)
+                    or self._is_top_box_dialogue(wait_record.frame_after)):
                 post_motion_remaining = DIALOGUE_POST_MOTION_WAIT
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
@@ -1514,6 +1555,20 @@ class _DialogueSettlingExecutor(PolicyExecutor):
         return state
 
     def _advance_dialogue_box(self, button: str = "a") -> bool:
+        if self._agent_state() == AgentState.IN_MENU and self._is_top_box_dialogue():
+            menu_action = "back" if button == "b" else "confirm"
+            progressed = False
+            for _ in range(DIALOGUE_TOP_BOX_PRESSES):
+                record = self._take_action(MenuAction, menu_action=menu_action)
+                drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
+                if record.action_success != -1 or record.frame_changed:
+                    progressed = True
+                if self._last_terminated or self._last_truncated:
+                    return True
+                if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
+                    self._settle_after_step()
+                    return True
+            return progressed
         record = self._take_action(PassDialogueAction)
         drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
         if self._last_terminated or self._last_truncated:
@@ -1575,6 +1630,9 @@ class DialogueExecutor(_DialogueSettlingExecutor):
         self.report.notes = self.dialogue_text
         return code
 
+    def _in_dialogue_loop_state(self, state: AgentState) -> bool:
+        return state == AgentState.IN_DIALOGUE or (state == AgentState.IN_MENU and self._is_top_box_dialogue())
+
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
@@ -1586,9 +1644,11 @@ class DialogueExecutor(_DialogueSettlingExecutor):
                 return self._finish(DIALOGUE_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(DIALOGUE_TRUNCATED, "truncated")
-        if state != AgentState.IN_DIALOGUE:
-            if state == AgentState.FREE_ROAM and (has_bottom_dialogue_box(self._current_frame())
-                                                  or has_modal_preview_box(self._current_frame())):
+        if not self._in_dialogue_loop_state(state):
+            frame = self._current_frame()
+            if state == AgentState.FREE_ROAM and (has_bottom_dialogue_box(frame)
+                                                  or has_modal_preview_box(frame)
+                                                  or self._is_top_box_dialogue(frame)):
                 a_record = self._take_action_string("button(a)")
                 if a_record is not None:
                     drop_prefix_crops(captured_dialogue_crops([a_record]), self.dialogue_crops)
@@ -1601,8 +1661,9 @@ class DialogueExecutor(_DialogueSettlingExecutor):
                     return self._finish(DIALOGUE_TERMINATED, "terminated")
                 if self._last_truncated:
                     return self._finish(DIALOGUE_TRUNCATED, "truncated")
-                if state != AgentState.IN_DIALOGUE:
-                    code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
+                if not self._in_dialogue_loop_state(state):
+                    eff_state = self._effective_state(raw_state=state)
+                    code = LEFT_DIALOGUE_CODES.get(eff_state, DIALOGUE_CLEARED)
                     return self._finish(code, {
                         DIALOGUE_CLEARED: "dialogue_cleared",
                         DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
@@ -1619,8 +1680,9 @@ class DialogueExecutor(_DialogueSettlingExecutor):
             if self._last_truncated:
                 return self._finish(DIALOGUE_TRUNCATED, "truncated")
             state = self._agent_state()
-            if state != AgentState.IN_DIALOGUE:
-                code = LEFT_DIALOGUE_CODES.get(state, DIALOGUE_CLEARED)
+            if not self._in_dialogue_loop_state(state):
+                eff_state = self._effective_state(raw_state=state)
+                code = LEFT_DIALOGUE_CODES.get(eff_state, DIALOGUE_CLEARED)
                 return self._finish(code, {
                     DIALOGUE_CLEARED: "dialogue_cleared",
                     DIALOGUE_LEFT_TO_MENU: "left_dialogue_to_menu",
@@ -1716,7 +1778,8 @@ Press: <one of a, b, start, up, down, left, right>
 
     def _step_press(self, press: str) -> bool:
         state = self._agent_state()
-        if press in ("a", "b") and state == AgentState.IN_DIALOGUE:
+        if press in ("a", "b") and (state == AgentState.IN_DIALOGUE
+                                    or (state == AgentState.IN_MENU and self._is_top_box_dialogue())):
             self._advance_dialogue_box(press)
             return True
         record = self._take_action_string(f"button({press})") if press in FREE_BUTTONS else None

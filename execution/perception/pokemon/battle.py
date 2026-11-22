@@ -263,3 +263,60 @@ def find_modal_preview_boxes(frame: np.ndarray):
 def has_modal_preview_box(frame: np.ndarray) -> bool:
     """Return True if an enclosed modal preview window is open over the overworld."""
     return bool(find_modal_preview_boxes(frame))
+
+
+TOP_BOX_TOP = 0
+TOP_BOX_INNER_TOP = 8
+TOP_BOX_INNER_BOTTOM = 24
+TOP_BOX_BOTTOM = 32
+TOP_BOX_INNER_LEFT = 8
+TOP_BOX_INNER_RIGHT = 152
+
+BATTLE_UPPER_BOTTOM = 96
+BATTLE_TOP_STRIP_BOTTOM = 16
+BATTLE_MID_X = 80
+BATTLE_MIN_UPPER_WHITE_FRACTION = 0.75
+BATTLE_MIN_HALF_WHITE_FRACTION = 0.65
+
+
+def has_top_dialogue_box(frame: np.ndarray) -> bool:
+    """Return True if a full-width 4-tile-tall bordered box is drawn at the top of the screen."""
+    img = _grey_frame(frame)
+    if img.shape[0] < TOP_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    inner = img[TOP_BOX_INNER_TOP:TOP_BOX_INNER_BOTTOM,
+                TOP_BOX_INNER_LEFT:TOP_BOX_INNER_RIGHT]
+    if float((inner >= DIALOGUE_BOX_WHITE).mean()) < DIALOGUE_BOX_MIN_WHITE_FRACTION:
+        return False
+    for tx in range(1, GRID_COLS - 1):
+        sl = slice(tx * TILE_SIZE, (tx + 1) * TILE_SIZE)
+        if not (is_horizontal_border_tile(img[TOP_BOX_TOP:TOP_BOX_INNER_TOP, sl])
+                and is_horizontal_border_tile(img[TOP_BOX_INNER_BOTTOM:TOP_BOX_BOTTOM, sl])):
+            return False
+    for ty in (1, 2):
+        rsl = slice(ty * TILE_SIZE, (ty + 1) * TILE_SIZE)
+        if not (is_vertical_border_tile(img[rsl, :TOP_BOX_INNER_LEFT])
+                and is_vertical_border_tile(img[rsl, TOP_BOX_INNER_RIGHT:GRID_COLS * TILE_SIZE])):
+            return False
+    return True
+
+
+def is_battle_screen(frame: np.ndarray) -> bool:
+    """Return True if the screen shows a battle backdrop above a bottom battle box."""
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    if has_top_dialogue_box(img) or has_modal_preview_box(img):
+        return False
+    upper = img[:BATTLE_UPPER_BOTTOM, :]
+    if float((upper >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_UPPER_WHITE_FRACTION:
+        return False
+    if float((img[:BATTLE_TOP_STRIP_BOTTOM, :] >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_UPPER_WHITE_FRACTION:
+        return False
+    if float((upper[:, :BATTLE_MID_X] >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_HALF_WHITE_FRACTION:
+        return False
+    if float((upper[:, BATTLE_MID_X:] >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_HALF_WHITE_FRACTION:
+        return False
+    return True
