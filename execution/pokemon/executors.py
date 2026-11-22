@@ -505,11 +505,11 @@ class GridMoveExecutor(PolicyExecutor):
                                   f"Stopped moving {direction} with {remaining} steps left")
         return None
 
-    def _walk(self, goals: Dict[Tuple[int, int], Optional[str]]) -> Optional[int]:
+    def _walk(self, goals: Dict[Tuple[int, int], Optional[str]], prefer_lateral: bool = False) -> Optional[int]:
         current_goals = dict(goals)
         reroutes = 0
         while True:
-            path = shortest_path(self.cell_kinds, (0, 0), current_goals)
+            path = shortest_path(self.cell_kinds, (0, 0), current_goals, prefer_lateral=prefer_lateral)
             if path is None:
                 if reroutes > 0:
                     return self._fail(MOVE_BLOCKED, "move_blocked",
@@ -569,7 +569,7 @@ class GridMoveExecutor(PolicyExecutor):
                         if shifted_goals:
                             blocked_neighbor = DIRECTIONS.get(failed_dir)
                             self._refresh_local_perception(blocked_neighbor=blocked_neighbor)
-                            if shortest_path(self.cell_kinds, (0, 0), shifted_goals) is not None:
+                            if shortest_path(self.cell_kinds, (0, 0), shifted_goals, prefer_lateral=prefer_lateral) is not None:
                                 current_goals = shifted_goals
                                 reroutes += 1
                                 self.report.termination_reason = None
@@ -856,7 +856,7 @@ Location: <(x, y) or Not Found>
 
         self.target_cell = target
         initial_frame = self._get_state()["core"]["current_frame"]
-        code = self._walk({target: None})
+        code = self._walk({target: None}, prefer_lateral=True)
         if code is not None:
             return code
         after_walk_frame = self._get_state()["core"]["current_frame"]

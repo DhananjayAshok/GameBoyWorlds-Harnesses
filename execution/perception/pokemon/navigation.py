@@ -298,19 +298,46 @@ def cell_kinds(
     return kinds
 
 
-def neighbours(cell: Cell) -> List[Tuple[str, Cell]]:
-    return [(d, (cell[0] + dx, cell[1] + dy)) for d, (dx, dy) in DIRECTIONS.items()]
+def neighbours(cell: Cell, direction_order: Iterable[str] = DIRECTIONS) -> List[Tuple[str, Cell]]:
+    return [(d, (cell[0] + DIRECTIONS[d][0], cell[1] + DIRECTIONS[d][1])) for d in direction_order]
 
 
-def shortest_path(kinds: Dict[Cell, str], start: Cell, goals: Iterable[Cell]) -> Optional[List[Tuple[str, str, Cell]]]:
+def _ordered_directions_for_goals(start: Cell, goals: set, prefer_lateral: bool = False) -> Tuple[str, ...]:
+    if not prefer_lateral or len(goals) != 1:
+        return tuple(DIRECTIONS)
+    target = next(iter(goals))
+    dx = target[0] - start[0]
+    dy = target[1] - start[1]
+    if dx == 0 or dy == 0:
+        return tuple(DIRECTIONS)
+    primary = []
+    if abs(ty := target[1]) == max(abs(min(Y_RANGE)), abs(max(Y_RANGE))) and abs(tx := target[0]) < max(abs(min(X_RANGE)), abs(max(X_RANGE))):
+        primary.append("right" if dx > 0 else "left")
+        primary.append("up" if dy > 0 else "down")
+    elif abs(target[0]) in (abs(min(X_RANGE)), abs(max(X_RANGE))) and abs(target[1]) < max(abs(min(Y_RANGE)), abs(max(Y_RANGE))):
+        primary.append("up" if dy > 0 else "down")
+        primary.append("right" if dx > 0 else "left")
+    else:
+        primary.append("right" if dx > 0 else "left")
+        primary.append("up" if dy > 0 else "down")
+    return tuple(primary + [d for d in DIRECTIONS if d not in primary])
+
+
+def shortest_path(
+    kinds: Dict[Cell, str],
+    start: Cell,
+    goals: Iterable[Cell],
+    prefer_lateral: bool = False,
+) -> Optional[List[Tuple[str, str, Cell]]]:
     goals = set(goals)
     if start in goals:
         return []
+    direction_order = _ordered_directions_for_goals(start, goals, prefer_lateral=prefer_lateral)
     previous: Dict[Cell, Tuple[Cell, str, str]] = {start: None}
     queue = deque([start])
     while queue:
         cell = queue.popleft()
-        for direction, nxt in neighbours(cell):
+        for direction, nxt in neighbours(cell, direction_order):
             if not in_bounds(nxt):
                 continue
             kind = kinds.get(nxt, BLOCKED)
