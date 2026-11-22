@@ -801,7 +801,7 @@ class PokemonStrategist:
         listeners = [self.npcs.on_env_step] if self.npcs is not None else []
         env = MappingEnvironment(self._env, self.global_map, self.tiles, self._parameters,
                                  listeners=listeners + [record_so_far])
-        warps_from = len(self.global_map.warps)
+        step_from = self.global_map.step
         supervisor = PokemonPlayThroughSupervisor(
             task=task, env=env, game=self._game, max_steps=self._supervisor_max_steps,
             tile_recognizer=self.tiles, episode_number=n, guidance=guidance, parameters=self._parameters,
@@ -820,7 +820,8 @@ class PokemonStrategist:
         settle_screen(self._env)
         self._name_segments(report, n)
         self._read_conversations()
-        events = record_events(self.guide, self.global_map, self.global_map.warps[warps_from:], n, self._parameters)
+        new_warps = [w for w in self.global_map.warps if w[0] > step_from]
+        events = record_events(self.guide, self.global_map, new_warps, n, self._parameters)
 
         before, frame = frame, self._current_frame()
         self._perceive(frame, n)

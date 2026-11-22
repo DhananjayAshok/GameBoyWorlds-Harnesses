@@ -9,7 +9,7 @@ import numpy as np
 
 from execution.artifact import StrategistArtifact, update
 from execution.perception.matching import cell_key, split_quarters
-from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box
+from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box, is_battle_screen
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import (LEDGE_LEFT, LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
@@ -37,6 +37,8 @@ DARK_LEVEL = 100
 BRIGHT_LEVEL = 150
 TRANSITION_FLASH_CELLS = 40
 IRIS_WIPE_CELLS = 30
+MIN_MID_TONE_CELLS = 10
+MAX_STEP_FILL = 8
 # A cell counts as unchanged by a wipe if at most this fraction of its pixels changed.
 WIPE_CELL_CHANGE = 0.2
 # A wipe leaves at least this many unchanged cells for every changed one; a new room changes nearly all.
@@ -140,6 +142,7 @@ class GlobalMap(StrategistArtifact):
         self.residual: Cell = (0, 0)
         self.lost = 0
         self.faded = False
+        self.in_battle = False
         self.merged_into: Dict[int, Tuple[int, Cell]] = {}
         self.pending: Optional[Tuple[str, int, Optional[int]]] = None
         self.step = 0
@@ -174,6 +177,7 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("segment_born", 0)
         self.__dict__.setdefault("warps", [])
         self.__dict__.setdefault("warp_moves", [None] * len(self.warps))
+        self.__dict__.setdefault("in_battle", False)
         self.__dict__.setdefault("fade_direction", None)
         self.__dict__.setdefault("routes", [])
         self.__dict__.setdefault("segment_info", {})
@@ -355,16 +359,30 @@ class GlobalMap(StrategistArtifact):
     def return_to_defeat(self, defeat: Dict[str, Any], episode: int) -> None:
         self.defeat_return = {"defeat": defeat, "episode": episode}
 
+    def _visited_cells_count(self, segment: int) -> int:
+        visits = self.visits[segment]
+        if len(visits) <= 1 or len(visits) >= MIN_NAME_OBSERVATIONS:
+            return len(visits)
+        from .routes import walked_squares
+        return max(len(visits), len(walked_squares(self, segment)))
+
+    def _has_min_observations(self, segment: int) -> bool:
+        return (
+            sum(self.visits[segment].values()) >= MIN_NAME_OBSERVATIONS
+            and self._visited_cells_count(segment) >= MIN_NAME_OBSERVATIONS
+        )
+
     def queue_grown(self) -> None:
         queued = {entry["segment"] for entry in self.naming_queue}
         for si, seg in enumerate(self.segments):
             if (seg and si not in queued and si not in self.merged_into
+                    and self._has_min_observations(si)
                     and self.filled_pixels(si) - self.info(si).named_pixels >= RENAME_GROWTH_PIXELS):
                 self.naming_queue.append({"segment": si, "exit": None, "step": self.step, "marker": None,
                                           "reason": "grew"})
                 queued.add(si)
         if (self.current and self.segment not in queued and self.info(self.segment).name is None
-                and sum(self.visits[self.segment].values()) >= MIN_NAME_OBSERVATIONS):
+                and self._has_min_observations(self.segment)):
             self.naming_queue.append({"segment": self.segment, "exit": None, "step": self.step, "marker": None,
                                       "reason": "here"})
 
@@ -491,9 +509,14 @@ class GlobalMap(StrategistArtifact):
 
     def on_step(self, frame: np.ndarray, identified, free_roam: bool, direction: Optional[str] = None,
                 max_steps: int = 0, reported: Optional[int] = None, was_free_roam: bool = True,
-                faded: bool = False) -> str:
+                faded: bool = False, in_battle: bool = False) -> str:
         self.step += 1
-        if faded:
+        if in_battle or (not free_roam and is_battle_screen(frame)):
+            self.in_battle = True
+            self.faded = False
+            self.fade_direction = None
+            self.lost = 0
+        elif faded and not self.in_battle:
             # after a blank screen the position must be recognised from the map, not slid from the last frame
             self.faded = True
             self.fade_direction = direction
@@ -512,6 +535,7 @@ class GlobalMap(StrategistArtifact):
         if self.anchor is None:
             shift = self._grid_shift(frame)
             self.anchor, self.residual = _screen(frame), grid_residual(shift)
+            self.in_battle = False
             self.observe(frame, identified, shift)
             return "start"
         if self.pending is not None and direction not in DIRECTIONS:
@@ -520,17 +544,29 @@ class GlobalMap(StrategistArtifact):
                                                   self.residual)
         if placed is not None:
             delta, residual, structural = placed
+            prev_pos = self.pos
             pos = (self.pos[0] + delta[0], self.pos[1] + delta[1])
             shift = tuple((-r) % GRID_SKIP for r in residual)
-            if not structural and self._blacks_out(frame, self.segment, pos, shift):
+            if self._blacks_out(frame, self.segment, pos, shift):
                 if direction in DIRECTIONS and self.pending is None:
                     self.pending = (direction, max_steps, reported)
                 self.stats["blackout_frames"] += 1
                 return "blank"
             if not structural:
-                self._learn_ledges(self.pos, pos, direction)
+                self._learn_ledges(prev_pos, pos, direction)
+                if (delta[0] == 0) != (delta[1] == 0) and 1 < abs(delta[0]) + abs(delta[1]) <= MAX_STEP_FILL:
+                    sx = (delta[0] > 0) - (delta[0] < 0)
+                    sy = (delta[1] > 0) - (delta[1] < 0)
+                    for i in range(1, abs(delta[0]) + abs(delta[1])):
+                        mid = (prev_pos[0] + sx * i, prev_pos[1] + sy * i)
+                        c_mid = self.segments[self.segment].get(mid)
+                        if c_mid is None or c_mid.kind not in (BLOCKED, LEDGE, LEDGE_LEFT):
+                            self.visits[self.segment][mid] += 1
             self.pos, self.residual = pos, residual
-            self.pending, self.lost, self.anchor = None, 0, _screen(frame)
+            self.pending, self.lost = None, 0
+            if not structural or delta != (0, 0):
+                self.anchor = _screen(frame)
+            self.in_battle = False
             self.stats["placed_by_edges" if structural else "placed"] += 1
             if structural:
                 # recoloured (a flash or fade): the position holds, the colours do not
@@ -556,6 +592,7 @@ class GlobalMap(StrategistArtifact):
             self.segment, self.pos = found
             self.residual, self.pending, self.lost, self.anchor = grid_residual(shift), None, 0, _screen(frame)
             self.faded = False
+            self.in_battle = False
             self.stats["relocalised"] += 1
             self.observe(frame, identified, shift)
             if prev_segment != self.segment:
@@ -582,6 +619,7 @@ class GlobalMap(StrategistArtifact):
         self.segment, self.pos = len(self.segments) - 1, (0, 0)
         self.residual, self.pending, self.lost, self.anchor = grid_residual(shift), None, 0, _screen(frame)
         self.faded = False
+        self.in_battle = False
         self.segment_born = self.stats["placed"]
         self.stats["new_segment"] += 1
         self.observe(frame, identified, shift)
@@ -590,12 +628,12 @@ class GlobalMap(StrategistArtifact):
         return "new_segment"
 
     def _link(self, segment: int, pos: Cell) -> None:
-        if not self.faded:
+        if not self.faded or self.in_battle or segment == self.segment:
             return
         self.warps.append((self.step, self.segment, self.pos, segment, pos))
         self.warp_moves.append(self.fade_direction if self.fade_direction in DIRECTIONS else None)
         left = self.segment
-        if (self.info(left).name is None and sum(self.visits[left].values()) >= MIN_NAME_OBSERVATIONS
+        if (self.info(left).name is None and self._has_min_observations(left)
                 and all(entry["segment"] != left for entry in self.naming_queue)):
             self.naming_queue.append({"segment": left, "exit": self.pos, "step": self.step, "marker": None,
                                       "reason": "door"})
@@ -651,7 +689,12 @@ class GlobalMap(StrategistArtifact):
             return True
         if white >= TRANSITION_FLASH_CELLS:
             return True
+        if black + white >= TRANSITION_FLASH_CELLS and best_same == 0:
+            return True
         if darkened >= TRANSITION_FLASH_CELLS and np.percentile(a, 98) <= DARK_LEVEL:
+            return True
+        mid_tone = sum(1 for piece in cells_by_xy.values() if np.any((piece > BLACK_LEVEL) & (piece < WHITE_LEVEL)))
+        if cells_by_xy and mid_tone < MIN_MID_TONE_CELLS:
             return True
         return False
 
@@ -695,10 +738,11 @@ class GlobalMap(StrategistArtifact):
         self.trail = [(t, target, (p[0] + dx, p[1] + dy)) if si == source else (t, si, p)
                       for t, si, p in self.trail]
 
-        def moved(si: int, p: Cell) -> Tuple[int, Cell]:
-            return (target, (p[0] + dx, p[1] + dy)) if si == source else (si, p)
+        def moved(si: int, p: Optional[Cell]) -> Tuple[int, Optional[Cell]]:
+            if si != source or p is None:
+                return si, p
+            return target, (p[0] + dx, p[1] + dy)
 
-        self.warps = [(t, *moved(a, pa), *moved(b, pb)) for t, a, pa, b, pb in self.warps]
         for entry in self.naming_queue:
             entry["segment"], entry["exit"] = moved(entry["segment"], entry["exit"])
         absorbed, kept = self.segment_info.pop(source, SegmentInfo()), self.info(target)
@@ -713,7 +757,20 @@ class GlobalMap(StrategistArtifact):
         self.blocked_cells[source] = set()
         if self.segment == source:
             self.segment, self.pos = target, (self.pos[0] + dx, self.pos[1] + dy)
+        self._clean_warps()
         self.stats["merged"] += 1
+
+    def _clean_warps(self) -> None:
+        new_warps: List[Tuple[int, int, Cell, int, Cell]] = []
+        new_moves: List[Optional[str]] = []
+        for (t, a, pa, b, pb), m in zip(self.warps, self.warp_moves):
+            ra, rpa = self.resolve(a, pa)
+            rb, rpb = self.resolve(b, pb)
+            if ra == rb:
+                continue
+            new_warps.append((t, ra, rpa, rb, rpb))
+            new_moves.append(m)
+        self.warps, self.warp_moves = new_warps, new_moves
 
     @staticmethod
     def _block_index(seg: Dict[Cell, MapCell]) -> Dict[Tuple[Any, ...], List[Cell]]:
@@ -807,9 +864,9 @@ class GlobalMap(StrategistArtifact):
         for si in range(len(self.segments)):
             if si == self.segment or si in self.merged_into or not self.segments[si]:
                 continue
-            if self.info(si).name is not None:
+            if self._has_min_observations(si):
                 continue
-            if sum(self.visits[si].values()) >= MIN_NAME_OBSERVATIONS:
+            if self.info(si).name is not None and len(self.visits[si]) > 1:
                 continue
             si_steps = [t for t, s, _ in self.trail if s == si]
             if not si_steps:
@@ -826,23 +883,6 @@ class GlobalMap(StrategistArtifact):
             else:
                 offset = self._transient_offset(si, target_seg, fallback_pos)
             dx, dy = offset
-
-            def moved(s: int, p: Optional[Cell]) -> Tuple[int, Optional[Cell]]:
-                if s != si or p is None:
-                    return s, p
-                return target_seg, (p[0] + dx, p[1] + dy)
-
-            new_warps: List[Tuple[int, int, Cell, int, Cell]] = []
-            new_moves: List[Optional[str]] = []
-            for (t, a, pa, b, pb), m in zip(self.warps, self.warp_moves):
-                ra, rpa = moved(a, pa)
-                rb, rpb = moved(b, pb)
-                assert rpa is not None and rpb is not None
-                if ra == rb and self._same_door(ra, rpa, rpb):
-                    continue
-                new_warps.append((t, ra, rpa, rb, rpb))
-                new_moves.append(m)
-            self.warps, self.warp_moves = new_warps, new_moves
             self.trail = [(t, target_seg, (p[0] + dx, p[1] + dy)) if s == si else (t, s, p)
                           for t, s, p in self.trail]
             self.naming_queue = [e for e in self.naming_queue if e.get("segment") != si]
@@ -852,8 +892,10 @@ class GlobalMap(StrategistArtifact):
             self.visits[si] = Counter()
             if si < len(self.blocked_cells):
                 self.blocked_cells[si] = set()
+            self._clean_warps()
             self.stats["transient_pruned"] += 1
             changed += 1
+        self._clean_warps()
         return changed
 
     def overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
@@ -1136,8 +1178,12 @@ class GlobalMap(StrategistArtifact):
     def door_labels(self) -> Dict[Tuple[int, Cell], int]:
         labels: Dict[Tuple[int, Cell], int] = {}
         for _, a, pa, b, pb in self.warps:
-            labels[(a, self._door_at(a, pa))] = b
-            labels[(b, self._door_at(b, pb))] = a
+            ra, rpa = self.resolve(a, pa)
+            rb, rpb = self.resolve(b, pb)
+            if ra == rb:
+                continue
+            labels[(ra, self._door_at(ra, rpa))] = rb
+            labels[(rb, self._door_at(rb, rpb))] = ra
         return labels
 
     def area_label(self, segment: int) -> str:

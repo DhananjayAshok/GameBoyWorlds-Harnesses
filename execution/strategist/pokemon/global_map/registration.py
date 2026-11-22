@@ -31,7 +31,7 @@ SCREEN_UNIT: Dict[str, Cell] = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), 
 # A screen that scrolled with no move pressed is searched this many cells each way.
 SCRIPTED_MAX_STEPS = 6
 # A cell whose pixels are all at or below this level is black.
-BLACK_LEVEL = 40
+BLACK_LEVEL = 60
 # A screen is off the 16px grid only if its best alignment beats the next best by this much.
 GRID_MARGIN = 0.02
 GRID_RELATIVE_MARGIN = 0.15

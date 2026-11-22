@@ -64,9 +64,11 @@ class MappingEnvironment:
 
     def step_high_level_action(self, action, **kwargs):
         from execution.game_api import AgentState
+        from execution.perception.pokemon.battle import is_battle_screen
 
         before = self._env.get_info()
-        was_free = before.get("pokemon_core", {}).get("agent_state") == AgentState.FREE_ROAM
+        before_state = before.get("pokemon_core", {}).get("agent_state")
+        was_free = before_state == AgentState.FREE_ROAM
         result = self._env.step_high_level_action(action, **kwargs)
         try:
             info = result[4] or {}
@@ -76,13 +78,21 @@ class MappingEnvironment:
             core = info.get("core", {})
             if not info.get("invalid_action") and core.get("current_frame") is not None:
                 frame = core["current_frame"]
-                free = info.get("pokemon_core", {}).get("agent_state") == AgentState.FREE_ROAM
+                after_state = info.get("pokemon_core", {}).get("agent_state")
+                free = after_state == AgentState.FREE_ROAM
+                in_battle = (
+                    before_state == AgentState.IN_BATTLE
+                    or after_state == AgentState.IN_BATTLE
+                    or (not free and is_battle_screen(frame))
+                )
                 direction, max_steps, reported = _movement(action, kwargs, info)
                 passed = core.get("transition_passed_frames")
                 faded = passed is not None and any(not has_structure(f) for f in passed)
                 identified = self._tiles.identify_tiles(frame) if free else {}
                 queued = len(self._map.naming_queue)
-                status = self._map.on_step(frame, identified, free, direction, max_steps, reported, was_free, faded)
+                status = self._map.on_step(
+                    frame, identified, free, direction, max_steps, reported, was_free, faded, in_battle=in_battle
+                )
                 if was_free and direction is not None:
                     self.facing = direction
                 elif status in ("relocalised", "new_segment"):
