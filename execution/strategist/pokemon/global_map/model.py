@@ -179,9 +179,15 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("ledge_patterns", set())
         self.__dict__.setdefault("walk_patterns", set())
 
+    @staticmethod
+    def _can_learn_walkable(tags: Iterable[str]) -> bool:
+        tag_set = set(tags)
+        return bool(tag_set & WALKABLE_TAGS) and "npc" not in tag_set and "unknown" not in tag_set
+
     def _classify(self, tags: Iterable[str], hashes: Tuple[Optional[str], ...]) -> str:
-        kind = classify(tags)
-        if kind == BLOCKED and hashes in self.walk_patterns:
+        tag_set = set(tags)
+        kind = classify(tag_set)
+        if kind == BLOCKED and hashes in self.walk_patterns and self._can_learn_walkable(tag_set):
             return WALKABLE
         if kind == BLOCKED and hashes in self.ledge_patterns:
             return LEDGE
@@ -189,7 +195,7 @@ class GlobalMap(StrategistArtifact):
 
     def _learn_walkable(self, cell: "MapCell") -> int:
         pattern = cell.hashes
-        if any(h is None for h in pattern):
+        if any(h is None for h in pattern) or not self._can_learn_walkable(cell.tags):
             return 0
         self.ledge_patterns.discard(pattern)
         relabelled = 0
@@ -322,7 +328,7 @@ class GlobalMap(StrategistArtifact):
                 info.explored = None
 
     def observe(self, frame: np.ndarray, identified: Dict[Tuple[int, int, str], Any],
-                shift: Cell = (0, 0)) -> int:
+                shift: Cell = (0, 0), can_learn_walkable: bool = False) -> int:
         seg = self.segments[self.segment]
         a = _screen(frame)
         px, py = self.pos
@@ -389,7 +395,7 @@ class GlobalMap(StrategistArtifact):
             if kind in (OCCUPIED, UNKNOWN) and old.kind not in (OCCUPIED, UNKNOWN):
                 continue
             if (x, y) == (0, 0) and old.kind != OCCUPIED:
-                if old.kind == BLOCKED:
+                if can_learn_walkable and old.kind == BLOCKED:
                     self._learn_walkable(old)
                 continue
             if (x, y) == (0, 1) and old.kind == WALKABLE and kind != OCCUPIED:
@@ -449,7 +455,7 @@ class GlobalMap(StrategistArtifact):
                 # recoloured (a flash or fade): the position holds, the colours do not
                 self.stats["recoloured_frames"] += 1
             elif self.residual == (0, 0):
-                self.observe(frame, identified)
+                self.observe(frame, identified, can_learn_walkable=(delta != (0, 0)))
                 self._try_merge(frame)
             else:
                 self.observe(frame, identified, shift)
@@ -958,6 +964,16 @@ class GlobalMap(StrategistArtifact):
 
     def refresh(self, tile_lookup: Dict[str, Any]) -> int:
         self.prune_transient_segments()
+        if self.walk_patterns:
+            cleaned_patterns = set()
+            for pattern in self.walk_patterns:
+                tiles = [tile_lookup.get(h) for h in pattern]
+                if all(t is not None for t in tiles):
+                    qtags = {normalize_tabletop_tag(t.tag, t.description) for t in tiles}
+                    if not self._can_learn_walkable(qtags):
+                        continue
+                cleaned_patterns.add(pattern)
+            self.walk_patterns = cleaned_patterns
         changed = 0
         for si, seg in enumerate(self.segments):
             quarter_tags: Dict[Cell, Dict[str, str]] = {}
@@ -971,10 +987,7 @@ class GlobalMap(StrategistArtifact):
                     quarter_descriptions[g] = {
                         q: t.description for q, t in zip(QUARTERS, tiles)
                     }
-            visits = self.visits[si] if si < len(self.visits) else Counter()
             for g, c in seg.items():
-                if visits.get(g, 0) > 0 and c.kind == BLOCKED:
-                    self._learn_walkable(c)
                 if g not in quarter_tags or c.kind == OCCUPIED:
                     continue
                 if is_top_overhang_floor_cell(g, quarter_tags, quarter_descriptions):

@@ -157,7 +157,12 @@ def cell_kinds(
             or is_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
         ):
             kinds[cell] = WALKABLE
-        elif walk_patterns and pattern in walk_patterns and "npc" not in cell_tags:
+        elif (
+            walk_patterns
+            and pattern in walk_patterns
+            and "npc" not in cell_tags
+            and bool(cell_tags & WALKABLE_TAGS)
+        ):
             kinds[cell] = WALKABLE
         elif cell_tags <= WALKABLE_TAGS | LEDGE_TAGS or is_player_overhang_ledge_cell(cell, quarter_tags):
             kinds[cell] = LEDGE
