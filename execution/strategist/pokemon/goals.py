@@ -482,4 +482,6 @@ def _decide(goals: GoalTree, path: GoalPath, subtree: GoalSubtree, digest: str, 
     if choice == "UPDATE":
         goals.edit(path, description=description, details=details, source_description=reason,
                    frontier_since=None, achievable_without_subgoals=None, episode_number=episode_number)
+        return False
+    goals.edit(path, frontier_since=episode_number, episode_number=episode_number)
     return False

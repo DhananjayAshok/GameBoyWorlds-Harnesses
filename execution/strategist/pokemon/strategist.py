@@ -759,7 +759,7 @@ class PokemonStrategist:
         return dispatched if dispatched is not None else (None, None)
 
     def _review(self, digest: str) -> Tuple[str, Optional[str]]:
-        new_doors = self.global_map.new_entrances()
+        new_doors = self.global_map.new_entrances(self.guide.towns)
         question, answer = town_question(self.guide) if new_doors else ("", "")
         prompt = (self._fill(P.REVIEW_PROMPT).replace("[DIGEST]", digest)
                   .replace("[TOWN_QUESTION]", question).replace("[TOWN_FORMAT]", answer))
@@ -773,7 +773,10 @@ class PokemonStrategist:
         return summary, None if town is None or town.strip().rstrip(".").lower() == "none" else town
 
     def _should_extract_knowledge(self, report: SupervisorReport, conversation_digest: str,
-                                  closed: List[Tuple[Tuple[str, ...], str]], town_event: Any) -> bool:
+                                  closed: List[Tuple[Tuple[str, ...], str]], town_event: Any,
+                                  episode_status: Optional[str] = None) -> bool:
+        if episode_status == "lost_battle":
+            return False
         if not (report.narrative or any(r.notes and r.notes.strip() for r in report.executor_reports)):
             return False
         if conversation_digest.strip():
@@ -841,7 +844,10 @@ class PokemonStrategist:
                 self.goals.add_under(path, GoalNode(description=answer["prepare"], details=details, source="defeat"),
                                      episode_number=n)
                 self.goals.edit(path, achievable_without_subgoals=None, episode_number=n)
-                self.goals.set_frontier(self.goals.path_to(self.goals.frontier()), n, episode_number=n)
+                new_frontier_path = self.goals.path_to(self.goals.frontier())
+                self.goals.set_frontier(new_frontier_path, n, episode_number=n)
+                if new_frontier_path is not None:
+                    self.goals.edit(new_frontier_path, achievable_without_subgoals=n, episode_number=n)
         if answer["return"] and defeat is not None:
             gmap.return_to_defeat(defeat, n)
         log_info(f"Defeat reflection: {answer['wrong']} Plan: "
@@ -949,11 +955,15 @@ class PokemonStrategist:
         since = subtree.root.frontier_since
         if path != self.goals.frontier_path or since is None:
             self.goals.set_frontier(path, n, episode_number=n)
-            if subtree.root.source == "subgoal_creation":
+            if subtree.root.source in ("subgoal_creation", "defeat"):
                 self.goals.edit(path, achievable_without_subgoals=n, episode_number=n)
                 return
             unsuccessful_for = 0
         else:
+            if subtree.root.source == "defeat" and not self._explore_now:
+                if subtree.root.achievable_without_subgoals is None:
+                    self.goals.edit(path, achievable_without_subgoals=n, episode_number=n)
+                return
             unsuccessful_for = n - since
             if unsuccessful_for <= 0 or unsuccessful_for % self._subgoal_every:
                 return
@@ -1023,11 +1033,15 @@ class PokemonStrategist:
 
         before, frame = frame, self._current_frame()
         self._perceive(frame, n)
+        self.global_map.refresh(self.tiles._by_hash)
 
         self._record_party_episode(record)
-        closed = check_goals(self.goals, report.digest, self.notepad.text, self._vlm_caller, self._game, n,
-                             current=self._current_place(), parameters=self._parameters,
-                             episode_status=record.status, subgoal_every=self._subgoal_every)
+        if record.status == "lost_battle":
+            closed = []
+        else:
+            closed = check_goals(self.goals, report.digest, self.notepad.text, self._vlm_caller, self._game, n,
+                                 current=self._current_place(), parameters=self._parameters,
+                                 episode_status=record.status, subgoal_every=self._subgoal_every)
         summary, town = self._review(report.digest)
         record.summary = summary or record.summary
         town_event = record_new_town(self.guide, town, self._current_place(), n, self._parameters)
@@ -1035,7 +1049,7 @@ class PokemonStrategist:
             events.append(town_event)
         conversation_digest = self._conversation_digest(n)
         extracted = False
-        if self._should_extract_knowledge(report, conversation_digest, closed, town_event):
+        if self._should_extract_knowledge(report, conversation_digest, closed, town_event, record.status):
             self._extract_knowledge(report.digest + conversation_digest, before, frame, n)
             extracted = True
         if closed:

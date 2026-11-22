@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -1278,7 +1278,9 @@ class GlobalMap(StrategistArtifact):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1
         if self.seen_entrances is not None:
-            valid = self.entrances()
+            valid = {(si, g) for si, seg in enumerate(self.segments)
+                     if si not in self.merged_into and self.info(si).kind in (OUTDOORS, None)
+                     for g, c in seg.items() if "entrance" in c.tags}
             self.seen_entrances = {key for key in self.seen_entrances if self.resolve(*key) in valid}
         return changed
 
@@ -1402,16 +1404,59 @@ class GlobalMap(StrategistArtifact):
         return f"{where}.\n" + render_plan(self, [segment], plan_route(self, [segment]))
 
     def entrances(self) -> set:
-        return {(si, g) for si, seg in enumerate(self.segments) if si not in self.merged_into
+        return {(si, g) for si, seg in enumerate(self.segments)
+                if si not in self.merged_into and self.info(si).kind == OUTDOORS
                 for g, c in seg.items() if "entrance" in c.tags}
 
-    def new_entrances(self) -> int:
-        if self.seen_entrances is None:
+    def new_entrances(self, seen_towns: Sequence[str] = ()) -> int:
+        if self.seen_entrances is None or not self.segments:
             return 0
-        return len(self.entrances() - {self.resolve(*key) for key in self.seen_entrances})
+        si = self.resolve(self.segment, (0, 0))[0]
+        info = self.info(si)
+        if info.kind != OUTDOORS or not self._segment_may_have_unseen_town(info.name, seen_towns):
+            return 0
+        doors = self.door_list(si)
+        if len(doors) < 2:
+            return 0
+        seen_here = {pos for seg_id, pos in (self.resolve(*key) for key in self.seen_entrances) if seg_id == si}
+        new_groups = 0
+        for door in doors:
+            if door["leads_to"] is not None:
+                continue
+            cells = [c for c in door["cells"] if c in self.segments[si] and "entrance" in self.segments[si][c].tags]
+            if not cells:
+                continue
+            if any(max(abs(c[0] - s[0]), abs(c[1] - s[1])) <= 1 for c in cells for s in seen_here):
+                continue
+            new_groups += 1
+        return new_groups
+
+    @staticmethod
+    def _segment_may_have_unseen_town(name: Optional[str], seen_towns: Sequence[str]) -> bool:
+        if not name or not name.strip():
+            return True
+        known = {t.strip().lower() for t in seen_towns if t and t.strip()}
+        if not known:
+            return True
+        name_l = name.strip().lower()
+        if name_l in known:
+            return False
+        parts = [p.strip() for chunk in name.split(",") for p in chunk.split("&") if p.strip()]
+        has_known = any(any(k in p.lower() for k in known) for p in parts)
+        if not has_known:
+            return True
+        town_words = ("town", "city", "village", "island", "plateau", "hamlet", "port")
+        unknown_town_parts = [
+            p for p in parts
+            if not any(k in p.lower() for k in known)
+            and any(w in p.lower() for w in town_words)
+        ]
+        return bool(unknown_town_parts)
 
     def mark_entrances_seen(self) -> None:
-        self.seen_entrances = self.entrances()
+        seen = {self.resolve(*key) for key in (self.seen_entrances or set())}
+        valid_segments = {si for si in range(len(self.segments)) if si not in self.merged_into}
+        self.seen_entrances = {key for key in seen if key[0] in valid_segments} | self.entrances()
 
     def _new_doors(self, old: "GlobalMap") -> Dict[Tuple[int, Cell], int]:
         before = {self.resolve(*key): self.resolve(b, (0, 0))[0] for key, b in old.door_labels().items()}
