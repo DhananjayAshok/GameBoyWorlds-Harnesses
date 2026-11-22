@@ -727,7 +727,24 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         shift_x, shift_y = placed[0]
         return (shift_x * dx + shift_y * dy) > 0
 
-    def _can_step_from_current(self, direction: str) -> Optional[bool]:
+    @staticmethod
+    def _can_step_from_cell_in_kinds(
+        kinds: Dict[Tuple[int, int], str],
+        cell: Tuple[int, int],
+        direction: str,
+    ) -> Optional[bool]:
+        dx, dy = DIRECTIONS[direction]
+        nxt = (cell[0] + dx, cell[1] + dy)
+        kind = kinds.get(nxt)
+        if kind == WALKABLE:
+            return True
+        if (kind == LEDGE and direction == "down") or (kind == LEDGE_LEFT and direction == "left"):
+            return kinds.get((cell[0] + 2 * dx, cell[1] + 2 * dy)) == WALKABLE
+        if kind in (BLOCKED, LEDGE, LEDGE_LEFT):
+            return False
+        return None
+
+    def _live_cell_kinds(self) -> Optional[Dict[Tuple[int, int], str]]:
         tiles = getattr(self._env, "_tiles", None)
         if tiles is None or not hasattr(tiles, "identify_tiles"):
             return None
@@ -739,7 +756,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 people = self.people_fn()
             except Exception:  # noqa: BLE001
                 people = None
-        kinds = cell_kinds(
+        return cell_kinds(
             identified,
             getattr(self._env, "ledge_patterns", None),
             getattr(self._env, "walk_patterns", None),
@@ -747,21 +764,102 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             getattr(self._env, "left_ledge_patterns", None),
             getattr(self._env, "blocked_cells", None),
         )
-        dx, dy = DIRECTIONS[direction]
-        nxt = (dx, dy)
-        kind = kinds.get(nxt)
-        if kind == WALKABLE:
-            return True
-        if (kind == LEDGE and direction == "down") or (kind == LEDGE_LEFT and direction == "left"):
-            return kinds.get((2 * dx, 2 * dy)) == WALKABLE
-        if kind in (BLOCKED, LEDGE, LEDGE_LEFT):
-            return False
-        return None
+
+    def _can_step_from_current(self, direction: str) -> Optional[bool]:
+        kinds = self._live_cell_kinds()
+        if kinds is None:
+            return None
+        return self._can_step_from_cell_in_kinds(kinds, (0, 0), direction)
+
+    def _sidestep_targets_at_edge(
+        self,
+        target: Tuple[int, int],
+        target_run: List[Tuple[int, int]],
+        direction: str,
+    ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        kinds = self._live_cell_kinds()
+        if kinds is None:
+            return []
+        axis = 0 if direction in ("up", "down") else 1
+        candidates = []
+        for cell in target_run:
+            if cell == target:
+                continue
+            rel = (cell[0] - target[0], cell[1] - target[1])
+            if not in_bounds(rel) or kinds.get(rel) != WALKABLE:
+                continue
+            if self._can_step_from_cell_in_kinds(kinds, rel, direction) is not True:
+                continue
+            if shortest_path(kinds, (0, 0), [rel]) is not None:
+                candidates.append((abs(rel[axis]), abs(cell[axis]), rel, cell))
+        candidates.sort()
+        return [(rel, cell) for _, _, rel, cell in candidates]
+
+    def _rebind_direction_for_coords(
+        self,
+        direction: str,
+        coords: List[Tuple[int, int]],
+    ) -> str:
+        if not coords:
+            return direction
+        gmap = getattr(self._env, "_map", None)
+        cells = edge_cells(self.cell_kinds, direction)
+        forward_cells = filter_forward_edge_cells(cells, direction)
+        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap)
+        if any(c in open_cells for c in coords):
+            return direction
+        # If an explicit corner or edge coordinate has an open exit on another edge that it touches
+        # (e.g. "MoveOff(right through the tall grass at (5, 4))" where (5, 4) is blocked on the right
+        # edge or inward-blocked on the up edge, or where the task text also mentions another direction),
+        # prefer the edge where that coordinate is an open exit or has the best offscreen continuation.
+        lower_task = self._task.lower()
+        mentioned_dirs = []
+        for word, alias in (("up", "up"), ("north", "up"), ("down", "down"), ("south", "down"),
+                            ("left", "left"), ("west", "left"), ("right", "right"), ("east", "right")):
+            if re.search(rf"\b{word}\b", lower_task) and alias not in mentioned_dirs:
+                mentioned_dirs.append(alias)
+        candidate_dirs = list(DIRECTIONS)
+        best_dir = direction
+        best_score = (-1, -1, -1)
+        seg = getattr(gmap, "current", None) if gmap is not None else None
+        px = py = 0
+        if seg is not None and getattr(gmap, "pos", None) is not None:
+            try:
+                _, (px, py) = gmap.resolve(gmap.segment, gmap.pos)
+            except Exception:  # noqa: BLE001
+                seg = None
+        from execution.perception.pokemon.navigation import LOOKAHEAD_STEPS, _offscreen_continuation_depth
+        for d in candidate_dirs:
+            d_cells = edge_cells(self.cell_kinds, d)
+            matching = [c for c in coords if c in d_cells]
+            if not matching:
+                continue
+            d_forward = filter_forward_edge_cells(d_cells, d)
+            d_open = filter_open_lane_edge_cells(d_forward, d, self.cell_kinds, gmap)
+            in_open = int(any(c in d_open for c in matching))
+            depth = 0
+            if seg is not None:
+                depth = max(
+                    _offscreen_continuation_depth(seg, (px + c[0], py + c[1]), d, LOOKAHEAD_STEPS)
+                    for c in matching
+                )
+            else:
+                depth = LOOKAHEAD_STEPS if in_open else 0
+            is_mentioned = int(d in mentioned_dirs)
+            is_Vertical_corner = int(d in ("up", "down") and any(abs(c[0]) >= 4 and abs(c[1]) == 4 for c in matching))
+            score = (in_open if depth > 0 else 0, depth, is_Vertical_corner + is_mentioned)
+            if score > best_score:
+                best_score = score
+                best_dir = d
+        return best_dir
 
     def _resolve_deterministic_edge(self) -> Optional[Tuple[str, Tuple[int, int]]]:
         direction = parse_edge_direction(self._task)
         if direction not in DIRECTIONS:
             return None
+        coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
+        if coords:
+            direction = self._rebind_direction_for_coords(direction, coords)
         cells = edge_cells(self.cell_kinds, direction)
         if not cells:
             return None
@@ -769,10 +867,22 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         gmap = getattr(self._env, "_map", None)
         open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap)
 
-        coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
         on_edge_coords = [c for c in coords if c in cells]
         if on_edge_coords:
-            preferred = [c for c in on_edge_coords if c in open_cells] or [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
+            preferred = [c for c in on_edge_coords if c in open_cells]
+            if not preferred and open_cells:
+                all_runs = edge_runs(cells, direction)
+                same_run_open = []
+                for c in on_edge_coords:
+                    c_run = next((r for r in all_runs if c in r), [])
+                    same_run_open.extend(oc for oc in c_run if oc in open_cells and oc not in same_run_open)
+                if same_run_open:
+                    axis = 0 if direction in ("up", "down") else 1
+                    ref = on_edge_coords[0]
+                    nearest = min(same_run_open, key=lambda c: (abs(c[axis] - ref[axis]), abs(c[axis])))
+                    preferred = [nearest]
+            if not preferred:
+                preferred = [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
             path = shortest_path(self.cell_kinds, (0, 0), preferred)
             target = path[-1][2] if path else preferred[0]
             return direction, target
@@ -883,9 +993,11 @@ Location: <(x, y) or Not Found>
                 if adjacent_open:
                     target = min(adjacent_open, key=lambda c: (abs(c[axis] - target[axis]), abs(c[axis])))
 
+        initial_edge_runs = edge_runs(edge_cells(self.cell_kinds, direction), direction)
+        target_run = next((r for r in initial_edge_runs if target in r), [target])
         self.target_cell = target
         initial_frame = self._get_state()["core"]["current_frame"]
-        code = self._walk({target: None}, prefer_lateral=True)
+        code = self._walk({target: None}, prefer_lateral=not (abs(target[0]) >= 4 and abs(target[1]) == 4))
         if code is not None:
             return code
         after_walk_frame = self._get_state()["core"]["current_frame"]
@@ -896,16 +1008,35 @@ Location: <(x, y) or Not Found>
         can_step = self._can_step_from_current(direction)
         if can_step is False:
             self._record_empirical_block(direction)
-            if scrolled_to_edge:
-                self._settle_free_roam()
-                if self._last_terminated:
-                    return self._fail(MOVE_TERMINATED, "terminated")
-                if self._last_truncated:
-                    return self._fail(MOVE_TRUNCATED, "truncated")
-                self.report.termination_reason = "left_screen"
-                self.report.notes = f"Walked to {target} at the {direction} edge"
-                return MOVE_OK
-            return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked at {target} moving {direction}")
+            sidesteps = self._sidestep_targets_at_edge(target, target_run, direction)
+            if (
+                sidesteps
+                and self._n_moves < self._max_steps
+                and self._get_state()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
+                and not has_bottom_dialogue_box(self._get_state()["core"]["current_frame"])
+            ):
+                rel_target, new_edge_target = sidesteps[0]
+                self._refresh_local_perception(blocked_neighbor=DIRECTIONS.get(direction))
+                sidestep_code = self._walk({rel_target: None}, prefer_lateral=True)
+                if sidestep_code is not None:
+                    return sidestep_code
+                target = new_edge_target
+                self.target_cell = target
+                can_step = self._can_step_from_current(direction)
+                if can_step is False:
+                    self._record_empirical_block(direction)
+                    return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked at {target} moving {direction}")
+            else:
+                if scrolled_to_edge:
+                    self._settle_free_roam()
+                    if self._last_terminated:
+                        return self._fail(MOVE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._fail(MOVE_TRUNCATED, "truncated")
+                    self.report.termination_reason = "left_screen"
+                    self.report.notes = f"Walked to {target} at the {direction} edge (further movement {direction} blocked at {target})"
+                    return MOVE_OK
+                return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked at {target} moving {direction}")
         code = self._step(direction, 1)
         if code is not None:
             if code == MOVE_BLOCKED and scrolled_to_edge:
