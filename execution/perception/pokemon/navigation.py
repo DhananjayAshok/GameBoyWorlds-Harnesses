@@ -235,6 +235,7 @@ def cell_kinds(
     walk_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
     people: Optional[Dict[Cell, str]] = None,
     left_ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
+    blocked_cells: Optional[Collection[Cell]] = None,
 ) -> Dict[Cell, str]:
     from execution.perception.pokemon.tiles import normalize_tabletop_tag
 
@@ -258,10 +259,13 @@ def cell_kinds(
         if "remembered here" in lower or "seen only in part" in lower:
             continue
         confirmed_occupied.add(cell)
+    empirical_blocked = set(blocked_cells or ())
     kinds = {}
     for cell, cell_tags in tags.items():
         pattern = tuple(hashes[cell].get(q) for q in QUARTERS)
         if cell in confirmed_occupied:
+            kinds[cell] = BLOCKED
+        elif cell != (0, 0) and cell in empirical_blocked and not (cell_tags & WARP_TAGS):
             kinds[cell] = BLOCKED
         elif (
             cell_tags & WARP_TAGS
@@ -415,6 +419,89 @@ def filter_forward_edge_cells(cells: Iterable[Cell], direction: str) -> List[Cel
     return forward if forward else cells_list
 
 
+LOOKAHEAD_STEPS = 4
+
+
+def _offscreen_continuation_depth(
+    seg: Dict[Cell, Any],
+    start: Cell,
+    direction: str,
+    max_depth: int = LOOKAHEAD_STEPS,
+) -> int:
+    dx, dy = DIRECTIONS[direction]
+    gx_min, gx_max = start[0] - max(X_RANGE) + min(X_RANGE), start[0]
+    if direction == "up":
+        bound = start[1]
+        in_forward = lambda g: g[1] >= bound
+        depth_of = lambda g: g[1] - bound
+    elif direction == "down":
+        bound = start[1]
+        in_forward = lambda g: g[1] <= bound
+        depth_of = lambda g: bound - g[1]
+    elif direction == "left":
+        bound = start[0]
+        in_forward = lambda g: g[0] <= bound
+        depth_of = lambda g: bound - g[0]
+    else:
+        bound = start[0]
+        in_forward = lambda g: g[0] >= bound
+        depth_of = lambda g: g[0] - bound
+
+    first = (start[0] + dx, start[1] + dy)
+    fc = seg.get(first)
+    if fc is None or getattr(fc, "kind", None) == "unknown":
+        return max_depth
+    if (getattr(fc, "kind", None) == LEDGE and direction == "down") or (
+        getattr(fc, "kind", None) == LEDGE_LEFT and direction == "left"
+    ):
+        first = (start[0] + 2 * dx, start[1] + 2 * dy)
+        fc = seg.get(first)
+        if fc is None or getattr(fc, "kind", None) == "unknown":
+            return max_depth
+        if getattr(fc, "kind", None) != WALKABLE:
+            return 0
+    elif getattr(fc, "kind", None) != WALKABLE:
+        return 0
+
+    best_depth = depth_of(first)
+    visited = {start, first}
+    queue = deque([(first, 1)])
+    while queue:
+        cur, steps = queue.popleft()
+        d_cur = depth_of(cur)
+        if d_cur > best_depth:
+            best_depth = d_cur
+        if best_depth >= max_depth or steps >= max_depth + 2:
+            return max_depth
+        for d_name, (nx_d, ny_d) in DIRECTIONS.items():
+            nxt = (cur[0] + nx_d, cur[1] + ny_d)
+            if not in_forward(nxt):
+                continue
+            nc = seg.get(nxt)
+            if nc is None or getattr(nc, "kind", None) == "unknown":
+                return max_depth
+            nkind = getattr(nc, "kind", None)
+            if "entrance" in getattr(nc, "tags", ()) or "staircase" in getattr(nc, "tags", ()):
+                return max_depth
+            if nkind == WALKABLE:
+                landing = nxt
+            elif (nkind == LEDGE and d_name == "down") or (nkind == LEDGE_LEFT and d_name == "left"):
+                landing = (nxt[0] + nx_d, nxt[1] + ny_d)
+                if not in_forward(landing):
+                    continue
+                lc = seg.get(landing)
+                if lc is None or getattr(lc, "kind", None) == "unknown":
+                    return max_depth
+                if getattr(lc, "kind", None) != WALKABLE:
+                    continue
+            else:
+                continue
+            if landing not in visited:
+                visited.add(landing)
+                queue.append((landing, steps + 1))
+    return min(best_depth, max_depth)
+
+
 def filter_open_lane_edge_cells(
     cells: Iterable[Cell],
     direction: str,
@@ -435,19 +522,17 @@ def filter_open_lane_edge_cells(
             seg = None
 
     if seg is not None:
-        beyond_clear = []
-        for c in cells_list:
-            beyond = seg.get((px + c[0] + dx, py + c[1] + dy))
-            if beyond is None:
-                beyond_clear.append(c)
-            elif beyond.kind == WALKABLE:
-                beyond_clear.append(c)
-            elif (beyond.kind == LEDGE and direction == "down") or (beyond.kind == LEDGE_LEFT and direction == "left"):
-                landing = seg.get((px + c[0] + 2 * dx, py + c[1] + 2 * dy))
-                if landing is None or landing.kind == WALKABLE:
-                    beyond_clear.append(c)
-        if beyond_clear:
-            cells_list = beyond_clear
+        depths = {
+            c: _offscreen_continuation_depth(seg, (px + c[0], py + c[1]), direction, LOOKAHEAD_STEPS)
+            for c in cells_list
+        }
+        deep_clear = [c for c in cells_list if depths[c] >= LOOKAHEAD_STEPS]
+        if deep_clear:
+            cells_list = deep_clear
+        else:
+            max_d = max(depths.values(), default=0)
+            if max_d > 0:
+                cells_list = [c for c in cells_list if depths[c] == max_d]
 
     inward_clear = [
         c for c in cells_list

@@ -32,7 +32,7 @@ from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUG
                                        PLAYTHROUGH_SUBGOAL_DECISION_PROMPT, PLAYTHROUGH_TASK_CHECK_PROMPT,
                                        PLAYTHROUGH_TEXT_BLOCK, PRIMITIVES)
 from execution.strategist.pokemon.global_map.model import UNKNOWN, is_door
-from execution.strategist.pokemon.global_map.text import LEGEND, ascii_window, frontier_targets
+from execution.strategist.pokemon.global_map.text import LEGEND, ascii_window, door_lines, frontier_targets
 from execution.report import ExecutorReport
 from execution.supervisors.base import Supervisor
 from utils import log_error, log_warn, parse_int, parse_key_value, parse_list, parse_yes_no
@@ -370,18 +370,26 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return ""
         cur_seg, cur_pos = place
         lines = []
+        remaining_calls = max(0, self._max_steps - self._calls)
         if self._start_place is not None:
             s_seg, s_pos = gmap.resolve(self._start_place[0], self._start_place[1])
             if s_seg == cur_seg:
                 dx, dy = cur_pos[0] - s_pos[0], cur_pos[1] - s_pos[1]
                 lines.append(
                     f"Current area coordinate: {cur_pos} (episode start: {s_pos}; "
-                    f"net displacement: ({dx:+d}, {dy:+d}), where +x is right/east and +y is up/north)."
+                    f"net displacement: ({dx:+d}, {dy:+d}), where +x is right/east and +y is up/north; "
+                    f"episode action budget used: {self._calls}/{self._max_steps}, {remaining_calls} remaining)."
                 )
             else:
-                lines.append(f"Current area coordinate: {cur_pos} (entered a new area since episode start).")
+                lines.append(
+                    f"Current area coordinate: {cur_pos} (entered a new area since episode start; "
+                    f"episode action budget used: {self._calls}/{self._max_steps}, {remaining_calls} remaining)."
+                )
         else:
-            lines.append(f"Current area coordinate: {cur_pos} (+x is right/east, +y is up/north).")
+            lines.append(
+                f"Current area coordinate: {cur_pos} (+x is right/east, +y is up/north; "
+                f"episode action budget used: {self._calls}/{self._max_steps}, {remaining_calls} remaining)."
+            )
         same_seg_stops = []
         for seg, pos in self._leg_stops:
             r_seg, r_pos = gmap.resolve(seg, pos)
@@ -413,6 +421,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if blocked_lines:
             lines.append("Blocked movement directions recorded in this area during this episode (do NOT repeat these from the same coordinate):")
             lines.extend(blocked_lines)
+        lines += door_lines(gmap)
         targets, _ = frontier_targets(gmap, local_kinds)
         if targets:
             lines.append("Nearest unexplored map edges in this area (x = steps right, y = steps up from the player):")
@@ -470,7 +479,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         people = self._people_now()
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), people,
-                           getattr(self._env, "left_ledge_patterns", None))
+                           getattr(self._env, "left_ledge_patterns", None),
+                           getattr(self._env, "blocked_cells", None))
         self._screen_tiles = (verbalize_tiles(self._identified, people)
                               + "\nWalkable cells on each edge of the screen:\n"
                               + self._describe_edges(kinds))
@@ -502,7 +512,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if raw_state == AgentState.FREE_ROAM and self._identified:
             local_kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                                      getattr(self._env, "walk_patterns", None), self._people_now(),
-                                     getattr(self._env, "left_ledge_patterns", None))
+                                     getattr(self._env, "left_ledge_patterns", None),
+                                     getattr(self._env, "blocked_cells", None))
         return (prompt.replace("[GAME]", self._game)
                 .replace("[TASK]", self._task)
                 .replace("[GUIDANCE_BLOCK]", guidance_block)
@@ -642,7 +653,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             after_people = self._people_now()
             after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None),
                                      getattr(self._env, "walk_patterns", None), after_people,
-                                     getattr(self._env, "left_ledge_patterns", None))
+                                     getattr(self._env, "left_ledge_patterns", None),
+                                     getattr(self._env, "blocked_cells", None))
             after_tiles = (verbalize_tiles(after_identified, after_people)
                            + "\nWalkable cells on each edge of the screen:\n"
                            + self._describe_edges(after_kinds))
@@ -781,7 +793,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _move(self, tag: str, task: str, *, counted: bool = True) -> Any:
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), self._people_now(),
-                           getattr(self._env, "left_ledge_patterns", None))
+                           getattr(self._env, "left_ledge_patterns", None),
+                           getattr(self._env, "blocked_cells", None))
         return self.call_executor(tag, task, counted=counted, screen_tiles=self._screen_tiles,
                                   cell_kinds=kinds,
                                   identified=self._identified,
@@ -1075,11 +1088,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             aliases = {"north": "up", "south": "down", "west": "left", "east": "right"}
                             move_dir = aliases.get(m_dir.group(1).lower(), m_dir.group(1).lower())
                     if move_dir:
-                         detail = f"{request} -> {result['reason']}"
-                         for place_key in {p for p in (before_place, after_place) if p is not None}:
-                             dir_list = self._blocked_moves.setdefault(place_key, {}).setdefault(move_dir, [])
-                             if detail not in dir_list:
-                                 dir_list.append(detail)
+                        recorder = getattr(self._env, "record_blocked_step", None)
+                        if callable(recorder):
+                            try:
+                                recorder(direction=move_dir)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        detail = f"{request} -> {result['reason']}"
+                        for place_key in {p for p in (before_place, after_place) if p is not None}:
+                            dir_list = self._blocked_moves.setdefault(place_key, {}).setdefault(move_dir, [])
+                            if detail not in dir_list:
+                                dir_list.append(detail)
                 note = f"{request} did not work: {result['reason']}" + (
                     f" ({result['notes']})" if result.get("notes") else "")
                 if move_tag:

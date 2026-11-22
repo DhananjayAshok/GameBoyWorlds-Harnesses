@@ -120,6 +120,13 @@ class MappingEnvironment:
     def walk_patterns(self) -> set:
         return self._map.walk_patterns
 
+    @property
+    def blocked_cells(self) -> set:
+        return self._map.local_blocked_cells()
+
+    def record_blocked_step(self, direction: Optional[str] = None, cell: Optional[Tuple[int, int]] = None):
+        return self._map.record_blocked_step(direction=direction, cell=cell)
+
     def step_str(self, input_str: str):
         action, kwargs = self._env.string_to_high_level_action(input_str)
         if action is None:

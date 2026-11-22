@@ -331,6 +331,14 @@ class GridMoveExecutor(PolicyExecutor):
         except Exception:  # noqa: BLE001
             return None
 
+    def _record_empirical_block(self, direction: str) -> None:
+        recorder = getattr(self._env, "record_blocked_step", None)
+        if callable(recorder):
+            try:
+                recorder(direction=direction)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _refresh_local_perception(self, blocked_neighbor: Optional[Tuple[int, int]] = None) -> bool:
         tiles = getattr(self._env, "_tiles", None)
         if tiles is None or not hasattr(tiles, "identify_tiles"):
@@ -352,6 +360,7 @@ class GridMoveExecutor(PolicyExecutor):
             getattr(self._env, "walk_patterns", None),
             people,
             getattr(self._env, "left_ledge_patterns", None),
+            getattr(self._env, "blocked_cells", None),
         )
         if blocked_neighbor is not None:
             kinds[blocked_neighbor] = BLOCKED
@@ -440,6 +449,7 @@ class GridMoveExecutor(PolicyExecutor):
                         and self._n_moves < self._max_steps):
                     retried_after_cutscene = True
                     continue
+                self._record_empirical_block(direction)
                 if taken == 0 and not action_return.get("rotated"):
                     return self._fail(MOVE_BLOCKED, "move_blocked",
                                       f"Blocked moving {direction} with {remaining} steps left")
@@ -618,10 +628,12 @@ class OffScreenMoveExecutor(GridMoveExecutor):
     def _screen_scrolled_along(self, before_frame: np.ndarray, after_frame: np.ndarray, direction: str) -> bool:
         from execution.strategist.pokemon.global_map.registration import register
 
+        dx, dy = DIRECTIONS[direction]
+        if (self._displacement[0] * dx + self._displacement[1] * dy) > 0:
+            return True
         placed = register(before_frame, after_frame, direction, max(1, self._steps_taken))
         if placed is None:
             return False
-        dx, dy = DIRECTIONS[direction]
         shift_x, shift_y = placed[0]
         return (shift_x * dx + shift_y * dy) > 0
 
@@ -643,6 +655,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             getattr(self._env, "walk_patterns", None),
             people,
             getattr(self._env, "left_ledge_patterns", None),
+            getattr(self._env, "blocked_cells", None),
         )
         dx, dy = DIRECTIONS[direction]
         nxt = (dx, dy)
@@ -792,6 +805,7 @@ Location: <(x, y) or Not Found>
         )
         can_step = self._can_step_from_current(direction)
         if can_step is False:
+            self._record_empirical_block(direction)
             if scrolled_to_edge:
                 self._settle_free_roam()
                 if self._last_terminated:
@@ -1778,18 +1792,48 @@ Press: <one of a, b, start, up, down, left, right>
                 return btn
         return None
 
+    def _current_map_place(self) -> Optional[Tuple[int, Tuple[int, int]]]:
+        gmap = getattr(self._env, "_map", None)
+        if gmap is None or not getattr(gmap, "current", None) or getattr(gmap, "pos", None) is None:
+            return None
+        try:
+            return gmap.resolve(gmap.segment, gmap.pos)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _step_press(self, press: str) -> bool:
         state = self._agent_state()
         if press in ("a", "b") and (state == AgentState.IN_DIALOGUE
                                     or (state == AgentState.IN_MENU and self._is_top_box_dialogue())):
             self._advance_dialogue_box(press)
             return True
+        was_free = (
+            state == AgentState.FREE_ROAM
+            and not has_bottom_dialogue_box(self._current_frame())
+            and not self._is_top_box_dialogue()
+        )
+        before_place = self._current_map_place() if (was_free and press in DIRECTIONS) else None
         record = self._take_action_string(f"button({press})") if press in FREE_BUTTONS else None
         if record is None:
             return False
         drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
         if self._last_terminated or self._last_truncated:
             return True
+        if (
+            before_place is not None
+            and self.presses
+            and self.presses[-1] == press
+            and self._agent_state() == AgentState.FREE_ROAM
+            and not has_bottom_dialogue_box(self._current_frame())
+            and not self._is_top_box_dialogue()
+            and self._current_map_place() == before_place
+        ):
+            recorder = getattr(self._env, "record_blocked_step", None)
+            if callable(recorder):
+                try:
+                    recorder(direction=press)
+                except Exception:  # noqa: BLE001
+                    pass
         if press in ("a", "b") and self._agent_state() == AgentState.FREE_ROAM:
             self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
         elif self._agent_state() == AgentState.IN_MENU:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
-from .model import DIRECTIONS, LEDGE, LEDGE_LEFT, OCCUPIED, UNKNOWN, WALKABLE
+from .model import BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, OCCUPIED, UNKNOWN, WALKABLE
 
 if TYPE_CHECKING:
     from .model import Cell, GlobalMap
@@ -21,13 +21,19 @@ OPPOSITE = {"up": "down", "down": "up", "left": "right", "right": "left"}
 
 
 def walked_squares(gmap: GlobalMap, segment: int) -> set:
+    seg = gmap.segments[segment]
+    emp_blocked = gmap.blocked_cells[segment] if segment < len(getattr(gmap, "blocked_cells", ())) else set()
     points = [p for _, s, p in gmap.trail if s == segment]
     walked = set(points) | set(gmap.visits[segment])
     for a, b in zip(points, points[1:]):
         if (a[0] == b[0]) != (a[1] == b[1]) and abs(a[0] - b[0]) + abs(a[1] - b[1]) <= MAX_WALK_FILL:
             sx, sy = (b[0] > a[0]) - (b[0] < a[0]), (b[1] > a[1]) - (b[1] < a[1])
             walked |= {(a[0] + sx * i, a[1] + sy * i) for i in range(abs(b[0] - a[0]) + abs(b[1] - a[1]))}
-    return walked
+    return {
+        g for g in walked
+        if g not in emp_blocked
+        and (g not in seg or seg[g].kind not in (BLOCKED, LEDGE, LEDGE_LEFT))
+    }
 
 
 def _snap(gmap: GlobalMap, segment: int, cell: Cell, walked: set) -> Optional[Cell]:
@@ -65,7 +71,7 @@ def path_in_segment(gmap: GlobalMap, segment: int, start: Cell,
         for direction, (dx, dy) in DIRECTIONS.items():
             nxt, move = (cell[0] + dx, cell[1] + dy), "walk"
             c = seg.get(nxt)
-            if nxt == goal or nxt in walked:
+            if nxt == goal or (nxt in walked and (c is None or c.kind not in (BLOCKED, LEDGE, LEDGE_LEFT))):
                 step = 1
             elif c is None:
                 continue

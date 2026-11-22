@@ -163,6 +163,7 @@ class GlobalMap(StrategistArtifact):
         self.ledge_patterns: set = set()
         self.left_ledge_patterns: set = set()
         self.walk_patterns: set = set()
+        self.blocked_cells: List[set] = [set()]
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -181,6 +182,9 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("ledge_patterns", set())
         self.__dict__.setdefault("left_ledge_patterns", set())
         self.__dict__.setdefault("walk_patterns", set())
+        self.__dict__.setdefault("blocked_cells", [set() for _ in self.segments])
+        while len(self.blocked_cells) < len(self.segments):
+            self.blocked_cells.append(set())
 
     @staticmethod
     def _can_learn_walkable(tags: Iterable[str]) -> bool:
@@ -248,6 +252,43 @@ class GlobalMap(StrategistArtifact):
         self.stats["ledges_learned"] += 1
         self.stats["ledge_cells_relabelled"] += relabelled
         return relabelled
+
+    def record_blocked_step(self, direction: Optional[str] = None, cell: Optional[Cell] = None) -> Optional[Cell]:
+        if not self.current or self.pos is None:
+            return None
+        while len(self.blocked_cells) <= self.segment:
+            self.blocked_cells.append(set())
+        if cell is None:
+            if direction not in DIRECTIONS:
+                return None
+            dx, dy = DIRECTIONS[direction]
+            target = (self.pos[0] + dx, self.pos[1] + dy)
+        else:
+            target = cell
+        if target == self.pos:
+            return None
+        if self.visits[self.segment].get(target, 0) > 0:
+            return None
+        seg = self.segments[self.segment]
+        c = seg.get(target)
+        if c is not None and (is_door(c) or c.kind in (LEDGE, LEDGE_LEFT)):
+            return None
+        self.blocked_cells[self.segment].add(target)
+        if c is not None and c.kind == WALKABLE:
+            c.kind = BLOCKED
+            self.stats["empirical_blocked_cells"] += 1
+        return target
+
+    def local_blocked_cells(self) -> set:
+        if not self.current or self.pos is None or self.segment >= len(self.blocked_cells):
+            return set()
+        px, py = self.pos
+        out = set()
+        for gx, gy in self.blocked_cells[self.segment]:
+            lx, ly = gx - px, gy - py
+            if -4 <= lx <= 5 and -4 <= ly <= 4 and (lx, ly) != (0, 0):
+                out.add((lx, ly))
+        return out
 
     def names_differ(self, a: int, b: int) -> bool:
         def norm(name: Optional[str]) -> Optional[str]:
@@ -413,12 +454,24 @@ class GlobalMap(StrategistArtifact):
                 }))
                 kind = BLOCKED if (x, y) in east_cliff_cells else self._classify(tags, hashes)
             g = (px + x, py + y)
+            while len(self.blocked_cells) <= self.segment:
+                self.blocked_cells.append(set())
+            seg_blocked = self.blocked_cells[self.segment]
+            is_uniform_piece = int(pixels.min()) == int(pixels.max())
+            if (x, y) == (0, 0):
+                seg_blocked.discard(g)
+            elif g in seg_blocked and kind == WALKABLE and not bool(set(tags) & DOOR_TAGS):
+                kind = BLOCKED
             old = seg.get(g)
             if old is None:
+                if is_uniform_piece and self.info(self.segment).kind == OUTDOORS:
+                    continue
                 seg[g] = MapCell(kind, tags, hashes, self.step, self.step, pixels)
                 added += 1
                 continue
             old.last_seen = self.step
+            if is_uniform_piece and old.pixels is not None and int(old.pixels.min()) != int(old.pixels.max()):
+                continue
             # an NPC on a cell, or a tile not yet recognised, never overwrites what the cell was known to be
             if kind in (OCCUPIED, UNKNOWN) and old.kind not in (OCCUPIED, UNKNOWN):
                 continue
@@ -523,6 +576,7 @@ class GlobalMap(StrategistArtifact):
         prev_segment = self.segment
         self.segments.append({})
         self.visits.append(Counter())
+        self.blocked_cells.append(set())
         self.segment_info[len(self.segments) - 1] = SegmentInfo()
         self._link(len(self.segments) - 1, (0, 0))
         self.segment, self.pos = len(self.segments) - 1, (0, 0)
@@ -625,6 +679,8 @@ class GlobalMap(StrategistArtifact):
     def _merge(self, source: int, target: int, offset: Cell) -> None:
         dx, dy = offset
         src, dst = self.segments[source], self.segments[target]
+        while len(self.blocked_cells) <= max(source, target):
+            self.blocked_cells.append(set())
         for (x, y), c in src.items():
             g = (x + dx, y + dy)
             old = dst.get(g)
@@ -632,6 +688,10 @@ class GlobalMap(StrategistArtifact):
                 dst[g] = c
         for (x, y), v in self.visits[source].items():
             self.visits[target][(x + dx, y + dy)] += v
+        for (x, y) in self.blocked_cells[source]:
+            g = (x + dx, y + dy)
+            if self.visits[target].get(g, 0) == 0:
+                self.blocked_cells[target].add(g)
         self.trail = [(t, target, (p[0] + dx, p[1] + dy)) if si == source else (t, si, p)
                       for t, si, p in self.trail]
 
@@ -650,6 +710,7 @@ class GlobalMap(StrategistArtifact):
         self.merged_into[source] = (target, (dx, dy))
         self.segments[source] = {}
         self.visits[source] = Counter()
+        self.blocked_cells[source] = set()
         if self.segment == source:
             self.segment, self.pos = target, (self.pos[0] + dx, self.pos[1] + dy)
         self.stats["merged"] += 1
@@ -789,6 +850,8 @@ class GlobalMap(StrategistArtifact):
             self.merged_into[si] = (target_seg, (dx, dy))
             self.segments[si] = {}
             self.visits[si] = Counter()
+            if si < len(self.blocked_cells):
+                self.blocked_cells[si] = set()
             self.stats["transient_pruned"] += 1
             changed += 1
         return changed
@@ -1002,8 +1065,20 @@ class GlobalMap(StrategistArtifact):
                         continue
                 cleaned_patterns.add(pattern)
             self.walk_patterns = cleaned_patterns
+        while len(self.blocked_cells) < len(self.segments):
+            self.blocked_cells.append(set())
         changed = 0
         for si, seg in enumerate(self.segments):
+            if not seg:
+                continue
+            seg_blocked = self.blocked_cells[si]
+            if self.info(si).kind == OUTDOORS:
+                for g in list(seg):
+                    c = seg[g]
+                    if c.pixels is not None and int(c.pixels.min()) == int(c.pixels.max()):
+                        del seg[g]
+                        seg_blocked.discard(g)
+                        changed += 1
             quarter_tags: Dict[Cell, Dict[str, str]] = {}
             quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
             for g, c in seg.items():
@@ -1036,6 +1111,8 @@ class GlobalMap(StrategistArtifact):
                 else:
                     new_tags = tuple(sorted(set(quarter_tags[g].values())))
                     new_kind = self._classify(new_tags, c.hashes)
+                if g in seg_blocked and new_kind == WALKABLE and not bool(set(new_tags) & DOOR_TAGS):
+                    new_kind = BLOCKED
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1

@@ -165,19 +165,31 @@ MAX_DOOR_LINES = 8
 
 
 def door_lines(gmap: GlobalMap) -> List[str]:
+    from .routes import _snap, compress_moves, path_in_segment, walked_squares
+
     px, py = gmap.pos
+    walked = walked_squares(gmap, gmap.segment)
     doors = []
     for door in gmap.door_list():
-        dx, dy = min(((g[0] - px, g[1] - py) for g in door["cells"]), key=lambda d: abs(d[0]) + abs(d[1]))
-        doors.append((abs(dx) + abs(dy), dx, dy, door["leads_to"]))
+        leads_to = door["leads_to"]
+        if leads_to is not None and gmap.resolve(leads_to, (0, 0))[0] == gmap.segment:
+            continue
+        goal_cell = min(door["cells"], key=lambda g: abs(g[0] - px) + abs(g[1] - py))
+        dx, dy = goal_cell[0] - px, goal_cell[1] - py
+        snapped = _snap(gmap, gmap.segment, goal_cell, walked)
+        found = path_in_segment(gmap, gmap.segment, (px, py), snapped, walked) if snapped is not None else None
+        path_moves = compress_moves(found[1]) if (found is not None and found[1]) else None
+        path_steps = len(found[1]) if found is not None else None
+        doors.append((abs(dx) + abs(dy), dx, dy, leads_to, path_steps, path_moves))
     if not doors:
         return []
     lines = ["Doors and stairs in this area (x = steps to the right, y = steps up, measured from you):"]
-    for steps, dx, dy, leads_to in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
+    for steps, dx, dy, leads_to, path_steps, path_moves in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
         behind = (f"leads to {gmap.area_label(leads_to)}"
                   + (", fully explored" if gmap.info(leads_to).explored is not None else "")
                   if leads_to is not None else "NOT entered yet")
-        lines.append(f"- ({dx}, {dy}), {steps} steps {sector(dx, dy) if steps else 'here'}: {behind}")
+        route_suffix = f" (mapped route, {path_steps} moves: {path_moves})" if path_moves else ""
+        lines.append(f"- ({dx}, {dy}), {steps} steps {sector(dx, dy) if steps else 'here'}: {behind}{route_suffix}")
     return lines
 
 
