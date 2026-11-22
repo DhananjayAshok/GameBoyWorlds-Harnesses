@@ -5,9 +5,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from execution.game_api import AgentState, WaitAction
 
 from execution.executors import Executor
-from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_menu_cursor,
-                                                 has_modal_preview_box, has_top_dialogue_box,
-                                                 is_cutscene_frame_changing)
+from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_emote_bubble,
+                                                 has_menu_cursor, has_modal_preview_box,
+                                                 has_top_dialogue_box, is_cutscene_frame_changing)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      cell_kinds, compress_path, edge_cells, edge_runs,
                                                      format_path_runs, parse_edge_direction, shortest_path,
@@ -897,7 +897,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
         if cur_step is not None and cur_step == self._last_settled_step and self._agent_state() == AgentState.FREE_ROAM:
             before = self._current_frame()
-            if not (has_bottom_dialogue_box(before) or (has_top_dialogue_box(before) and not has_menu_cursor(before))):
+            if not (has_bottom_dialogue_box(before)
+                    or has_emote_bubble(before)
+                    or (has_top_dialogue_box(before) and not has_menu_cursor(before))):
                 return
         waited = 0
         post_motion_remaining = 0
@@ -905,7 +907,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                and not self._env_done()
                and waited < max_cutscene_ticks):
             before = self._current_frame()
-            box_open = has_bottom_dialogue_box(before) or (has_top_dialogue_box(before) and not has_menu_cursor(before))
+            box_open = (has_bottom_dialogue_box(before)
+                        or has_emote_bubble(before)
+                        or (has_top_dialogue_box(before) and not has_menu_cursor(before)))
             if waited >= ticks and not box_open and post_motion_remaining <= 0:
                 break
             self._env.step_high_level_action(WaitAction)
@@ -915,6 +919,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             after = self._current_frame()
             if (is_cutscene_frame_changing(before, after)
                     or has_bottom_dialogue_box(after)
+                    or has_emote_bubble(after)
                     or (has_top_dialogue_box(after) and not has_menu_cursor(after))):
                 post_motion_remaining = post_motion_ticks
             elif post_motion_remaining > 0:

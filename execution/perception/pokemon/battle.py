@@ -309,6 +309,39 @@ def has_modal_preview_box(frame: np.ndarray) -> bool:
     return bool(find_modal_preview_boxes(frame))
 
 
+def has_emote_bubble(frame: np.ndarray) -> bool:
+    """Return True if an overworld speech/exclamation ('!') emote bubble is drawn above a sprite."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    h, w = img.shape[:2]
+    if h < 120 or w < 160:
+        return False
+    max_y = min(h - 9, 96)
+    dark = img < DARK_INK
+    light = img >= LIGHT_BACKGROUND
+    for x0 in range(0, w - 15, 4):
+        bot_rows = dark[8:max_y + 8, x0 + 3:x0 + 13].all(axis=1)
+        for y_core in np.flatnonzero(bot_rows):
+            y_core = int(y_core)
+            y_bot = y_core + 8
+            if not (dark[y_core:y_core + 7, x0 + 1].all() and dark[y_core:y_core + 7, x0 + 14].all()):
+                continue
+            if not (dark[y_bot - 1, x0 + 2] and dark[y_bot - 1, x0 + 13] and light[y_bot - 1, x0 + 3:x0 + 13].all()):
+                continue
+            if float(light[y_core:y_core + 7, x0 + 2:x0 + 7].mean()) < 0.85:
+                continue
+            if float(light[y_core:y_core + 7, x0 + 9:x0 + 14].mean()) < 0.85:
+                continue
+            if not (int(dark[y_core:y_core + 7, x0 + 6:x0 + 10].sum()) >= 6
+                    and int(light[y_core:y_core + 7, x0 + 6:x0 + 10].sum()) >= 6):
+                continue
+            if y_core >= 3 and not dark[y_core - 3, x0 + 3:x0 + 13].all():
+                continue
+            return True
+    return False
+
+
 TOP_BOX_TOP = 0
 TOP_BOX_INNER_TOP = 8
 TOP_BOX_INNER_BOTTOM = 24

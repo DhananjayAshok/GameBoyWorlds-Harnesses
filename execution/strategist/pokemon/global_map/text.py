@@ -300,6 +300,33 @@ def _obstacle_detour_edge(
     return info.get("leave_edge") if info is not None else None
 
 
+def _unentered_door_cues(gmap: GlobalMap, door_cells: List[Cell]) -> str:
+    seg = gmap.current
+    if not seg:
+        return ""
+    px, py = gmap.pos
+    sign_cells = set()
+    unmapped_above = False
+    for dc in door_cells:
+        if seg.get((dc[0], dc[1] + 1)) is None:
+            unmapped_above = True
+        for ox in range(-3, 4):
+            for oy in range(-1, 2):
+                if (ox, oy) == (0, 0):
+                    continue
+                nb = (dc[0] + ox, dc[1] + oy)
+                c = seg.get(nb)
+                if c is not None and "sign" in c.tags:
+                    sign_cells.add(nb)
+    cues = []
+    if sign_cells:
+        nearest = min(sign_cells, key=lambda s: abs(s[0] - px) + abs(s[1] - py))
+        cues.append(f"adjacent signpost at ({nearest[0] - px}, {nearest[1] - py})")
+    if unmapped_above:
+        cues.append("upper roof/facade above doorway not yet seen")
+    return ("; " + "; ".join(cues)) if cues else ""
+
+
 def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -> List[str]:
     from execution.perception.pokemon.navigation import approach_cells, in_bounds, shortest_path
     from .routes import _snap, compress_moves, path_in_segment, walked_squares
@@ -328,14 +355,15 @@ def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -
             if (path_moves is None or on_screen_blocked)
             else None
         )
-        doors.append((abs(dx) + abs(dy), dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_info))
+        cues = _unentered_door_cues(gmap, door["cells"]) if leads_to is None else ""
+        doors.append((abs(dx) + abs(dy), dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_info, cues))
     if not doors:
         return []
     lines = ["Doors and stairs in this area (x = steps to the right, y = steps up, measured from you):"]
-    for steps, dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_info in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
+    for steps, dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_info, cues in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
         behind = (f"leads to {gmap.area_label(leads_to)}"
                   + (", fully explored" if gmap.info(leads_to).explored is not None else "")
-                  if leads_to is not None else "NOT entered yet")
+                  if leads_to is not None else f"NOT entered yet{cues}")
         if path_moves:
             if on_screen_blocked:
                 route_suffix = f" (separated by obstacle barrier on current screen — must route off screen first; mapped route, {path_steps} moves: {path_moves})"
