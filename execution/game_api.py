@@ -65,7 +65,7 @@ except ImportError:
         pass
 
     class OpenMenuAction(HighLevelAction):
-        pass
+        options = ("pokedex", "pokemon", "bag", "trainer")
 
     class StateParser:
         @staticmethod
