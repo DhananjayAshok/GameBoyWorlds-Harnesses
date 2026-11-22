@@ -100,7 +100,13 @@ def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
                      "(x = steps to the right, y = steps up, measured from you):")
         for t in targets:
             where = "on screen, reachable" if t["on_screen"] else "off screen"
-            lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({where})")
+            if t.get("path_moves"):
+                route_note = f"{where}; mapped route ({t['path_steps']} moves): {t['path_moves']}"
+            elif t.get("path_steps") is None:
+                route_note = f"{where}; no direct mapped path yet"
+            else:
+                route_note = where
+            lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({route_note})")
         lines.append("Most unexplored edge lies: " +
                      ", ".join(f"{s} ({n} squares)" for s, n in mass.most_common(3)) + ".")
     else:

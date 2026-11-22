@@ -45,12 +45,63 @@ def sector(dx: int, dy: int) -> str:
     return SECTORS[int(round(math.atan2(dy, dx) / (math.pi / 4))) % 8]
 
 
+def _mapped_paths_from_start(gmap: GlobalMap) -> Dict[Cell, Optional[Tuple[Cell, str, str]]]:
+    import heapq
+    from .model import DIRECTIONS
+    from .routes import STEP_COSTS
+
+    seg = gmap.current
+    start = gmap.pos
+    best: Dict[Cell, int] = {start: 0}
+    previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
+    heap = [(0, start)]
+    while heap:
+        cost, cell = heapq.heappop(heap)
+        if cost > best[cell]:
+            continue
+        for direction, (dx, dy) in DIRECTIONS.items():
+            nxt, move = (cell[0] + dx, cell[1] + dy), "walk"
+            c = seg.get(nxt)
+            if c is None:
+                continue
+            if (c.kind == LEDGE and direction == "down") or (c.kind == LEDGE_LEFT and direction == "left"):
+                nxt, move, step = (nxt[0] + dx, nxt[1] + dy), "jump", 2
+                landing = seg.get(nxt)
+                if landing is None or landing.kind not in STEP_COSTS:
+                    continue
+            elif c.kind in STEP_COSTS:
+                step = STEP_COSTS[c.kind]
+            else:
+                continue
+            if cost + step < best.get(nxt, cost + step + 1):
+                best[nxt], previous[nxt] = cost + step, (cell, direction, move)
+                heapq.heappush(heap, (cost + step, nxt))
+    return previous
+
+
+def _reconstruct_moves(
+    previous: Dict[Cell, Optional[Tuple[Cell, str, str]]],
+    goal: Cell,
+) -> Optional[List[Tuple[str, str]]]:
+    if goal not in previous:
+        return None
+    moves: List[Tuple[str, str]] = []
+    cell = goal
+    while previous[cell] is not None:
+        parent, direction, move = previous[cell]
+        moves.append((direction, move))
+        cell = parent
+    return moves[::-1]
+
+
 def frontier_targets(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None,
                      limit: int = 8) -> Tuple[List[Dict[str, Any]], Counter]:
     # dx, dy are relative to the player: x right, y up
     from execution.perception.pokemon.navigation import shortest_path, in_bounds
+    from .routes import compress_moves
 
     px, py = gmap.pos
+    previous = _mapped_paths_from_start(gmap)
     mass: Counter = Counter()
     nearest: Dict[str, Dict[str, Any]] = {}
     for g in gmap.frontier():
@@ -60,11 +111,29 @@ def frontier_targets(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = N
         on_screen = local_kinds is not None and in_bounds((dx, dy))
         if on_screen and shortest_path(local_kinds, (0, 0), [(dx, dy)]) is None:
             continue
-        t = {"dx": dx, "dy": dy, "steps": abs(dx) + abs(dy), "sector": sector(dx, dy), "on_screen": on_screen}
+        moves = _reconstruct_moves(previous, g)
+        t = {
+            "dx": dx,
+            "dy": dy,
+            "steps": abs(dx) + abs(dy),
+            "sector": sector(dx, dy),
+            "on_screen": on_screen,
+            "path_steps": len(moves) if moves is not None else None,
+            "path_moves": compress_moves(moves) if moves else None,
+        }
         mass[t["sector"]] += 1
-        if t["sector"] not in nearest or t["steps"] < nearest[t["sector"]]["steps"]:
+        cur = nearest.get(t["sector"])
+        if cur is None:
             nearest[t["sector"]] = t
-    out = sorted(nearest.values(), key=lambda t: t["steps"])
+        else:
+            t_key = (t["path_steps"] is None, t["path_steps"] or t["steps"], t["steps"])
+            cur_key = (cur["path_steps"] is None, cur["path_steps"] or cur["steps"], cur["steps"])
+            if t_key < cur_key:
+                nearest[t["sector"]] = t
+    out = sorted(
+        nearest.values(),
+        key=lambda t: (t["path_steps"] is None, t["path_steps"] or t["steps"], t["steps"]),
+    )
     return out[:limit], mass
 
 

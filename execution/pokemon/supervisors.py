@@ -9,8 +9,9 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_me
                                                  has_modal_preview_box, has_top_dialogue_box,
                                                  is_cutscene_frame_changing)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
-                                                     cell_kinds, compress_path, edge_cells,
-                                                     format_path_runs, shortest_path, verbalize_edges)
+                                                     cell_kinds, compress_path, edge_cells, edge_runs,
+                                                     format_path_runs, parse_edge_direction, shortest_path,
+                                                     verbalize_edges)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
                                          InteractionExecutor, MenuExecutor,
@@ -122,6 +123,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._max_total_calls = max(self.MAX_TOTAL_EXECUTOR_CALLS, max_steps * 3)
         self._start_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self._leg_stops: List[Tuple[int, Tuple[int, int]]] = []
+        self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {}
         self.last_executor = None
         self.plan: List[str] = []
         super().__init__(task=task, executor_class=None, env=env, game=game,
@@ -180,10 +182,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._leg_stops.append(place)
         return place
 
-    def _edge_pocket_note(self, direction: str, local_edge_cells: List[Tuple[int, int]]) -> Optional[str]:
+    def _run_pocket_bounds(
+        self,
+        direction: str,
+        run_cells: List[Tuple[int, int]],
+    ) -> Optional[Tuple[set, set]]:
         gmap = self._global_map()
         place = self._current_map_place()
-        if gmap is None or place is None or not local_edge_cells:
+        if gmap is None or place is None or not run_cells:
             return None
         seg = gmap.current
         px, py = place[1]
@@ -212,7 +218,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return g[0] > gx_max
 
         seeds = []
-        for lx, ly in local_edge_cells:
+        for lx, ly in run_cells:
             eg = (px + lx, py + ly)
             c = seg.get(eg)
             if c is None or c.kind == UNKNOWN or is_door(c):
@@ -225,6 +231,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         visited = set(seeds)
         queue = deque(seeds)
         beyond_cells = set()
+        half_plane_open = False
 
         while queue:
             cur = queue.popleft()
@@ -232,57 +239,116 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 beyond_cells.add(cur)
             c = seg.get(cur)
             if c is not None and is_door(c):
-                return None
-            for d, (nx_d, ny_d) in DIRECTIONS.items():
+                half_plane_open = True
+                break
+            for _, (nx_d, ny_d) in DIRECTIONS.items():
                 nxt = (cur[0] + nx_d, cur[1] + ny_d)
                 if in_screen(nxt):
                     if nxt not in seeds:
                         continue
                 if not in_half_plane(nxt):
                     nc = seg.get(nxt)
-                    if (
-                        nc is None
-                        or nc.kind in (WALKABLE, UNKNOWN)
-                        or (nc.kind == LEDGE and d == "down")
-                        or (nc.kind == LEDGE_LEFT and d == "left")
-                    ):
-                        return None
+                    if nc is None or nc.kind in (WALKABLE, UNKNOWN) or is_door(nc):
+                        half_plane_open = True
+                        break
                     continue
                 nc = seg.get(nxt)
                 if nc is None or nc.kind == UNKNOWN or is_door(nc):
-                    return None
-                if nc.kind == WALKABLE:
-                    landing = nxt
-                elif (nc.kind == LEDGE and d == "down") or (nc.kind == LEDGE_LEFT and d == "left"):
-                    landing = (nxt[0] + nx_d, nxt[1] + ny_d)
-                    if in_screen(landing) and landing not in seeds:
-                        continue
-                    if not in_half_plane(landing):
-                        return None
-                    lc = seg.get(landing)
-                    if lc is None or lc.kind == UNKNOWN or is_door(lc):
-                        return None
-                    if lc.kind != WALKABLE:
-                        continue
-                else:
-                    continue
-                if landing not in visited:
-                    visited.add(landing)
-                    queue.append(landing)
+                    half_plane_open = True
+                    break
+                if nc.kind == WALKABLE and nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+                    if len(visited) > 60:
+                        half_plane_open = True
+                        break
+            if half_plane_open:
+                break
+        if not half_plane_open:
+            return visited, beyond_cells
 
-        xs = [c[0] - px for c in visited]
-        ys = [c[1] - py for c in visited]
-        return (f" [mapped closed dead-end pocket beyond {direction} edge: "
-                f"{len(beyond_cells)} off-screen walkable tile(s), relative x in [{min(xs)}, {max(xs)}], "
-                f"y in [{min(ys)}, {max(ys)}], no unexplored tiles or doors]")
+        for min_offset in (1, 2):
+            def in_forward_offset(g: Tuple[int, int], off: int = min_offset) -> bool:
+                if direction == "up":
+                    return g[1] >= py + off
+                if direction == "down":
+                    return g[1] <= py - off
+                if direction == "left":
+                    return g[0] <= px - off
+                return g[0] >= px + off
+
+            visited2 = set(seeds)
+            queue2 = deque(seeds)
+            beyond2 = set()
+            open2 = False
+            while queue2:
+                cur = queue2.popleft()
+                if strictly_beyond(cur):
+                    beyond2.add(cur)
+                c = seg.get(cur)
+                if c is not None and is_door(c):
+                    open2 = True
+                    break
+                for _, (nx_d, ny_d) in DIRECTIONS.items():
+                    nxt = (cur[0] + nx_d, cur[1] + ny_d)
+                    if not in_forward_offset(nxt):
+                        continue
+                    nc = seg.get(nxt)
+                    if nc is None or nc.kind == UNKNOWN or is_door(nc):
+                        open2 = True
+                        break
+                    if nc.kind == WALKABLE and nxt not in visited2:
+                        visited2.add(nxt)
+                        queue2.append(nxt)
+                        if len(visited2) > 25:
+                            open2 = True
+                            break
+                if open2:
+                    break
+            if not open2:
+                return visited2, beyond2
+        return None
+
+    def _edge_pocket_note(self, direction: str, local_edge_cells: List[Tuple[int, int]]) -> Optional[str]:
+        place = self._current_map_place()
+        if place is None or not local_edge_cells:
+            return None
+        px, py = place[1]
+        runs = edge_runs(local_edge_cells, direction)
+        closed_runs = []
+        open_runs = []
+        visited_all: set = set()
+        beyond_all: set = set()
+        for r in runs:
+            bounds = self._run_pocket_bounds(direction, r)
+            if bounds is not None:
+                closed_runs.append(r)
+                visited_all |= bounds[0]
+                beyond_all |= bounds[1]
+            else:
+                open_runs.append(r)
+        if not closed_runs:
+            return None
+        xs = [c[0] - px for c in visited_all]
+        ys = [c[1] - py for c in visited_all]
+        if not open_runs:
+            return (f" [mapped closed dead-end pocket beyond {direction} edge: "
+                    f"{len(beyond_all)} off-screen walkable tile(s), relative x in [{min(xs)}, {max(xs)}], "
+                    f"y in [{min(ys)}, {max(ys)}], no unexplored tiles or doors]")
+        closed_cells = [c for r in closed_runs for c in r]
+        closed_str = ", ".join(f"({x}, {y})" for x, y in closed_cells)
+        return (f" [dead-end alcove at {closed_str}: leads into a mapped closed pocket "
+                f"(relative x in [{min(xs)}, {max(xs)}], y in [{min(ys)}, {max(ys)}], no unexplored tiles or doors)]")
 
     def _describe_edges(self, kinds: Dict[Tuple[int, int], str]) -> str:
         lines = []
         for direction in DIRECTIONS:
             cells = edge_cells(kinds, direction)
             if cells:
+                runs = edge_runs(cells, direction)
+                open_cells = [c for r in runs if self._run_pocket_bounds(direction, r) is None for c in r]
                 listed = ", ".join(f"({x}, {y})" for x, y in cells)
-                path = shortest_path(kinds, (0, 0), cells)
+                path = shortest_path(kinds, (0, 0), open_cells or cells)
                 if path:
                     target = path[-1][2]
                     runs_text = format_path_runs(compress_path(path))
@@ -337,12 +403,28 @@ class PokemonPlayThroughSupervisor(Supervisor):
         )
         lines.append(ascii_window(gmap))
         lines.append("Legend: " + LEGEND)
+        blocked_lines = []
+        for (b_seg, b_pos), by_dir in self._blocked_moves.items():
+            r_seg, r_pos = gmap.resolve(b_seg, b_pos)
+            if r_seg == cur_seg:
+                here_tag = " [HERE]" if r_pos == cur_pos else ""
+                dir_summaries = [f"{d} ({'; '.join(notes[-2:])})" for d, notes in by_dir.items()]
+                blocked_lines.append(f"- at {r_pos}{here_tag}: blocked moving {', '.join(dir_summaries)}")
+        if blocked_lines:
+            lines.append("Blocked movement directions recorded in this area during this episode (do NOT repeat these from the same coordinate):")
+            lines.extend(blocked_lines)
         targets, _ = frontier_targets(gmap, local_kinds)
         if targets:
             lines.append("Nearest unexplored map edges in this area (x = steps right, y = steps up from the player):")
             for t in targets[:6]:
                 where = "on screen, reachable" if t["on_screen"] else "off screen"
-                lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({where})")
+                if t.get("path_moves"):
+                    route_note = f"{where}; mapped route ({t['path_steps']} moves): {t['path_moves']}"
+                elif t.get("path_steps") is None:
+                    route_note = f"{where}; no direct mapped path yet"
+                else:
+                    route_note = where
+                lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({route_note})")
         return PLAYTHROUGH_AREA_MAP_BLOCK.replace("[AREA_MAP]", "\n".join(lines))
 
     def _format_leg_movement(
@@ -981,6 +1063,23 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 continue
 
             if not result["succeeded"]:
+                if result["reason"] in ("move_blocked", "out_of_steps"):
+                    move_dir = parse_edge_direction(task) if action == "MoveOff" else None
+                    if move_dir is None and result.get("notes"):
+                        m_dir = re.search(r"Blocked.*moving\s+(up|down|left|right)", str(result.get("notes")), re.IGNORECASE)
+                        if m_dir:
+                            move_dir = m_dir.group(1).lower()
+                    if move_dir is None and action == "Free":
+                        m_dir = re.search(r"\b(up|down|left|right|north|south|west|east)\b", task, re.IGNORECASE)
+                        if m_dir:
+                            aliases = {"north": "up", "south": "down", "west": "left", "east": "right"}
+                            move_dir = aliases.get(m_dir.group(1).lower(), m_dir.group(1).lower())
+                    if move_dir:
+                         detail = f"{request} -> {result['reason']}"
+                         for place_key in {p for p in (before_place, after_place) if p is not None}:
+                             dir_list = self._blocked_moves.setdefault(place_key, {}).setdefault(move_dir, [])
+                             if detail not in dir_list:
+                                 dir_list.append(detail)
                 note = f"{request} did not work: {result['reason']}" + (
                     f" ({result['notes']})" if result.get("notes") else "")
                 if move_tag:
