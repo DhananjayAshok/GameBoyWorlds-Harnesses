@@ -298,6 +298,7 @@ class GridMoveExecutor(PolicyExecutor):
         self.people_fn = people_fn
         self.target_cell: Optional[Tuple[int, int]] = None
         self.plan: Optional[List[Tuple[str, int, str]]] = None
+        self.dialogue_crops: List[Any] = []
         self._n_moves = 0
         self._steps_taken = 0
         self._displacement: Tuple[int, int] = (0, 0)
@@ -383,6 +384,7 @@ class GridMoveExecutor(PolicyExecutor):
             if waited >= MOVE_SETTLE_WAIT and not box_open and post_motion_remaining <= 0:
                 break
             wait_record = self._take_action(WaitAction)
+            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
             waited += 1
             state = self._get_state()["pokemon_core"]["agent_state"]
             if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
@@ -410,6 +412,7 @@ class GridMoveExecutor(PolicyExecutor):
             return None
         before_place = self._current_map_place()
         record = self._take_action(LowLevelAction, low_level_action=arrow)
+        drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
         if self._last_terminated:
             return self._fail(MOVE_TERMINATED, "terminated")
         if self._last_truncated:
@@ -453,6 +456,7 @@ class GridMoveExecutor(PolicyExecutor):
             self._n_moves += 1
             before_place = self._current_map_place()
             record = self._take_action(MoveStepsAction, direction=direction, steps=remaining)
+            drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
             if self._last_terminated:
                 return self._fail(MOVE_TERMINATED, "terminated")
             if self._last_truncated:
@@ -1672,8 +1676,8 @@ class _DialogueSettlingExecutor(PolicyExecutor):
 
 
 class DialogueExecutor(_DialogueSettlingExecutor):
-    def __init__(self, env, task, max_steps: int = 10, **kwargs):
-        self.dialogue_crops: List[Any] = []
+    def __init__(self, env, task, max_steps: int = 10, initial_dialogue_crops: Optional[List[Any]] = None, **kwargs):
+        self.dialogue_crops: List[Any] = list(initial_dialogue_crops) if initial_dialogue_crops else []
         self.dialogue_text: str = ""
         super().__init__(env, task, max_steps, **kwargs)
 
