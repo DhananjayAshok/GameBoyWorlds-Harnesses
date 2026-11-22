@@ -803,11 +803,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
             earlier["notes"] = "\n".join(filter(None, [earlier.get("notes"), later.get("notes")]))
         return earlier
 
-    def _handle_interruption(self, *, dialogue_task: str = "clear the dialogue that interrupted what the player was doing",
-                             initial_dialogue_crops: Optional[List[Any]] = None) -> Tuple[str, Dict[str, Any]]:
+    def _handle_interruption(self, *, dialogue_task: str = "clear the dialogue that interrupted what the player was doing") -> Tuple[str, Dict[str, Any]]:
         states_seen: List[str] = []
         combined: Optional[Dict[str, Any]] = None
-        pending_crops = list(initial_dialogue_crops) if initial_dialogue_crops else None
         for step_idx in range(self.MAX_INTERRUPTION_CHAIN):
             if self._env_done() or self._battles_lost() or self._total_calls >= self._max_total_calls:
                 break
@@ -820,9 +818,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 states_seen.append(state_label)
             if state == AgentState.IN_DIALOGUE:
                 task = dialogue_task if step_idx == 0 else "clear the dialogue that followed"
-                handled = self.call_executor("dialogue", task, counted=False,
-                                             initial_dialogue_crops=pending_crops)
-                pending_crops = None
+                handled = self.call_executor("dialogue", task, counted=False)
             elif state == AgentState.IN_BATTLE:
                 handled = self._combat(self._battle_instructions(frame), counted=False)
             elif state == AgentState.IN_MENU:
@@ -1035,8 +1031,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if not result["succeeded"] and (self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue()):
                 if is_move_action and self._calls > 0:
                     self._calls -= 1
-                seed_crops = getattr(self.last_executor, "dialogue_crops", None) if is_move_action else None
-                state, handled = self._handle_interruption(initial_dialogue_crops=seed_crops)
+                state, handled = self._handle_interruption()
                 handled["report"].initial_state = result["report"].initial_state
                 after_place = self._record_map_stop()
                 move_tag = self._format_leg_movement(

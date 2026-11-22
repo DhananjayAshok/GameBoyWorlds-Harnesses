@@ -354,9 +354,7 @@ class GlobalMap(StrategistArtifact):
         quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
         if shift == (0, 0):
             for (ix, iy, iq), tile in (identified or {}).items():
-                quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(
-                    tile.tag, tile.description, getattr(tile, "image", None)
-                )
+                quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(tile.tag, tile.description)
                 quarter_descriptions.setdefault((ix, iy), {})[iq] = tile.description
         top_overhang_cells = {
             cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
@@ -410,11 +408,7 @@ class GlobalMap(StrategistArtifact):
                 kind = LEDGE_LEFT
             else:
                 tags = tuple(sorted({
-                    normalize_tabletop_tag(
-                        identified[(x, y, q)].tag,
-                        identified[(x, y, q)].description,
-                        getattr(identified[(x, y, q)], "image", None),
-                    )
+                    normalize_tabletop_tag(identified[(x, y, q)].tag, identified[(x, y, q)].description)
                     for q in QUARTERS if (x, y, q) in identified
                 }))
                 kind = BLOCKED if (x, y) in east_cliff_cells else self._classify(tags, hashes)
@@ -1003,7 +997,7 @@ class GlobalMap(StrategistArtifact):
             for pattern in self.walk_patterns:
                 tiles = [tile_lookup.get(h) for h in pattern]
                 if all(t is not None for t in tiles):
-                    qtags = {normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None)) for t in tiles}
+                    qtags = {normalize_tabletop_tag(t.tag, t.description) for t in tiles}
                     if not self._can_learn_walkable(qtags):
                         continue
                 cleaned_patterns.add(pattern)
@@ -1016,8 +1010,7 @@ class GlobalMap(StrategistArtifact):
                 tiles = [tile_lookup.get(h) for h in c.hashes]
                 if all(t is not None for t in tiles):
                     quarter_tags[g] = {
-                        q: normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None))
-                        for q, t in zip(QUARTERS, tiles)
+                        q: normalize_tabletop_tag(t.tag, t.description) for q, t in zip(QUARTERS, tiles)
                     }
                     quarter_descriptions[g] = {
                         q: t.description for q, t in zip(QUARTERS, tiles)
@@ -1046,9 +1039,6 @@ class GlobalMap(StrategistArtifact):
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1
-        if self.seen_entrances is not None:
-            valid = self.entrances()
-            self.seen_entrances = {key for key in self.seen_entrances if self.resolve(*key) in valid}
         return changed
 
     @update
