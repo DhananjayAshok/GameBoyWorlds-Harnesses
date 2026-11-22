@@ -23,8 +23,8 @@ Classify what is in the outlined cell into exactly one of these categories:
 - Interactable Object: an object the player can interact with (machines, computers, bookshelves, or an object such as a Poke Ball, book, or item resting on a table, desk, or counter)
 - Item: an item lying on the ground that the player can pick up. An item on the ground always looks like a Poke Ball
 - NPC: a non-player character
-- Sign: a freestanding wooden signpost or wall plaque/notice the player can read (never a flat horizontal-bar step tile interrupting a ledge row on the ground)
-- Staircase: stairs, a ladder, or a hole in the floor that takes the player up or down to another floor or level
+- Sign: a freestanding wooden signpost or wall plaque/notice the player can read (never a flat horizontal-bar step tile interrupting a ledge row on the ground, and never a square indoor floor ladder with horizontal rungs set into a wooden or tiled floor)
+- Staircase: stairs, an indoor floor ladder (a square ladder frame with horizontal rungs set into the floor of a building, tower, or cave), or a hole in the floor that takes the player up or down to another floor or level
 - Elevator: an elevator, or the panel or floor of an elevator, that moves the player between floors
 - Special Ground Tile: a tile the player can walk on that may move them around, such as arrow or spinner tiles that push the player, ice floors the player slides across, or teleportation pads
 - Unknown: none of the above, or you cannot tell

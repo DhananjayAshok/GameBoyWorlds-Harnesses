@@ -83,15 +83,36 @@ WALKABLE_GROUND_OVERRIDE_PATTERN = re.compile(
     r"^(?:boundary\s+hedge|hedge\s+border|roadside\s+sign)$",
     re.IGNORECASE,
 )
+INDOOR_LADDER_SIGN_DESC_PATTERN = re.compile(
+    r"^(?:wooden\s+sign(?:post)?|freestanding\s+sign(?:post)?|signpost)$",
+    re.IGNORECASE,
+)
 
 
 def is_solid_shade_piece(image: Optional[np.ndarray]) -> bool:
     return image is not None and image.size > 0 and int(image.min()) == int(image.max())
 
 
+def is_indoor_floor_ladder_quarter(
+    tag: str, description: Optional[str], image: Optional[np.ndarray] = None
+) -> bool:
+    if tag != "sign" or not description or image is None or image.size == 0:
+        return False
+    if not INDOOR_LADDER_SIGN_DESC_PATTERN.search(description.strip()):
+        return False
+    arr = np.squeeze(np.asarray(image))
+    if arr.shape != (8, 8):
+        return False
+    if int(arr.min()) < 56 or int(arr.max()) > 216:
+        return False
+    return not bool(np.any((arr > 60) & (arr < 150)))
+
+
 def normalize_tabletop_tag(tag: str, description: Optional[str], image: Optional[np.ndarray] = None) -> str:
     if tag in WARP_QUARTER_TAGS and is_solid_shade_piece(image):
         return "ground"
+    if is_indoor_floor_ladder_quarter(tag, description, image):
+        return "staircase"
     if description:
         stripped = description.strip()
         if tag == "obstacle" and TABLETOP_OBJECT_PATTERN.search(stripped):
@@ -471,11 +492,17 @@ class TileRecognizer(StrategistArtifact):
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
         for tile in getattr(self, "tiles", ()):
-            tile.tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
+            new_tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
+            if tile.tag == "sign" and new_tag == "staircase":
+                tile.description = "indoor floor ladder"
+            tile.tag = new_tag
 
     @update
     def _add_tiles(self, tiles: List[Tile]) -> None:
         for tile in tiles:
-            tile.tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
+            new_tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
+            if tile.tag == "sign" and new_tag == "staircase":
+                tile.description = "indoor floor ladder"
+            tile.tag = new_tag
             self.tiles.append(tile)
             self._by_hash[tile.hash] = tile

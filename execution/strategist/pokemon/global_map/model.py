@@ -711,6 +711,7 @@ class GlobalMap(StrategistArtifact):
         seg, shift = self.segments[self.segment], tuple((-r) % GRID_SKIP for r in self.residual)
         a = _screen(frame)
         cells_by_xy = dict(_local_cells(a, shift))
+        half = GRID_SKIP // 2
         top_black = sum(1 for x in range(-4, 6) if (x, 4) in cells_by_xy and cells_by_xy[(x, 4)].max() <= BLACK_LEVEL)
         bot_black = sum(1 for x in range(-4, 6) if (x, -4) in cells_by_xy and cells_by_xy[(x, -4)].max() <= BLACK_LEVEL)
         left_black = sum(1 for y in range(-4, 5) if (-4, y) in cells_by_xy and cells_by_xy[(-4, y)].max() <= BLACK_LEVEL)
@@ -722,8 +723,12 @@ class GlobalMap(StrategistArtifact):
             for dy in (-2, -1, 0, 1, 2):
                 same = changed = b = w = d = c = 0
                 for (x, y), piece in cells_by_xy.items():
+                    if (x, y) == (0, 0):
+                        continue
                     old = seg.get((self.pos[0] + dx + x, self.pos[1] + dy + y))
-                    if old is None or old.pixels is None or (x, y) == (0, 0):
+                    if old is None or old.pixels is None:
+                        if int(piece.max()) > BLACK_LEVEL:
+                            changed += 1
                         continue
                     new, prior = piece.astype(int), np.squeeze(old.pixels).astype(int)
                     lit = _still_lit(new, prior)
@@ -737,9 +742,16 @@ class GlobalMap(StrategistArtifact):
                     new_span = int(new.max()) - int(new.min())
                     if old_span >= 24 and new_span <= old_span - 16:
                         c += 1
-                    if not lit.any():
+                    lit_quarters = [
+                        (slice(qy, qy + half), slice(qx, qx + half))
+                        for qy in (0, half)
+                        for qx in (0, half)
+                        if new[qy:qy + half, qx:qx + half].max() > BLACK_LEVEL
+                        and prior[qy:qy + half, qx:qx + half].max() > BLACK_LEVEL
+                    ]
+                    if not lit_quarters:
                         continue
-                    if np.mean(np.abs(new - prior)[lit] > BLACK_LEVEL) < WIPE_CELL_CHANGE:
+                    if all(np.mean(new[q] != prior[q]) < WIPE_CELL_CHANGE for q in lit_quarters):
                         same += 1
                     else:
                         changed += 1
@@ -966,10 +978,14 @@ class GlobalMap(StrategistArtifact):
         return changed
 
     def overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
+        def is_uniform(c: MapCell) -> bool:
+            return c.pixels is not None and int(c.pixels.min()) == int(c.pixels.max())
+
         def content(seg):
-            return {g: c for g, c in seg.items()
-                    if c.kind != OCCUPIED and not (c.pixels is not None and c.pixels.min() == c.pixels.max())}
-        src, dst = content(self.segments[source]), content(self.segments[target])
+            return {g: c for g, c in seg.items() if c.kind != OCCUPIED and not is_uniform(c)}
+
+        seg_src, seg_dst = self.segments[source], self.segments[target]
+        src, dst = content(seg_src), content(seg_dst)
         index: Dict[Tuple[Optional[str], ...], List[Cell]] = defaultdict(list)
         for g, c in dst.items():
             index[c.hashes].append(g)
@@ -978,10 +994,22 @@ class GlobalMap(StrategistArtifact):
         votes = self._collect_offset_votes(src_hashes, index, block_index)
         if not votes:
             return None
+
         def agreement(offset: Cell) -> Tuple[int, int]:
-            shared = [(c, dst[(g[0] + offset[0], g[1] + offset[1])]) for g, c in src.items()
-                      if (g[0] + offset[0], g[1] + offset[1]) in dst]
-            return sum(1 for a, b in shared if a.hashes == b.hashes), len(shared)
+            matches = total = 0
+            for g, c in seg_src.items():
+                if c.kind == OCCUPIED:
+                    continue
+                c_dst = seg_dst.get((g[0] + offset[0], g[1] + offset[1]))
+                if c_dst is None or c_dst.kind == OCCUPIED:
+                    continue
+                u_src, u_dst = is_uniform(c), is_uniform(c_dst)
+                if u_src and u_dst:
+                    continue
+                total += 1
+                if not u_src and not u_dst and c.hashes == c_dst.hashes:
+                    matches += 1
+            return matches, total
 
         ranked = sorted(
             ((agreement(o), v, o) for o, v in votes.most_common(RELOCALISE_CANDIDATES)),
@@ -1048,9 +1076,13 @@ class GlobalMap(StrategistArtifact):
                    allowed: Optional[Callable[[int, Cell], bool]] = None) -> Optional[Tuple[int, Cell]]:
         a = _screen(frame)
         local: Dict[Cell, Tuple[Optional[str], ...]] = {}
+        blank_local: List[Cell] = []
         for (x, y), piece in _local_cells(a, shift):
+            if (x, y) == (0, 0):
+                continue
             # blank cells match everywhere, so they do not vote
-            if (x, y) == (0, 0) or piece.min() == piece.max():
+            if int(piece.min()) == int(piece.max()):
+                blank_local.append((x, y))
                 continue
             quarters = split_quarters(piece)
             local[(x, y)] = self._cell_hashes(quarters)
@@ -1066,7 +1098,7 @@ class GlobalMap(StrategistArtifact):
             votes = self._collect_offset_votes(local, index, block_index)
             if not votes:
                 continue
-            ranked = sorted((self._screen_agreement(seg, local, o), o)
+            ranked = sorted((self._screen_agreement(seg, local, o, blank_local), o)
                             for o, _ in votes.most_common(RELOCALISE_CANDIDATES))[::-1]
             close = [(o, overlap) for (m, overlap), o in ranked if m >= RELOCALISE_CLOSE_CALL * ranked[0][0][0]]
             if len(close) > 1:
@@ -1079,10 +1111,12 @@ class GlobalMap(StrategistArtifact):
                     continue
                 close = [(distinctive[0][1], distinctive[0][2])]
             offset, overlap = close[0]
-            n = self._screen_agreement(seg, local, offset)[0]
+            n = self._screen_agreement(seg, local, offset, blank_local)[0]
             # a small room shows few content cells: ask for most of them rather than the fixed minimum
             needed = min(RELOCALISE_MIN_CELLS, max(10, int(0.6 * len(local))))
             if n >= needed and n >= RELOCALISE_MIN_FRACTION * overlap:
+                if self._blacks_out(frame, si, offset, shift):
+                    continue
                 if allowed is not None and not allowed(si, offset):
                     self.stats["relocalise_door_vetoes"] += 1
                     continue
@@ -1092,10 +1126,17 @@ class GlobalMap(StrategistArtifact):
 
     @staticmethod
     def _screen_agreement(seg: Dict[Cell, MapCell], local: Dict[Cell, Tuple[Optional[str], ...]],
-                          offset: Cell) -> Tuple[int, int]:
+                          offset: Cell, blank_local: Iterable[Cell] = ()) -> Tuple[int, int]:
         placed = [(seg.get((offset[0] + x, offset[1] + y)), h) for (x, y), h in local.items()]
-        placed = [(c, h) for c, h in placed if c is not None]
-        return sum(1 for c, h in placed if c.kind != OCCUPIED and c.hashes == h), len(placed)
+        placed = [(c, h) for c, h in placed if c is not None and c.kind != OCCUPIED]
+        blank_disagreements = sum(
+            1 for (x, y) in blank_local
+            if (c := seg.get((offset[0] + x, offset[1] + y))) is not None
+            and c.kind != OCCUPIED
+            and c.pixels is not None
+            and int(c.pixels.min()) != int(c.pixels.max())
+        )
+        return sum(1 for c, h in placed if c.hashes == h), len(placed) + blank_disagreements
 
     @staticmethod
     def _distinctive_matches(seg: Dict[Cell, MapCell], index: Dict[Tuple[Optional[str], ...], List[Cell]],
@@ -1135,10 +1176,8 @@ class GlobalMap(StrategistArtifact):
 
         conflicts, ends = 0, []
         for (_, a, pa, b, pb), move in zip(warps, moves):
-            if a == b and move is not None:
+            if a == b:
                 conflicts += 1
-                continue
-            if a == b and near(a, pa, pb):
                 continue
             ends += [(a, pa, b, pb), (b, pb, a, pa)]
         for i, (s, p, other, q) in enumerate(ends):
