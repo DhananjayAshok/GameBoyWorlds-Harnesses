@@ -11,7 +11,8 @@ from tqdm import tqdm
 
 from execution.artifact import episode_dirs
 from execution.game_api import AgentState, WaitAction
-from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box
+from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_modal_preview_box,
+                                                 has_player_pokemon_fainted_text, is_battle_defeat_text)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import CombatExecutor
 from execution.pokemon.supervisors import PokemonPlayThroughSupervisor
@@ -59,6 +60,83 @@ def settle_screen(env) -> None:
         obs, *_ = env.step_high_level_action(WaitAction)
         if obs is None:
             return
+
+
+HEALING_DIGEST_PATTERN = re.compile(
+    r"\b(?:fighting\s+fit|fully\s+healed|restored\s+(?:your\s+POK[eé]MON\s+)?to\s+full\s+health"
+    r"|healed\s+(?:the\s+|your\s+|all\s+)?(?:POK[eé]MON|party)|take\s+a\s+rest)\b",
+    re.IGNORECASE,
+)
+BATTLE_CHUNK_PATTERN = re.compile(
+    r"\b(?:Wild\s+[A-Z0-9♀♂.'-]+\s+appeared|wants\s+to\s+(?:battle|fight)"
+    r"|sent\s+out\s+[A-Z0-9♀♂.'-]+!|used\s+[A-Z0-9♀♂.' -]+!|Got\s+away\s+safely!)",
+    re.IGNORECASE,
+)
+USED_MOVE_PATTERN = re.compile(r"\bused\s+[A-Z0-9♀♂.' -]+!")
+
+
+def is_healing_digest(digest: str) -> bool:
+    return bool(digest and HEALING_DIGEST_PATTERN.search(digest))
+
+
+def is_real_battle_loss(record: EpisodeRecord) -> bool:
+    if getattr(record, "status", "") != "lost_battle":
+        return False
+    digest = record.supervisor_report.digest if getattr(record, "supervisor_report", None) else ""
+    if "Text seen along the way, in order:" not in digest:
+        return True
+    text_sec = digest.split("Text seen along the way, in order:", 1)[1]
+    if not text_sec.strip():
+        return True
+    return bool(is_battle_defeat_text([text_sec]) or has_player_pokemon_fainted_text([text_sec]))
+
+
+def fought_and_fled_battles_in_digest(digest: str) -> Tuple[int, int]:
+    if not digest or "Text seen along the way, in order:" not in digest:
+        return 0, 0
+    text_sec = digest.split("Text seen along the way, in order:", 1)[1]
+    chunks = re.split(r"\n-\s+while\s+doing\s+\"", text_sec)
+    fought, fled = 0, 0
+    for ch in chunks[1:]:
+        body = ch.split("\":", 1)[1] if "\":" in ch else ch
+        if not BATTLE_CHUNK_PATTERN.search(body):
+            continue
+        if "got away safely" in body.lower() and not USED_MOVE_PATTERN.search(body):
+            fled += 1
+        else:
+            fought += 1
+    return fought, fled
+
+
+def sanitize_false_loss_summary(summary: str) -> str:
+    if not summary:
+        return summary
+    return re.sub(
+        r",?\s*(?:before\s+losing|then\s+lost)\s+a\s+(?:subsequent\s+|wild\s+)?battle\s+and\s+"
+        r"(?:black(?:ing|ed)|whit(?:ing|ed))\s+out",
+        "",
+        summary,
+        flags=re.IGNORECASE,
+    )
+
+
+def sanitize_false_loss_notepad(text: str) -> str:
+    if not text:
+        return text
+    cleaned_lines = []
+    for line in text.splitlines():
+        if re.search(r"\b(?:just\s+)?(?:blacked|whited)\s+out\b.*\b(?:respawned|healed)\b", line, re.IGNORECASE):
+            continue
+        line = re.sub(r"\s+before\s+(?:blacking|whiting)\s+out\b", "", line, flags=re.IGNORECASE)
+        line = re.sub(
+            r"Exit\s+the\s+[^,]*Pok[eé]mon\s+Center,\s*(?:head|walk)\s+[^,]*to\s+the\s+"
+            r"([^,]*tall\s+grass),\s*and\s+fight",
+            r"In the \1, fight",
+            line,
+            flags=re.IGNORECASE,
+        )
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
 
 
 def treat_name(name: str) -> str:
@@ -176,6 +254,12 @@ class PokemonStrategist:
         self._episodes_run = 0
         self._ran = False
         self._explore_now = False
+        self._fought_since_heal: int = 0
+        self._fled_since_heal: int = 0
+        self._last_heal_episode: Optional[int] = None
+        self._last_battle_hp: Optional[Tuple[int, int]] = None
+        self._last_battle_hp_episode: Optional[int] = None
+        self._fought_since_last_hp: int = 0
 
         self._started_at = datetime.now()
         self._session_dir = self._resolve_session_dir()
@@ -247,17 +331,108 @@ class PokemonStrategist:
             return artifact
         return factory()
 
+    def _record_party_episode(self, record: EpisodeRecord,
+                              strategist_calls: Optional[List[StrategistVLMCallRecord]] = None) -> None:
+        digest = record.supervisor_report.digest if record.supervisor_report is not None else ""
+        if is_real_battle_loss(record) or is_healing_digest(digest):
+            self._fought_since_heal = 0
+            self._fled_since_heal = 0
+            self._last_heal_episode = record.n
+            self._last_battle_hp = None
+            self._last_battle_hp_episode = None
+            self._fought_since_last_hp = 0
+            return
+        fought, fled = fought_and_fled_battles_in_digest(digest)
+        self._fought_since_heal += fought
+        self._fled_since_heal += fled
+        hp = CombatExecutor.extract_player_hp_from_text(digest)
+        if hp is None and record.supervisor_report is not None:
+            for ex in record.supervisor_report.executor_reports:
+                if ex.executor_name == CombatExecutor.__name__:
+                    for call in ex.vlm_call_log:
+                        if isinstance(call, ExecutorVLMCallRecord) and call.tag in (
+                            CombatExecutor.STEP_TAG, CombatExecutor.MOVE_TAG
+                        ):
+                            found = CombatExecutor.extract_player_hp_from_text(str(call.response))
+                            if found is not None:
+                                hp = found
+        if hp is None and strategist_calls:
+            for c in strategist_calls:
+                if c.stage == "defeat_reflection":
+                    idx = c.prompt.find("The battle, as the player fought it:")
+                    end = c.prompt.find("The first image is the battle screen")
+                    if idx != -1:
+                        hp = CombatExecutor.extract_player_hp_from_text(
+                            c.prompt[idx:end if end != -1 else len(c.prompt)]
+                        )
+        if hp is not None:
+            self._last_battle_hp = hp
+            self._last_battle_hp_episode = record.n
+            self._fought_since_last_hp = 0
+        else:
+            self._fought_since_last_hp += fought
+
+    def _party_status_block(self) -> str:
+        fought = self._fought_since_heal
+        fled = self._fled_since_heal
+        last_heal_ep = self._last_heal_episode
+        last_hp = self._last_battle_hp
+        last_hp_ep = self._last_battle_hp_episode
+        fought_after_hp = self._fought_since_last_hp
+        if fought <= 0 and (last_hp is None or last_hp[0] >= last_hp[1]):
+            if last_heal_ep is not None:
+                return f"\nParty health status: Fully healed (0 battles fought since last heal in episode {last_heal_ep}).\n"
+            return "\nParty health status: Fully healed (0 battles fought since last heal).\n"
+        heal_ref = f" in episode {last_heal_ep}" if last_heal_ep is not None else ""
+        parts = [
+            f"{fought} battle(s) fought"
+            + (f" and {fled} fled" if fled else "")
+            + f" without healing since last heal{heal_ref}"
+        ]
+        if last_hp is not None:
+            cur_hp, max_hp = last_hp
+            hp_note = f"last battle HP recorded: {cur_hp}/{max_hp} HP in episode {last_hp_ep}"
+            if fought_after_hp > 0:
+                hp_note += f", followed by {fought_after_hp} more battle(s) without healing"
+            parts.append(hp_note)
+        status = "; ".join(parts)
+        low_hp = (last_hp is not None and last_hp[0] * 2 <= last_hp[1]) or fought >= 3
+        warning = (
+            " — party HP is low/weakened; enter a Pokemon Center to heal before continuing onto a route or trainer battles."
+            if low_hp else
+            " — party has taken battle attrition and has not healed at a Pokemon Center yet."
+        )
+        return f"\nParty health status: {status}{warning}\n"
+
     def _load_prior_episodes(self) -> List[EpisodeRecord]:
         if self.start_episode <= 0:
             return []
-        prior_nums = [n for n in saved_episode_reports(self._resume_dir) if n < self.start_episode]
+        prior_nums = sorted(n for n in saved_episode_reports(self._resume_dir) if n < self.start_episode)
+        keep_from = set(prior_nums[-max(self.RECENT_EPISODES, self.MIN_NAMING_STEPS + 2):])
         episodes: List[EpisodeRecord] = []
-        for n in prior_nums[-max(self.RECENT_EPISODES, self.MIN_NAMING_STEPS + 2):]:
+        false_loss_episodes: set = set()
+        for n in prior_nums:
             try:
-                episodes.append(load_episode_report(self._resume_dir, n).episode)
+                archive = load_episode_report(self._resume_dir, n)
+                ep = archive.episode
+                if ep.status == "lost_battle" and not is_real_battle_loss(ep):
+                    false_loss_episodes.add(n)
+                    ep.status = "completed"
+                    ep.summary = sanitize_false_loss_summary(ep.summary)
+                self._record_party_episode(ep, archive.strategist_calls)
+                if n in keep_from:
+                    episodes.append(ep)
             except Exception as e:  # noqa: BLE001
                 log_warn(f"Strategist: could not load episode {n} report from {self._resume_dir!r}: {e}",
                          self._parameters)
+        if false_loss_episodes:
+            if (self.start_episode - 1) in false_loss_episodes and self.notepad.text.strip():
+                cleaned_notes = sanitize_false_loss_notepad(self.notepad.text)
+                if cleaned_notes != self.notepad.text:
+                    self.notepad.update(cleaned_notes, episode_number=self.start_episode)
+            if self.global_map.defeat_return is not None:
+                if self.global_map.defeat_return.get("episode") in false_loss_episodes:
+                    self.global_map.defeat_return = None
         return episodes
 
     @property
@@ -355,6 +530,7 @@ class PokemonStrategist:
                 .replace("[MAX_STEPS]", str(self._supervisor_max_steps))
                 .replace("[GOAL]", frontier_text(self.goals))
                 .replace("[CURRENT]", self._current_place())
+                .replace("[PARTY_BLOCK]", self._party_status_block())
                 .replace("[NOTEPAD]", self.notepad.text.strip() or "(empty)")
                 .replace("[GUIDE]", guide_block(self.guide, self.global_map, self.start_episode + self._episodes_run,
                                                 goal_completed_since_entry=self._goal_completed_since_building_entry())))
@@ -845,6 +1021,7 @@ class PokemonStrategist:
         before, frame = frame, self._current_frame()
         self._perceive(frame, n)
 
+        self._record_party_episode(record)
         closed = check_goals(self.goals, report.digest, self.notepad.text, self._vlm_caller, self._game, n,
                              current=self._current_place(), parameters=self._parameters,
                              episode_status=record.status, subgoal_every=self._subgoal_every)
@@ -858,7 +1035,6 @@ class PokemonStrategist:
         if self._should_extract_knowledge(report, conversation_digest, closed, town_event):
             self._extract_knowledge(report.digest + conversation_digest, before, frame, n)
             extracted = True
-        self._update_notepad(report.digest, summary, n)
         if closed:
             if any(status == "complete" for _, status in closed):
                 self.guide.mark_goal_completed(self.global_map, episode_number=n)
@@ -866,6 +1042,7 @@ class PokemonStrategist:
                 self.notepad.clear(episode_number=n)
             else:
                 self._absorb_notepad(closed, n)
+        self._update_notepad(report.digest, summary, n)
         if events and self._should_update_guide(events, record.status):
             update_guide(self.guide, events, report.digest, self._vlm_caller("guide_update"), self._game, n,
                          self._parameters)

@@ -10,14 +10,14 @@ The goal you are working towards, from the broadest goal down to it:
 [GOAL]
 
 The player is at: [CURRENT]
-
+[PARTY_BLOCK]
 Your notepad:
 [NOTEPAD]
 [GUIDE]
 The image is the current game screen. Here is what has been recognised on it:
 [SCREEN_TILES][GLOBAL_MAP][PEOPLE]
 
-Write one task for the player that moves them towards the goal. The player is competent but has no memory of anything before this moment, gets roughly [MAX_STEPS] actions, and can only walk, talk to people, use menus and fight battles. So the task must be something reachable from this screen in that budget: "walk into the Pokemon Center and heal your team", not "beat the next gym". Walking to a visible doorway, staircase or boundary exit mat automatically steps through or off it in a single move, so describe exiting or entering a room as one step rather than instructing the player to step onto an exit mat and then press a direction again. State the task in terms of the destination, landmark, or general heading to reach rather than prescribing low-level cardinal detours around immediate on-screen obstacles (such as which side of an NPC, ledge, tree row, or building to step around), and never combine speculative "if it ends in a dead end, walk back..." fallback branches into a single task; the player has a live on-screen pathfinder and will route around local obstacles from the screen and the walkable screen edges listed above. Never claim in the task or guidance that an unexplored path or corridor (shown as `?` on your map and listed as an unexplored edge) is a dead end before the player has actually walked to the end of it and mapped it.
+Write one task for the player that moves them towards the goal. The player is competent but has no memory of anything before this moment, gets roughly [MAX_STEPS] actions, and can only walk, talk to people, use menus and fight battles. So the task must be something reachable from this screen in that budget: "walk into the Pokemon Center and heal your team", not "beat the next gym". Whenever `Party health status` above shows that the party has fought battles without healing or has low/reduced HP (especially after returning from a wild-battle training detour or before heading onto a route, cave, or Gym with trainer battles) and a Pokemon Center entrance or sign is on screen or nearby in the current town, prioritize entering the Pokemon Center and healing at the nurse counter before walking past the Pokemon Center onto the next route, even if your notepad's next step says to walk straight to the route. Walking to a visible doorway, staircase or boundary exit mat automatically steps through or off it in a single move, so describe exiting or entering a room as one step rather than instructing the player to step onto an exit mat and then press a direction again. State the task in terms of the destination, landmark, or general heading to reach rather than prescribing low-level cardinal detours around immediate on-screen obstacles (such as which side of an NPC, ledge, tree row, or building to step around), and never combine speculative "if it ends in a dead end, walk back..." fallback branches into a single task; the player has a live on-screen pathfinder and will route around local obstacles from the screen and the walkable screen edges listed above. Never claim in the task or guidance that an unexplored path or corridor (shown as `?` on your map and listed as an unexplored edge) is a dead end before the player has actually walked to the end of it and mapped it.
 
 Then write the guidance: everything the player needs and could not work out from the screen. Where the thing they want is, what has already been tried and failed, what to avoid. Because the player has no memory of earlier episodes, whenever the target door or destination is separated by an obstacle barrier or has no direct mapped path yet, or when your notepad or recent episodes record an off-screen obstacle barrier or dead end discovered in a previous episode in this area (such as which side of a building or barrier was blocked), do not leave Guidance as None—tell the player which previously tried direction or side is blocked and which open detour direction or nearest reachable unexplored edge leads toward the destination. Do not prescribe exact tile-by-tile step counts or left/right detours around on-screen obstacles unless verified by the shortest path in the walkable screen edges above, and do not repeat the task in it.
 
@@ -315,11 +315,12 @@ Choice: <the numbers of the places that fit, separated by commas, or None>
 
 NOTEPAD_UPDATE_PROMPT = """You are playing [GAME] and are the strategist. You keep a notepad of working thoughts about the goal you are pursuing: what has been tried, what worked, what failed, and what to try next. One episode has just finished.
 
+[RECENT_BLOCK]
 The goal you are working towards, from the broadest goal down to it:
 [GOAL]
 
 The player is at: [CURRENT]
-
+[PARTY_BLOCK]
 Your notepad:
 [NOTEPAD]
 

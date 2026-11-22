@@ -213,7 +213,7 @@ Your task: "[TASK]"
 [GUIDANCE_BLOCK][BATTLE_TIPS_BLOCK]
 The image is the current battle screen.
 
-Say how this battle should be fought, for whoever gives the orders in it. Keep it short: which Pokemon to use, which kind of move to favour, whether to try to run, or whether to just win normally. Answer None if there is nothing special to say and the battle should simply be won.
+Say how this battle should be fought, for whoever gives the orders in it. Keep it short: which Pokemon to use, which kind of move to favour, whether to try to run, or whether to just win normally. In a wild battle (even when the task or guidance asks to fight or train on wild Pokemon for EXP), always check the wild Pokemon's species and type against your active Pokemon's type and current HP: if your active Pokemon has a severe type disadvantage against the wild Pokemon (such as a Fire-type starter facing a wild Water-type or Rock/Ground-type Pokemon that can use super-effective moves) and you have no safe switch-in, or if your active Pokemon's HP is low, instruct the player to run away immediately rather than staying in and risking a blackout (and always instruct them to run during a wild battle if the wild opponent uses a super-effective move or drops your active Pokemon's HP below half when it cannot knock out the opponent on the next hit). Answer None if there is nothing special to say and the battle should simply be won.
 
 Respond in exactly this format:
 Reasoning: <what the battle screen shows and what it means for the task>

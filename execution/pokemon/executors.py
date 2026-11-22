@@ -983,7 +983,7 @@ Choose what to do next:
 - pokemon: open your team to switch; only choose it if switching is needed
 
 Respond in exactly this format:
-Reasoning: <what the screen shows and what to do about it>
+Reasoning: <what the screen shows (including your active Pokemon's current/max HP, e.g. 12/21 HP) and what to do about it>
 Action: <one of fight, progress, run, bag, pokemon>
 Move: <1, 2, 3 or 4 if the action is fight, otherwise None>
 [STOP]"""
@@ -1191,6 +1191,36 @@ Press: <one of up, down, left, right, confirm, back>
             return "Win this battle.\n"
         return f"Your instructions for this battle: \"{task}\"\n"
 
+    PLAYER_HP_PATTERN = re.compile(
+        r"(?<!enemy\s)(?<!wild\s)(?<!foe\s)"
+        r"(?:\bHP\s*(?:is|at|of|:|=)?\s*(\d{1,3})\s*/\s*(\d{1,3})\b"
+        r"|\b(\d{1,3})\s*/\s*(\d{1,3})\s*HP\b"
+        r"|\bHP\s*\(\s*(\d{1,3})\s*/\s*(\d{1,3})\s*\))",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def extract_player_hp_from_text(cls, text: str) -> Optional[Tuple[int, int]]:
+        last: Optional[Tuple[int, int]] = None
+        for m in cls.PLAYER_HP_PATTERN.finditer(text or ""):
+            g = m.groups()
+            cur_s = g[0] or g[2] or g[4]
+            max_s = g[1] or g[3] or g[5]
+            if cur_s and max_s:
+                cur_hp, max_hp = int(cur_s), int(max_s)
+                if 0 <= cur_hp <= max_hp and 10 <= max_hp <= 999:
+                    last = (cur_hp, max_hp)
+        return last
+
+    def _last_seen_player_hp(self) -> Optional[Tuple[int, int]]:
+        last: Optional[Tuple[int, int]] = None
+        for call in self.report.vlm_call_log:
+            if isinstance(call, ExecutorVLMCallRecord) and call.tag in (self.STEP_TAG, self.MOVE_TAG):
+                found = self.extract_player_hp_from_text(str(call.response))
+                if found is not None:
+                    last = found
+        return last
+
     def _choose_move(self, output: str) -> Optional[int]:
         move = parse_int(output, "Move", lo=1, hi=4)
         for _ in range(self.MOVE_ATTEMPTS):
@@ -1235,7 +1265,12 @@ Press: <one of up, down, left, right, confirm, back>
                 recorder(place=self._battle_place)
             reason = "battle_lost"
         self.report.termination_reason = reason
-        self.report.notes = "\n".join(self.dialogue_text)
+        notes_lines = list(self.dialogue_text)
+        if reason != "battle_lost":
+            last_hp = self._last_seen_player_hp()
+            if last_hp is not None:
+                notes_lines.append(f"[Party HP seen in battle: {last_hp[0]}/{last_hp[1]} HP]")
+        self.report.notes = "\n".join(notes_lines)
         return code
 
     def _execute(self) -> int:
