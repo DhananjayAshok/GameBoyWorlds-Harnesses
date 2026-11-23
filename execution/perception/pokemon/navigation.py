@@ -3,6 +3,8 @@ import re
 from collections import deque
 from typing import Any, Collection, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
+
 from execution.game_api import HARD_MAX_STEPS
 
 from execution.perception.pokemon.grid import LEFT_COL, TOP_ROW
@@ -142,10 +144,85 @@ def is_west_ledge_cell(
     )
 
 
+STAIR_STEP_DESCRIPTION_PATTERN = re.compile(
+    r"\b(?:step|steps|stair|stairs|ladder)\b",
+    re.IGNORECASE,
+)
+ELEVATION_STEP_MEAN_DIFF = 60.0
+
+
+def _uniform_ground_quarter_image(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    allow_player_cap: bool = False,
+) -> Optional[np.ndarray]:
+    if quarter_images is None:
+        return None
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4 or set(cell_q.values()) != {"ground"}:
+        return None
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    for desc in cell_d.values():
+        if desc and STAIR_STEP_DESCRIPTION_PATTERN.search(desc):
+            return None
+    cell_imgs = quarter_images.get(cell, {})
+    if len(cell_imgs) < 4 or any(cell_imgs.get(q) is None for q in QUARTERS):
+        return None
+    tl = np.squeeze(np.asarray(cell_imgs["top_left"]))
+    tr = np.squeeze(np.asarray(cell_imgs["top_right"]))
+    bl = np.squeeze(np.asarray(cell_imgs["bottom_left"]))
+    br = np.squeeze(np.asarray(cell_imgs["bottom_right"]))
+    if tl.size == 0 or int(tl.min()) == int(tl.max()) or not np.array_equal(tl, tr):
+        return None
+    if np.array_equal(tl, bl) and np.array_equal(tl, br):
+        return tl
+    if allow_player_cap and cell == (0, 1):
+        if np.array_equal(tl[:4, :], bl[:4, :]) and np.array_equal(tl[:4, :], br[:4, :]):
+            return tl
+    return None
+
+
+def _is_east_elevation_step_barrier_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    allow_player_cap: bool = False,
+) -> bool:
+    img_here = _uniform_ground_quarter_image(
+        cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=allow_player_cap
+    )
+    if img_here is None:
+        return False
+    shades_here = {int(v) for v in np.unique(img_here)}
+    if 0 in shades_here:
+        return False
+    west = (cell[0] - 1, cell[1])
+    west_q = quarter_tags.get(west, {})
+    if allow_player_cap and west == (0, 0) and "player" in set(west_q.values()):
+        west_candidates = [(-1, 0), (0, 1), (0, -1)]
+    else:
+        west_candidates = [west]
+    for wc in west_candidates:
+        img_west = _uniform_ground_quarter_image(
+            wc, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=allow_player_cap
+        )
+        if img_west is None:
+            continue
+        shades_west = {int(v) for v in np.unique(img_west)}
+        if 0 in shades_west and float(np.mean(img_here)) - float(np.mean(img_west)) >= ELEVATION_STEP_MEAN_DIFF:
+            return True
+    return False
+
+
 def is_east_cliff_barrier_cell(
     cell: Cell,
     quarter_tags: Dict[Cell, Dict[str, str]],
     quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    allow_player_cap: bool = False,
 ) -> bool:
     cell_q = quarter_tags.get(cell, {})
     if len(cell_q) < 4:
@@ -154,9 +231,13 @@ def is_east_cliff_barrier_cell(
     left_tags = {cell_q["top_left"], cell_q["bottom_left"]}
     if not (left_tags <= WALKABLE_TAGS):
         return False
-    return (
+    if (
         is_ridge_quarter(cell_q["top_right"], cell_d.get("top_right"))
         and is_ridge_quarter(cell_q["bottom_right"], cell_d.get("bottom_right"))
+    ):
+        return True
+    return _is_east_elevation_step_barrier_cell(
+        cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=allow_player_cap
     )
 
 
@@ -244,12 +325,15 @@ def cell_kinds(
     tags: Dict[Cell, set] = {}
     quarter_tags: Dict[Cell, Dict[str, str]] = {}
     quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
+    quarter_images: Dict[Cell, Dict[str, Optional[Any]]] = {}
     hashes: Dict[Cell, Dict[str, Optional[str]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
         desc = getattr(tile, "description", None)
-        norm_tag = normalize_tabletop_tag(tile.tag, desc, getattr(tile, "image", None))
+        img = getattr(tile, "image", None)
+        norm_tag = normalize_tabletop_tag(tile.tag, desc, img)
         quarter_tags.setdefault((x, y), {})[quarter] = norm_tag
         quarter_descriptions.setdefault((x, y), {})[quarter] = desc
+        quarter_images.setdefault((x, y), {})[quarter] = img
         hashes.setdefault((x, y), {})[quarter] = tile.hash
     for cell in list(quarter_tags):
         quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
@@ -269,6 +353,10 @@ def cell_kinds(
         if cell in confirmed_occupied:
             kinds[cell] = BLOCKED
         elif cell != (0, 0) and cell in empirical_blocked and not (cell_tags & WARP_TAGS):
+            kinds[cell] = BLOCKED
+        elif is_east_cliff_barrier_cell(
+            cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
+        ):
             kinds[cell] = BLOCKED
         elif (
             cell_tags & WARP_TAGS
@@ -291,7 +379,6 @@ def cell_kinds(
             and pattern in walk_patterns
             and "npc" not in cell_tags
             and bool(cell_tags & WALKABLE_TAGS)
-            and not is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions)
         ):
             kinds[cell] = WALKABLE
         else:

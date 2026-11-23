@@ -137,17 +137,24 @@ def filter_cell_warp_quarter_tags(cell_quarter_tags: Dict[str, str]) -> Dict[str
 
 def _quarter_tag_map(
     identified: Dict[TileKey, Tile]
-) -> Tuple[Dict[Tuple[int, int], Dict[str, str]], Dict[Tuple[int, int], Dict[str, Optional[str]]]]:
+) -> Tuple[
+    Dict[Tuple[int, int], Dict[str, str]],
+    Dict[Tuple[int, int], Dict[str, Optional[str]]],
+    Dict[Tuple[int, int], Dict[str, Optional[np.ndarray]]],
+]:
     quarter_tags: Dict[Tuple[int, int], Dict[str, str]] = {}
     quarter_descriptions: Dict[Tuple[int, int], Dict[str, Optional[str]]] = {}
+    quarter_images: Dict[Tuple[int, int], Dict[str, Optional[np.ndarray]]] = {}
     for (x, y, quarter), tile in (identified or {}).items():
+        img = getattr(tile, "image", None)
         quarter_tags.setdefault((x, y), {})[quarter] = normalize_tabletop_tag(
-            tile.tag, tile.description, getattr(tile, "image", None)
+            tile.tag, tile.description, img
         )
         quarter_descriptions.setdefault((x, y), {})[quarter] = tile.description
+        quarter_images.setdefault((x, y), {})[quarter] = img
     for cell in list(quarter_tags):
         quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
-    return quarter_tags, quarter_descriptions
+    return quarter_tags, quarter_descriptions, quarter_images
 
 
 def verbalize_tiles(
@@ -155,7 +162,7 @@ def verbalize_tiles(
     people: Optional[Dict[Tuple[int, int], str]] = None,
     kinds: Optional[Dict[Tuple[int, int], str]] = None,
 ) -> str:
-    quarter_tags, quarter_descriptions = _quarter_tag_map(identified)
+    quarter_tags, quarter_descriptions, quarter_images = _quarter_tag_map(identified)
     top_overhang_cells = {
         cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     }
@@ -170,7 +177,11 @@ def verbalize_tiles(
         cell for cell in quarter_tags if is_west_ledge_cell(cell, quarter_tags, quarter_descriptions)
     }
     east_cliff_cells = {
-        cell for cell in quarter_tags if is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions)
+        cell
+        for cell in quarter_tags
+        if is_east_cliff_barrier_cell(
+            cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
+        )
     }
     by_cell: Dict[Tuple[int, int], Dict[str, Dict[str, Any]]] = {}
     for cell in south_ledge_cells:
@@ -289,12 +300,14 @@ COUNTER_NEIGHBOURS = {
 
 
 def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> str:
-    quarter_tags, quarter_descriptions = _quarter_tag_map(identified)
+    quarter_tags, quarter_descriptions, quarter_images = _quarter_tag_map(identified)
     if is_south_ledge_cell(cell, quarter_tags, quarter_descriptions):
         return "ledge (one-way ledge, jump down only; blocks moving up) in the bottom half"
     if is_west_ledge_cell(cell, quarter_tags, quarter_descriptions):
         return "ledge (one-way vertical ledge, jump left only; blocks moving right) in the left half"
-    if is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions):
+    if is_east_cliff_barrier_cell(
+        cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
+    ):
         return "obstacle (vertical cliff wall; blocks moving left or right) in the right half"
     is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)

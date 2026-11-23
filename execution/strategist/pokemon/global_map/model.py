@@ -448,12 +448,15 @@ class GlobalMap(StrategistArtifact):
         masked_cells = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
         quarter_tags: Dict[Cell, Dict[str, str]] = {}
         quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
+        quarter_images: Dict[Cell, Dict[str, Optional[np.ndarray]]] = {}
         if shift == (0, 0):
             for (ix, iy, iq), tile in (identified or {}).items():
+                img = getattr(tile, "image", None)
                 quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(
-                    tile.tag, tile.description, getattr(tile, "image", None)
+                    tile.tag, tile.description, img
                 )
                 quarter_descriptions.setdefault((ix, iy), {})[iq] = tile.description
+                quarter_images.setdefault((ix, iy), {})[iq] = img
             for cell in list(quarter_tags):
                 quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
         top_overhang_cells = {
@@ -472,7 +475,11 @@ class GlobalMap(StrategistArtifact):
             cell for cell in quarter_tags if is_west_ledge_cell(cell, quarter_tags, quarter_descriptions)
         }
         east_cliff_cells = {
-            cell for cell in quarter_tags if is_east_cliff_barrier_cell(cell, quarter_tags, quarter_descriptions)
+            cell
+            for cell in quarter_tags
+            if is_east_cliff_barrier_cell(
+                cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
+            )
         }
         for (x, y), piece in _local_cells(a, shift):
             if (x, y) in masked_cells and (x, y) != (0, 0):
@@ -1361,6 +1368,7 @@ class GlobalMap(StrategistArtifact):
                 changed += self._heal_visited_ground(si)
             quarter_tags: Dict[Cell, Dict[str, str]] = {}
             quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
+            quarter_images: Dict[Cell, Dict[str, Optional[np.ndarray]]] = {}
             for g, c in seg.items():
                 tiles = [tile_lookup.get(h) for h in c.hashes]
                 if any(t is not None for t in tiles):
@@ -1375,6 +1383,9 @@ class GlobalMap(StrategistArtifact):
                     quarter_tags[g] = filter_cell_warp_quarter_tags(raw_qtags)
                     quarter_descriptions[g] = {
                         q: (t.description if t is not None else None) for q, t in zip(QUARTERS, tiles)
+                    }
+                    quarter_images[g] = {
+                        q: (getattr(t, "image", None) if t is not None else None) for q, t in zip(QUARTERS, tiles)
                     }
             for g, c in seg.items():
                 if g not in quarter_tags or c.kind == OCCUPIED:
@@ -1391,7 +1402,7 @@ class GlobalMap(StrategistArtifact):
                 elif is_west_ledge_cell(g, quarter_tags, quarter_descriptions):
                     new_tags = tuple(sorted({quarter_tags[g]["top_right"], quarter_tags[g]["bottom_right"], "ledge"}))
                     new_kind = LEDGE_LEFT
-                elif is_east_cliff_barrier_cell(g, quarter_tags, quarter_descriptions):
+                elif is_east_cliff_barrier_cell(g, quarter_tags, quarter_descriptions, quarter_images):
                     new_tags = tuple(sorted(set(quarter_tags[g].values())))
                     new_kind = BLOCKED
                 else:
