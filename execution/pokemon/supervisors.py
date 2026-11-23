@@ -352,8 +352,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self,
         kinds: Dict[Tuple[int, int], str],
         identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+        people: Optional[Dict[Tuple[int, int], str]] = None,
     ) -> str:
-        from execution.perception.pokemon.navigation import filter_open_lane_edge_cells, warp_cells
+        from execution.perception.pokemon.navigation import (
+            edge_hazard_annotations,
+            filter_open_lane_edge_cells,
+            warp_cells,
+        )
         gmap = self._global_map()
         warps = warp_cells(identified=identified, global_map=gmap)
         lines = []
@@ -363,10 +368,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 runs = edge_runs(cells, direction)
                 open_cells = [c for r in runs if self._run_pocket_bounds(direction, r) is None for c in r]
                 open_lane_cells = filter_open_lane_edge_cells(
-                    open_cells or cells, direction, kinds, gmap, identified=identified
+                    open_cells or cells, direction, kinds, gmap, identified=identified, people=people
                 )
                 listed = ", ".join(f"({x}, {y})" for x, y in cells)
-                path = shortest_path(kinds, (0, 0), open_lane_cells or open_cells or cells, avoid_cells=warps)
+                path = shortest_path(
+                    kinds, (0, 0), open_lane_cells or open_cells or cells, avoid_cells=warps, people=people
+                )
                 if path:
                     target = path[-1][2]
                     lat_path = shortest_path(
@@ -375,9 +382,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         [target],
                         prefer_lateral=not (abs(target[0]) >= 4 and abs(target[1]) == 4),
                         avoid_cells=warps,
+                        people=people,
                     )
                     runs_text = format_path_runs(compress_path(lat_path or path))
                     listed += f" (shortest path to {target}: {runs_text})"
+                listed += edge_hazard_annotations(cells, kinds, people=people, direction=direction)
                 note = self._edge_pocket_note(direction, cells)
                 if note:
                     listed += note
@@ -514,7 +523,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                            getattr(self._env, "blocked_cells", None))
         self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                               + "\nWalkable cells on each edge of the screen:\n"
-                              + self._describe_edges(kinds, identified=self._identified))
+                              + self._describe_edges(kinds, identified=self._identified, people=people))
         return self._screen_tiles
 
     def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
@@ -755,7 +764,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                      getattr(self._env, "blocked_cells", None))
             after_tiles = (verbalize_tiles(after_identified, after_people, after_kinds)
                            + "\nWalkable cells on each edge of the screen:\n"
-                           + self._describe_edges(after_kinds, identified=after_identified))
+                           + self._describe_edges(after_kinds, identified=after_identified, people=after_people))
             if move_tag:
                 after_tiles += f"\n{move_tag}"
             after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", after_tiles)

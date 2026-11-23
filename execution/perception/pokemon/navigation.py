@@ -1,3 +1,4 @@
+import heapq
 import re
 from collections import deque
 from typing import Any, Collection, Dict, Iterable, List, Optional, Tuple
@@ -323,46 +324,94 @@ def _ordered_directions_for_goals(start: Cell, goals: set, prefer_lateral: bool 
     return tuple(primary + [d for d in DIRECTIONS if d not in primary])
 
 
-def _bfs_shortest_path(
+TRAINER_LOS_MAX_RANGE = 4
+FACING_LABEL_PATTERN = re.compile(r"\bfacing\s+(up|down|left|right)\b", re.IGNORECASE)
+
+
+def parse_trainer_los_from_label(label: Optional[str]) -> Tuple[Optional[str], bool]:
+    if not label or not isinstance(label, str) or label.startswith("sign:"):
+        return None, False
+    lower = label.lower()
+    if "remembered here" in lower:
+        return None, False
+    match = FACING_LABEL_PATTERN.search(lower)
+    facing = match.group(1).lower() if match else None
+    talked = "talked to here" in lower and "not talked to here" not in lower
+    return facing, (facing is not None and not talked)
+
+
+def trainer_los_cells(
+    kinds: Optional[Dict[Cell, str]],
+    people: Optional[Dict[Cell, str]] = None,
+    max_range: int = TRAINER_LOS_MAX_RANGE,
+) -> Dict[Cell, List[Tuple[Cell, str]]]:
+    los: Dict[Cell, List[Tuple[Cell, str]]] = {}
+    if not kinds or not people:
+        return los
+    for npc_cell, label in people.items():
+        if npc_cell == (0, 0) or not in_bounds(npc_cell):
+            continue
+        facing, active = parse_trainer_los_from_label(label)
+        if not active or facing not in DIRECTIONS:
+            continue
+        dx, dy = DIRECTIONS[facing]
+        for step in range(1, max_range + 1):
+            cell = (npc_cell[0] + dx * step, npc_cell[1] + dy * step)
+            if not in_bounds(cell) or kinds.get(cell, BLOCKED) != WALKABLE:
+                break
+            los.setdefault(cell, []).append((npc_cell, facing))
+    return los
+
+
+def trainer_los_ray(
+    kinds: Optional[Dict[Cell, str]],
+    npc_cell: Cell,
+    label: Optional[str],
+    max_range: int = TRAINER_LOS_MAX_RANGE,
+) -> Tuple[Optional[str], List[Cell]]:
+    if not kinds or npc_cell == (0, 0) or not in_bounds(npc_cell):
+        return None, []
+    facing, active = parse_trainer_los_from_label(label)
+    if not active or facing not in DIRECTIONS:
+        return facing, []
+    dx, dy = DIRECTIONS[facing]
+    ray: List[Cell] = []
+    for step in range(1, max_range + 1):
+        cell = (npc_cell[0] + dx * step, npc_cell[1] + dy * step)
+        if not in_bounds(cell) or kinds.get(cell, BLOCKED) != WALKABLE:
+            break
+        ray.append(cell)
+    return facing, ray
+
+
+def is_ledge_roofed_edge_cell(
+    cell: Cell,
+    direction: str,
     kinds: Dict[Cell, str],
-    start: Cell,
-    goals: set,
-    direction_order: Tuple[str, ...],
-    avoid_set: Optional[set] = None,
-) -> Optional[List[Tuple[str, str, Cell]]]:
-    previous: Dict[Cell, Tuple[Cell, str, str]] = {start: None}
-    queue = deque([start])
-    while queue:
-        cell = queue.popleft()
-        for direction, nxt in neighbours(cell, direction_order):
-            if not in_bounds(nxt):
-                continue
-            if avoid_set and nxt in avoid_set and nxt not in goals:
-                continue
-            kind = kinds.get(nxt, BLOCKED)
-            if kind == WALKABLE:
-                landing, move = nxt, "walk"
-            elif (kind == LEDGE and direction == "down") or (kind == LEDGE_LEFT and direction == "left"):
-                dx, dy = DIRECTIONS[direction]
-                landing, move = (nxt[0] + dx, nxt[1] + dy), "jump"
-                if not in_bounds(landing) or kinds.get(landing, BLOCKED) != WALKABLE:
-                    continue
-                if avoid_set and landing in avoid_set and landing not in goals:
-                    continue
-            else:
-                continue
-            if landing in previous:
-                continue
-            previous[landing] = (cell, direction, move)
-            if landing in goals:
-                path = []
-                while previous[landing] is not None:
-                    parent, d, m = previous[landing]
-                    path.append((d, m, landing))
-                    landing = parent
-                return path[::-1]
-            queue.append(landing)
-    return None
+) -> bool:
+    if direction in ("left", "right"):
+        x, y0 = cell
+        if y0 >= 0:
+            return False
+        for y in range(y0 + 1, 1):
+            k = kinds.get((x, y), BLOCKED)
+            if k == LEDGE:
+                return True
+            if k != WALKABLE:
+                return False
+        return False
+    if direction == "down":
+        x0, y = cell
+        if x0 >= 0:
+            return False
+        for x in range(x0 + 1, 1):
+            k = kinds.get((x, y), BLOCKED)
+            if k == LEDGE_LEFT:
+                return True
+            if k != WALKABLE:
+                return False
+        return False
+    return False
 
 
 def shortest_path(
@@ -370,18 +419,61 @@ def shortest_path(
     start: Cell,
     goals: Iterable[Cell],
     prefer_lateral: bool = False,
-    avoid_cells: Optional[Iterable[Cell]] = None,
+    avoid_cells: Optional[Collection[Cell]] = None,
+    people: Optional[Dict[Cell, str]] = None,
 ) -> Optional[List[Tuple[str, str, Cell]]]:
-    goals = set(goals)
-    if start in goals:
+    goal_set = set(goals)
+    if start in goal_set:
         return []
-    direction_order = _ordered_directions_for_goals(start, goals, prefer_lateral=prefer_lateral)
-    avoid_set = (set(avoid_cells) - goals - {start}) if avoid_cells else None
-    if avoid_set:
-        avoided_path = _bfs_shortest_path(kinds, start, goals, direction_order, avoid_set=avoid_set)
-        if avoided_path is not None:
-            return avoided_path
-    return _bfs_shortest_path(kinds, start, goals, direction_order, avoid_set=None)
+    if not goal_set:
+        return None
+    direction_order = _ordered_directions_for_goals(start, goal_set, prefer_lateral=prefer_lateral)
+    dir_rank = {d: i for i, d in enumerate(direction_order)}
+    avoid_set = (set(avoid_cells) - goal_set - {start}) if avoid_cells else set()
+    los_set = set(trainer_los_cells(kinds, people)) if people else set()
+    best: Dict[Cell, Tuple[int, int, int, int]] = {start: (0, 0, 0, 0)}
+    previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
+    counter = 0
+    heap: List[Tuple[int, int, int, int, int, int, Cell]] = [(0, 0, 0, 0, 0, 0, start)]
+    while heap:
+        jumps, avoids, los_hits, steps, first_rank, _, cell = heapq.heappop(heap)
+        if (jumps, avoids, los_hits, steps) > best.get(cell, (jumps + 1, 0, 0, 0)):
+            continue
+        if cell in goal_set:
+            path = []
+            cur = cell
+            while previous[cur] is not None:
+                parent, d, m = previous[cur]
+                path.append((d, m, cur))
+                cur = parent
+            return path[::-1]
+        for direction, nxt in neighbours(cell, direction_order):
+            if not in_bounds(nxt):
+                continue
+            kind = kinds.get(nxt, BLOCKED)
+            if kind == WALKABLE:
+                landing, move = nxt, "walk"
+                n_jumps = jumps
+            elif (kind == LEDGE and direction == "down") or (kind == LEDGE_LEFT and direction == "left"):
+                dx, dy = DIRECTIONS[direction]
+                landing, move = (nxt[0] + dx, nxt[1] + dy), "jump"
+                if not in_bounds(landing) or kinds.get(landing, BLOCKED) != WALKABLE:
+                    continue
+                n_jumps = jumps + 1
+            else:
+                continue
+            step_avoid = int((nxt in avoid_set and nxt not in goal_set) or (landing in avoid_set and landing not in goal_set))
+            n_avoids = avoids + step_avoid
+            n_los = los_hits + (1 if landing in los_set else 0)
+            n_steps = steps + 1
+            cost = (n_jumps, n_avoids, n_los, n_steps)
+            if cost < best.get(landing, (n_jumps + 1, 0, 0, 0)):
+                best[landing] = cost
+                previous[landing] = (cell, direction, move)
+                counter += 1
+                rank = dir_rank[direction] if cell == start else first_rank
+                heapq.heappush(heap, (n_jumps, n_avoids, n_los, n_steps, rank, counter, landing))
+    return None
 
 
 def compress_path(path: List[Tuple[str, str, Cell]]) -> List[Tuple[str, int, str]]:
@@ -779,6 +871,7 @@ def filter_open_lane_edge_cells(
     kinds: Dict[Cell, str],
     global_map: Optional[Any] = None,
     identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    people: Optional[Dict[Cell, str]] = None,
 ) -> List[Cell]:
     cells_list = list(cells)
     if not cells_list:
@@ -822,6 +915,52 @@ def filter_open_lane_edge_cells(
     ]
     if inward_clear:
         cells_list = inward_clear
+
+    hazard_cells = set(trainer_los_cells(kinds, people)) if people else set()
+    non_jump_cells: List[Cell] = []
+    unroofed_non_jump_cells: List[Cell] = []
+    los_free_non_jump_cells: List[Cell] = []
+    los_free_inward_non_jump_cells: List[Cell] = []
+    los_free_unroofed_non_jump_cells: List[Cell] = []
+    los_free_inward_unroofed_non_jump_cells: List[Cell] = []
+    los_free_any_cells: List[Cell] = []
+    for c in cells_list:
+        path = shortest_path(kinds, (0, 0), [c], people=people)
+        if path is None:
+            continue
+        has_jump = any(m == "jump" for _, m, _ in path)
+        has_los = bool(hazard_cells) and any(step_cell in hazard_cells for _, _, step_cell in path)
+        inward_los = bool(hazard_cells) and ((c[0] - dx, c[1] - dy) in hazard_cells)
+        roofed = is_ledge_roofed_edge_cell(c, direction, kinds)
+        if not has_jump:
+            non_jump_cells.append(c)
+            if not roofed:
+                unroofed_non_jump_cells.append(c)
+            if not has_los:
+                los_free_non_jump_cells.append(c)
+                if not roofed:
+                    los_free_unroofed_non_jump_cells.append(c)
+                if not inward_los:
+                    los_free_inward_non_jump_cells.append(c)
+                    if not roofed:
+                        los_free_inward_unroofed_non_jump_cells.append(c)
+        if not has_los:
+            los_free_any_cells.append(c)
+
+    if los_free_inward_unroofed_non_jump_cells:
+        return los_free_inward_unroofed_non_jump_cells
+    if los_free_unroofed_non_jump_cells:
+        return los_free_unroofed_non_jump_cells
+    if unroofed_non_jump_cells:
+        return unroofed_non_jump_cells
+    if los_free_inward_non_jump_cells:
+        return los_free_inward_non_jump_cells
+    if los_free_non_jump_cells:
+        return los_free_non_jump_cells
+    if non_jump_cells:
+        return non_jump_cells
+    if los_free_any_cells:
+        return los_free_any_cells
     return cells_list
 
 
@@ -872,18 +1011,59 @@ def format_path_runs(runs: List[Tuple[str, int, str]]) -> str:
     return ", ".join(parts)
 
 
+def edge_hazard_annotations(
+    cells: List[Cell],
+    kinds: Dict[Cell, str],
+    people: Optional[Dict[Cell, str]] = None,
+    direction: Optional[str] = None,
+) -> str:
+    if not cells:
+        return ""
+    hazard_cells = set(trainer_los_cells(kinds, people)) if people else set()
+    jump_only: List[Cell] = []
+    roofed_only: List[Cell] = []
+    los_only: List[Cell] = []
+    for cell in cells:
+        path = shortest_path(kinds, (0, 0), [cell], people=people)
+        if path is None:
+            continue
+        has_jump = any(m == "jump" for _, m, _ in path)
+        is_roofed = bool(direction) and is_ledge_roofed_edge_cell(cell, direction, kinds)
+        if has_jump:
+            jump_only.append(cell)
+        elif is_roofed:
+            roofed_only.append(cell)
+        if hazard_cells and any(step_cell in hazard_cells for _, _, step_cell in path):
+            los_only.append(cell)
+    notes = ""
+    if jump_only and len(jump_only) < len(cells):
+        j_str = ", ".join(f"({x}, {y})" for x, y in jump_only)
+        notes += f" [requires one-way ledge jump: {j_str}]"
+    if roofed_only and len(roofed_only) < len(cells):
+        r_str = ", ".join(f"({x}, {y})" for x, y in roofed_only)
+        notes += f" [drops below one-way ledge: {r_str}]"
+    if los_only and len(los_only) < len(cells):
+        l_str = ", ".join(f"({x}, {y})" for x, y in los_only)
+        notes += f" [crosses line of sight: {l_str}]"
+    return notes
+
+
 def verbalize_edges(
     kinds: Dict[Cell, str],
     identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    people: Optional[Dict[Cell, str]] = None,
+    global_map: Optional[Any] = None,
 ) -> str:
-    warps = warp_cells(identified=identified)
+    warps = warp_cells(identified=identified, global_map=global_map)
     lines = []
     for direction in DIRECTIONS:
         cells = edge_cells(kinds, direction)
         if cells:
-            open_cells = filter_open_lane_edge_cells(cells, direction, kinds, identified=identified)
+            open_cells = filter_open_lane_edge_cells(
+                cells, direction, kinds, global_map=global_map, identified=identified, people=people
+            )
             listed = ", ".join(f"({x}, {y})" for x, y in cells)
-            path = shortest_path(kinds, (0, 0), open_cells or cells, avoid_cells=warps)
+            path = shortest_path(kinds, (0, 0), open_cells or cells, avoid_cells=warps, people=people)
             if path:
                 target = path[-1][2]
                 lat_path = shortest_path(
@@ -892,9 +1072,11 @@ def verbalize_edges(
                     [target],
                     prefer_lateral=not (abs(target[0]) >= 4 and abs(target[1]) == 4),
                     avoid_cells=warps,
+                    people=people,
                 )
                 runs_text = format_path_runs(compress_path(lat_path or path))
                 listed += f" (shortest path to {target}: {runs_text})"
+            listed += edge_hazard_annotations(cells, kinds, people=people, direction=direction)
         else:
             listed = "none"
         lines.append(f"- {direction} edge: {listed}")
@@ -942,7 +1124,7 @@ def describe_target_reachability(
         goals = list(approach_cells(kinds, target, identified=identified, people=people))
     if not goals:
         return " [no walkable approach tile adjacent on current screen]"
-    path = shortest_path(kinds, (0, 0), goals)
+    path = shortest_path(kinds, (0, 0), goals, people=people)
     if path is not None:
         if not path:
             if abs(target[0]) + abs(target[1]) == 2:

@@ -25,7 +25,8 @@ from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
                                                      filter_forward_edge_cells, filter_open_lane_edge_cells, in_bounds,
-                                                     is_boundary_exit_direction, parse_all_cells, parse_avoided_cells,
+                                                     is_boundary_exit_direction, is_ledge_roofed_edge_cell,
+                                                     parse_all_cells, parse_avoided_cells,
                                                      parse_cell, parse_edge_direction, shortest_path, verbalize_edges,
                                                      warp_cells)
 from execution.pokemon.executor_actions import CheckInteractionAction
@@ -754,6 +755,14 @@ class GridMoveExecutor(PolicyExecutor):
                                   f"Stopped moving {direction} with {remaining} steps left")
         return None
 
+    def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
+        if not callable(self.people_fn):
+            return None
+        try:
+            return self.people_fn()
+        except Exception:  # noqa: BLE001
+            return None
+
     def _walk(self, goals: Dict[Tuple[int, int], Optional[str]], prefer_lateral: bool = False) -> Optional[int]:
         current_goals = dict(goals)
         current_avoid = {c for c in parse_avoided_cells(self._task) if in_bounds(c)} | warp_cells(
@@ -761,12 +770,14 @@ class GridMoveExecutor(PolicyExecutor):
         )
         reroutes = 0
         while True:
+            people = self._people_now()
             path = shortest_path(
                 self.cell_kinds,
                 (0, 0),
                 current_goals,
                 prefer_lateral=prefer_lateral,
                 avoid_cells=current_avoid,
+                people=people,
             )
             if path is None:
                 if reroutes > 0:
@@ -838,6 +849,7 @@ class GridMoveExecutor(PolicyExecutor):
                                 shifted_goals,
                                 prefer_lateral=prefer_lateral,
                                 avoid_cells=shifted_avoid,
+                                people=self._people_now(),
                             ) is not None:
                                 current_goals = shifted_goals
                                 current_avoid = shifted_avoid
@@ -874,14 +886,6 @@ Location: <(x, y), Ambiguous, or Not Found>
 Candidates: <if Ambiguous, each candidate with its coordinates and what sets it apart from the others; otherwise None>
 [STOP]"""
 
-    def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
-        if not callable(self.people_fn):
-            return None
-        try:
-            return self.people_fn()
-        except Exception:  # noqa: BLE001
-            return None
-
     def _resolve_explicit_target(self) -> Optional[Tuple[int, int]]:
         coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
         if len(coords) != 1:
@@ -889,12 +893,13 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
         target = coords[0]
         if target == (0, 0):
             return target
+        people = self._people_now()
         if self.cell_kinds.get(target) == WALKABLE:
-            if shortest_path(self.cell_kinds, (0, 0), [target]) is not None:
+            if shortest_path(self.cell_kinds, (0, 0), [target], people=people) is not None:
                 return target
         else:
-            goals = approach_cells(self.cell_kinds, target, identified=self.identified, people=self._people_now())
-            if goals and shortest_path(self.cell_kinds, (0, 0), goals) is not None:
+            goals = approach_cells(self.cell_kinds, target, identified=self.identified, people=people)
+            if goals and shortest_path(self.cell_kinds, (0, 0), goals, people=people) is not None:
                 return target
         return target
 
@@ -1057,10 +1062,11 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         if not coords:
             return direction
         gmap = getattr(self._env, "_map", None)
+        people = self._people_now()
         cells = edge_cells(self.cell_kinds, direction)
         forward_cells = filter_forward_edge_cells(cells, direction)
         open_cells = filter_open_lane_edge_cells(
-            forward_cells, direction, self.cell_kinds, gmap, identified=self.identified
+            forward_cells, direction, self.cell_kinds, gmap, identified=self.identified, people=people
         )
         if any(c in open_cells for c in coords):
             return direction
@@ -1092,7 +1098,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 continue
             d_forward = filter_forward_edge_cells(d_cells, d)
             d_open = filter_open_lane_edge_cells(
-                d_forward, d, self.cell_kinds, gmap, identified=self.identified
+                d_forward, d, self.cell_kinds, gmap, identified=self.identified, people=people
             )
             in_open = int(any(c in d_open for c in matching))
             depth = 0
@@ -1128,14 +1134,24 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 cells = non_avoided_cells
         forward_cells = filter_forward_edge_cells(cells, direction)
         gmap = getattr(self._env, "_map", None)
+        people = self._people_now()
         path_avoid = avoided_set | warp_cells(self.identified, gmap)
         open_cells = filter_open_lane_edge_cells(
-            forward_cells, direction, self.cell_kinds, gmap, identified=self.identified
+            forward_cells, direction, self.cell_kinds, gmap, identified=self.identified, people=people
         )
         if avoided_set:
             non_avoided_open = [c for c in open_cells if c not in avoided_set]
             if non_avoided_open:
                 open_cells = non_avoided_open
+
+        def _is_ledge_trap_cell(c: Tuple[int, int]) -> bool:
+            if is_ledge_roofed_edge_cell(c, direction, self.cell_kinds):
+                return True
+            p = shortest_path(self.cell_kinds, (0, 0), [c], avoid_cells=path_avoid, people=people)
+            return bool(p and any(m == "jump" for _, m, _ in p))
+
+        unroofed_open_exists = any(not _is_ledge_trap_cell(oc) for oc in open_cells)
+        task_allows_ledge = bool(re.search(r"\b(?:ledge|jump)\b", self._task, re.IGNORECASE))
 
         on_edge_coords = [c for c in coords if c in cells]
         if on_edge_coords:
@@ -1152,8 +1168,13 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                     nearest = min(same_run_open, key=lambda c: (abs(c[axis] - ref[axis]), abs(c[axis])))
                     preferred = [nearest]
             if not preferred:
-                preferred = [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
-            path = shortest_path(self.cell_kinds, (0, 0), preferred, avoid_cells=path_avoid)
+                candidate_explicit = [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
+                if unroofed_open_exists and not task_allows_ledge:
+                    safe_explicit = [c for c in candidate_explicit if not _is_ledge_trap_cell(c)]
+                    preferred = safe_explicit or open_cells
+                else:
+                    preferred = candidate_explicit
+            path = shortest_path(self.cell_kinds, (0, 0), preferred, avoid_cells=path_avoid, people=people)
             target = path[-1][2] if path else preferred[0]
             return direction, target
 
@@ -1174,11 +1195,11 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         if len(runs) == 1:
             run = runs[0]
             if is_bare_direction or len(run) <= self.MAX_DETERMINISTIC_CORRIDOR_WIDTH:
-                path = shortest_path(self.cell_kinds, (0, 0), run, avoid_cells=path_avoid)
+                path = shortest_path(self.cell_kinds, (0, 0), run, avoid_cells=path_avoid, people=people)
                 target = path[-1][2] if path else run[0]
                 return direction, target
-        elif is_bare_direction and open_cells:
-            path = shortest_path(self.cell_kinds, (0, 0), open_cells, avoid_cells=path_avoid)
+        elif open_cells and (is_bare_direction or not coords):
+            path = shortest_path(self.cell_kinds, (0, 0), open_cells, avoid_cells=path_avoid, people=people)
             if path:
                 return direction, path[-1][2]
         return None
@@ -1228,7 +1249,12 @@ Location: <(x, y) or Not Found>
             prompt = (self.LOCATE_PROMPT.replace("[TARGET]", self._task.strip())
                       .replace("[GRID_DESCRIPTION]", GRID_DESCRIPTION)
                       .replace("[SCREEN_TILES]", self.screen_tiles)
-                      .replace("[EDGE_CELLS]", verbalize_edges(self.cell_kinds, identified=self.identified)))
+                      .replace("[EDGE_CELLS]", verbalize_edges(
+                          self.cell_kinds,
+                          identified=self.identified,
+                          people=self._people_now(),
+                          global_map=getattr(self._env, "_map", None),
+                      )))
             output = self._locate(prompt)
             location = (parse_key_value(output, "Location") or "").strip()
             direction = (parse_key_value(output, "Direction") or "").strip().lower()
@@ -1265,8 +1291,9 @@ Location: <(x, y) or Not Found>
                 return self._fail(MOVE_BAD_LOCATION, "bad_location",
                                   f"{location!r} is not a walkable cell on the {direction} edge")
             gmap = getattr(self._env, "_map", None)
+            people = self._people_now()
             open_cells = filter_open_lane_edge_cells(
-                candidate_cells, direction, self.cell_kinds, gmap, identified=self.identified
+                candidate_cells, direction, self.cell_kinds, gmap, identified=self.identified, people=people
             )
             if avoided_set:
                 non_avoided_open = [c for c in open_cells if c not in avoided_set]
@@ -1277,6 +1304,15 @@ Location: <(x, y) or Not Found>
                 adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= 2]
                 if adjacent_open:
                     target = min(adjacent_open, key=lambda c: (abs(c[axis] - target[axis]), abs(c[axis])))
+                elif not re.search(r"\b(?:ledge|jump)\b", self._task, re.IGNORECASE):
+                    target_path = shortest_path(self.cell_kinds, (0, 0), [target], people=people)
+                    target_is_trap = is_ledge_roofed_edge_cell(target, direction, self.cell_kinds) or bool(
+                        target_path and any(m == "jump" for _, m, _ in target_path)
+                    )
+                    if target_is_trap:
+                        safe_open_path = shortest_path(self.cell_kinds, (0, 0), open_cells, people=people)
+                        if safe_open_path:
+                            target = safe_open_path[-1][2]
 
         initial_edge_runs = edge_runs(edge_cells(self.cell_kinds, direction), direction)
         target_run = next((r for r in initial_edge_runs if target in r), [target])
