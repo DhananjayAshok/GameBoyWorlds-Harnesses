@@ -989,24 +989,38 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         kinds: Dict[Tuple[int, int], str],
         cell: Tuple[int, int],
         direction: str,
+        avoid_warps: Optional[set] = None,
     ) -> Optional[bool]:
         dx, dy = DIRECTIONS[direction]
         nxt = (cell[0] + dx, cell[1] + dy)
+        if avoid_warps and nxt in avoid_warps:
+            return False
         kind = kinds.get(nxt)
         if kind == WALKABLE:
             return True
         if (kind == LEDGE and direction == "down") or (kind == LEDGE_LEFT and direction == "left"):
-            return kinds.get((cell[0] + 2 * dx, cell[1] + 2 * dy)) == WALKABLE
+            landing = (cell[0] + 2 * dx, cell[1] + 2 * dy)
+            if avoid_warps and landing in avoid_warps:
+                return False
+            return kinds.get(landing) == WALKABLE
         if kind in (BLOCKED, LEDGE, LEDGE_LEFT):
             return False
         return None
 
-    def _live_cell_kinds(self) -> Optional[Dict[Tuple[int, int], str]]:
+    def _live_perception(self) -> Tuple[Optional[Dict[Tuple[int, int], str]], Optional[Dict[Any, Any]]]:
         tiles = getattr(self._env, "_tiles", None)
         if tiles is None or not hasattr(tiles, "identify_tiles"):
-            return None
+            return None, None
         frame = self._get_state()["core"]["current_frame"]
         gmap = getattr(self._env, "_map", None)
+        if hasattr(tiles, "record_tiles") and getattr(tiles, "vlm_call", None) is not None:
+            ep = getattr(self._env, "_episode", 0)
+            try:
+                tiles.record_tiles(frame, ep)
+                if gmap is not None and hasattr(gmap, "refresh"):
+                    gmap.refresh(tiles._by_hash)
+            except Exception:  # noqa: BLE001
+                pass
         identified = tiles.identify_tiles(frame, global_map=gmap)
         people = None
         if callable(self.people_fn):
@@ -1014,7 +1028,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 people = self.people_fn()
             except Exception:  # noqa: BLE001
                 people = None
-        return cell_kinds(
+        kinds = cell_kinds(
             identified,
             getattr(self._env, "ledge_patterns", None),
             getattr(self._env, "walk_patterns", None),
@@ -1022,12 +1036,28 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             getattr(self._env, "left_ledge_patterns", None),
             getattr(self._env, "blocked_cells", None),
         )
+        return kinds, identified
+
+    def _live_cell_kinds(self) -> Optional[Dict[Tuple[int, int], str]]:
+        kinds, _ = self._live_perception()
+        return kinds
+
+    def _task_targets_warp(self) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:ladder|stair(?:s|case)?|door(?:way)?|entrance|exit|elevator|warp)\b",
+                self._task,
+                re.IGNORECASE,
+            )
+        )
 
     def _can_step_from_current(self, direction: str) -> Optional[bool]:
-        kinds = self._live_cell_kinds()
+        kinds, identified = self._live_perception()
         if kinds is None:
             return None
-        return self._can_step_from_cell_in_kinds(kinds, (0, 0), direction)
+        gmap = getattr(self._env, "_map", None)
+        avoid_warps = None if self._task_targets_warp() else warp_cells(identified=identified, global_map=gmap)
+        return self._can_step_from_cell_in_kinds(kinds, (0, 0), direction, avoid_warps=avoid_warps)
 
     def _sidestep_targets_at_edge(
         self,
@@ -1035,9 +1065,11 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         target_run: List[Tuple[int, int]],
         direction: str,
     ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
-        kinds = self._live_cell_kinds()
+        kinds, identified = self._live_perception()
         if kinds is None:
             return []
+        gmap = getattr(self._env, "_map", None)
+        avoid_warps = set() if self._task_targets_warp() else warp_cells(identified=identified, global_map=gmap)
         avoided_set = {c for c in parse_avoided_cells(self._task) if in_bounds(c)}
         axis = 0 if direction in ("up", "down") else 1
         candidates = []
@@ -1045,11 +1077,11 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             if cell == target or cell in avoided_set:
                 continue
             rel = (cell[0] - target[0], cell[1] - target[1])
-            if not in_bounds(rel) or kinds.get(rel) != WALKABLE:
+            if not in_bounds(rel) or kinds.get(rel) != WALKABLE or rel in avoid_warps:
                 continue
-            if self._can_step_from_cell_in_kinds(kinds, rel, direction) is not True:
+            if self._can_step_from_cell_in_kinds(kinds, rel, direction, avoid_warps=avoid_warps) is not True:
                 continue
-            if shortest_path(kinds, (0, 0), [rel]) is not None:
+            if shortest_path(kinds, (0, 0), [rel], avoid_cells=avoid_warps) is not None:
                 candidates.append((abs(rel[axis]), abs(cell[axis]), rel, cell))
         candidates.sort()
         return [(rel, cell) for _, _, rel, cell in candidates]
@@ -1328,7 +1360,14 @@ Location: <(x, y) or Not Found>
         )
         can_step = self._can_step_from_current(direction)
         if can_step is False:
-            self._record_empirical_block(direction)
+            dx_dir, dy_dir = DIRECTIONS[direction]
+            step_cell = (dx_dir, dy_dir)
+            _, live_identified = self._live_perception()
+            step_is_warp = step_cell in warp_cells(
+                identified=live_identified, global_map=getattr(self._env, "_map", None)
+            )
+            if not step_is_warp:
+                self._record_empirical_block(direction)
             sidesteps = self._sidestep_targets_at_edge(target, target_run, direction)
             if (
                 sidesteps
@@ -1337,7 +1376,7 @@ Location: <(x, y) or Not Found>
                 and not has_bottom_dialogue_box(self._get_state()["core"]["current_frame"])
             ):
                 rel_target, new_edge_target = sidesteps[0]
-                self._refresh_local_perception(blocked_neighbor=DIRECTIONS.get(direction))
+                self._refresh_local_perception(blocked_neighbor=None if step_is_warp else DIRECTIONS.get(direction))
                 sidestep_code = self._walk({rel_target: None}, prefer_lateral=True)
                 if sidestep_code is not None:
                     return sidestep_code
@@ -1345,7 +1384,11 @@ Location: <(x, y) or Not Found>
                 self.target_cell = target
                 can_step = self._can_step_from_current(direction)
                 if can_step is False:
-                    self._record_empirical_block(direction)
+                    _, live_identified2 = self._live_perception()
+                    if step_cell not in warp_cells(
+                        identified=live_identified2, global_map=getattr(self._env, "_map", None)
+                    ):
+                        self._record_empirical_block(direction)
                     return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked at {target} moving {direction}")
             else:
                 if scrolled_to_edge:

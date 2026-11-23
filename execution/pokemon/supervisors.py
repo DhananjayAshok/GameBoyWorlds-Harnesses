@@ -731,7 +731,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             log_warn(f"Could not parse a plan from: {output!r}", self._parameters)
         return subgoals
 
-    def _decide(self, subgoal: str, attempts: List[str], frame) -> Optional[Tuple[str, Optional[str]]]:
+    def _decide(self, subgoal: str, attempts: List[str], frame) -> Tuple[Optional[Tuple[str, Optional[str]]], str]:
         attempts_block = ""
         if attempts:
             attempts_block = PLAYTHROUGH_ATTEMPTS_BLOCK.replace(
@@ -743,10 +743,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
         decision = parse_decision(output)
         if decision is None:
             log_warn(f"Could not parse a decision from: {output!r}", self._parameters)
-        return decision
+        reasoning = (parse_key_value(output, "Reasoning") or "").strip()
+        return decision, reasoning
 
     def _judge(self, subgoal: str, request: str, result: Dict[str, Any],
-               subgoal_index: int = 0, move_tag: str = "") -> Tuple[bool, str, int]:
+               subgoal_index: int = 0, move_tag: str = "",
+               decision_reasoning: str = "") -> Tuple[bool, str, int, bool]:
         report = result["report"]
         before = report.initial_state["core"]["current_frame"]
         after = report.final_state["core"]["current_frame"]
@@ -786,12 +788,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
         else:
             remaining_block = ""
             remaining_line = ""
+        request_with_context = request
+        if decision_reasoning:
+            request_with_context = f"{request}\nWhy you chose that action: {decision_reasoning}"
         prompt = (self._fill_prompt(PLAYTHROUGH_JUDGE_PROMPT)
                   .replace("[SUBGOAL_NUMBER]", str(subgoal_index + 1))
                   .replace("[SUBGOAL]", subgoal)
                   .replace("[REMAINING_SUBGOALS_BLOCK]", remaining_block)
                   .replace("[REMAINING_SUBGOALS_LINE]", remaining_line)
-                  .replace("[REQUEST]", request)
+                  .replace("[REQUEST]", request_with_context)
                   .replace("[AFTER_BLOCK]", after_block)
                   .replace("[TEXT_BLOCK]", text_block)
                   .replace("[EXECUTOR_REPORT]", executor_report))
@@ -800,11 +805,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if not summary:
             summary = f"{request} -> {executor_report}"
         complete = bool(parse_yes_no(output, "Subgoal complete"))
+        replan_needed = bool(parse_yes_no(output, "Replan needed")) and not complete
         reached = parse_int(output, "Reached subgoal", lo=subgoal_index + 1, hi=len(self.plan)) if remaining else None
         if not complete and reached is not None and reached > subgoal_index + 1:
             complete = True
+            replan_needed = False
         reached_index = (reached - 1) if (complete and reached is not None) else subgoal_index
-        return complete, summary, reached_index
+        return complete, summary, reached_index, replan_needed
 
     def _reconsider(self, subgoal: str, attempts: List[str], frame) -> Tuple[str, Optional[str], List[str]]:
         prompt = (self._fill_prompt(PLAYTHROUGH_ACHIEVABLE_PROMPT)
@@ -1120,12 +1127,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if self._env_done():
                     return "env_done", attempts, subgoal_index
                 if handled and handled.get("succeeded"):
-                    complete, summary, reached = self._judge(
+                    complete, summary, reached, replan_needed = self._judge(
                         subgoal, request_label, handled, subgoal_index)
                     self._note(summary)
                     attempts.append(f"Dialogue(): {summary}")
                     if complete:
                         return "complete", attempts, reached
+                    if replan_needed:
+                        return "stuck", attempts, subgoal_index
                 if self._out_of_calls():
                     return "out_of_calls", attempts, subgoal_index
             iterations += 1
@@ -1135,7 +1144,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if before_place is not None and (not subgoal_places or subgoal_places[-1] != before_place):
                 subgoal_places.append(before_place)
             prior_stops = list(self._leg_stops)
-            decision = self._decide(subgoal, attempts, frame)
+            decision, decision_reasoning = self._decide(subgoal, attempts, frame)
             if decision is None:
                 attempts.append("the reply could not be read, so nothing was done")
                 failed_attempts += 1
@@ -1227,14 +1236,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if self._env_done():
                     return "env_done", attempts, subgoal_index
                 if handled.get("succeeded"):
-                    complete, summary, reached = self._judge(
-                        subgoal, f"{request} (cleared {state})", handled, subgoal_index, move_tag=move_tag)
+                    complete, summary, reached, replan_needed = self._judge(
+                        subgoal, f"{request} (cleared {state})", handled, subgoal_index,
+                        move_tag=move_tag, decision_reasoning=decision_reasoning)
                     if move_tag and move_tag not in summary:
                         summary = f"{move_tag} {summary}"
                     self._note(summary)
                     attempts.append(f"{request}: {summary}")
                     if complete:
                         return "complete", attempts, reached
+                    if replan_needed:
+                        return "stuck", attempts, subgoal_index
                 if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
                     subgoal_places.append(after_place)
                 if not is_move_action or not handled.get("succeeded"):
@@ -1283,13 +1295,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 failed_attempts += 1
                 continue
 
-            complete, summary, reached = self._judge(subgoal, request, result, subgoal_index, move_tag=move_tag)
+            complete, summary, reached, replan_needed = self._judge(
+                subgoal, request, result, subgoal_index, move_tag=move_tag,
+                decision_reasoning=decision_reasoning)
             if move_tag and move_tag not in summary:
                 summary = f"{move_tag} {summary}"
             self._note(summary)
             attempts.append(f"{request}: {summary}")
             if complete:
                 return "complete", attempts, reached
+            if replan_needed:
+                return "stuck", attempts, subgoal_index
             made_progress = is_move_action and self._made_new_subgoal_progress(before_place, after_place, subgoal_places)
             if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
                 subgoal_places.append(after_place)
