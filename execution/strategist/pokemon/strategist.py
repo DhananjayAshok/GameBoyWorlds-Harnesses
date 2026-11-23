@@ -651,7 +651,7 @@ class PokemonStrategist:
                                    self.global_map.local_blocked_cells())
                 self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                                       + "\nWalkable cells on each edge of the screen:\n"
-                                      + verbalize_edges(kinds, people=people, global_map=self.global_map))
+                                      + verbalize_edges(kinds))
         except Exception as e:
             log_warn(f"NPC registry: naming the people on screen was skipped: {type(e).__name__}: {e}",
                      self._parameters)

@@ -1419,47 +1419,8 @@ class NPCRegistry(StrategistArtifact):
             self._attribute_by_text(conv)
 
     @staticmethod
-    def _infer_view_facing(view: View) -> Optional[str]:
-        m = np.asarray(view.key, dtype=bool)
-        px = np.asarray(view.pixels)
-        if m.shape != (16, 16) or px.shape != (16, 16) or not m.any():
-            return None
-        m12 = m[4:, :]
-        sym12 = int((m12 ^ m12[:, ::-1]).sum())
-        mh = m[3:9, 2:14]
-        sym_h = int((mh ^ mh[:, ::-1]).sum())
-        if sym12 <= 16 or sym_h <= 14:
-            light_face = int((px[5:10, 4:12] >= 180).sum())
-            cheeks = int((px[6:9, 5:7] >= 180).sum() + (px[6:9, 9:11] >= 180).sum())
-            if light_face >= 14 and cheeks >= 6:
-                return "down"
-            return "up"
-        l_light = int((px[5:10, 3:8] >= 180).sum())
-        r_light = int((px[5:10, 8:13] >= 180).sum())
-        if l_light > r_light:
-            return "left"
-        if r_light > l_light:
-            return "right"
-        return None
-
-    @staticmethod
     def sighting_facing(look: Look, sighting: Sighting) -> Optional[str]:
-        if sighting.view >= len(look.views):
-            return None
-        view = look.views[sighting.view]
-        facing = view.facing
-        if facing is None and not view.partial:
-            for other in look.views:
-                if other.facing is not None and not other.partial:
-                    dist, fl = S.mask_distance(view.key, other.key)
-                    if dist <= 12:
-                        if fl and other.facing in ("left", "right"):
-                            facing = "left" if other.facing == "right" else "right"
-                        else:
-                            facing = other.facing
-                        break
-        if facing is None:
-            facing = NPCRegistry._infer_view_facing(view)
+        facing = look.views[sighting.view].facing if sighting.view < len(look.views) else None
         if sighting.flipped and facing in ("left", "right"):
             return "left" if facing == "right" else "right"
         return facing
@@ -1547,12 +1508,9 @@ class NPCRegistry(StrategistArtifact):
                 status = f"talked to here (episode {last.episode}){said}"
             else:
                 status = "not talked to yet"
-            seen_info = self.last_seen(gmap, npc)
-            facing = self.sighting_facing(self.look_of(npc), seen_info[2]) if seen_info is not None else None
-            facing_note = f", facing {facing}" if facing else ""
             what = ", ".join(x for x in (npc.kind if npc.kind != "unknown" else "", npc.description[:70]) if x)
             at = "" if where == "away" else f" at ({dx}, {dy})"
-            lines.append(f'- "{display_name(npc)}"{f" ({what})" if what else ""}{at}{facing_note}, {when}: {status}.')
+            lines.append(f'- "{display_name(npc)}"{f" ({what})" if what else ""}{at}, {when}: {status}.')
         if len(here) > max_people:
             lines.append(f"...and {len(here) - max_people} more.")
         lines += maybe_lines(gmap, maybe)
@@ -1618,13 +1576,10 @@ class NPCRegistry(StrategistArtifact):
             if cell in remembered:
                 status = ("remembered here, not recognised on this frame: may have moved; " if self.seen_whole(npc)
                           else "seen only in part (hidden, for example in tall grass); ") + status
-            seen_info = self.last_seen(gmap, npc)
-            facing = self.sighting_facing(self.look_of(npc), seen_info[2]) if seen_info is not None else None
-            facing_note = f", facing {facing}" if facing else ""
             kind = npc.kind if npc.kind != "unknown" else "person"
             name = (f'who gave the name "{npc.real_name}"' if npc.real_name
                     else f'labelled "{npc.name}" (the label is {LABEL_NOTE})')
-            out[cell] = f'{kind} {name}{facing_note} ({status})'[:320]
+            out[cell] = f'{kind} {name} ({status})'[:320]
         for sign, square in self.signs_here(gmap):
             cell = (square[0] - gmap.pos[0], square[1] - gmap.pos[1])
             if cell in out:

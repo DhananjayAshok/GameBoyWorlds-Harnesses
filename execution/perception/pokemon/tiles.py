@@ -14,7 +14,7 @@ from execution.perception.pokemon.navigation import (FURNITURE_OVERHANG_TOP_TAGS
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
                                                      is_overhang_floor_cell, is_player_overhang_floor_cell,
                                                      is_south_ledge_cell, is_top_overhang_floor_cell,
-                                                     is_west_ledge_cell, trainer_los_ray)
+                                                     is_west_ledge_cell)
 from execution.perception.pokemon.prompts import PLAYER_SIDES, TILE_IN_CELL_PROMPT, TILE_TAGS, fill_player_note
 from utils import log_error, parse_key_value
 
@@ -236,13 +236,7 @@ def verbalize_tiles(
                 if tag in REACHABILITY_OBJECT_TAGS
                 else ""
             )
-            los_note = ""
-            if tag == "npc" and people and (x, y) in people:
-                facing, ray = trainer_los_ray(kinds, (x, y), people.get((x, y)))
-                if facing and ray:
-                    ray_str = ", ".join(f"({rx}, {ry})" for rx, ry in ray)
-                    los_note = f" [line of sight ({facing}): {ray_str}]"
-            lines.append(f"({x}, {y}){cell_part(entry['quarters'])} {tag}{details}{reach}{los_note}")
+            lines.append(f"({x}, {y}){cell_part(entry['quarters'])} {tag}{details}{reach}")
     return "\n".join(lines)
 
 

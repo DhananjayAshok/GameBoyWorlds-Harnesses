@@ -348,12 +348,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return (f" [dead-end alcove at {closed_str}: leads into a mapped closed pocket "
                 f"(relative x in [{min(xs)}, {max(xs)}], y in [{min(ys)}, {max(ys)}], no unexplored tiles or doors)]")
 
-    def _describe_edges(
-        self,
-        kinds: Dict[Tuple[int, int], str],
-        people: Optional[Dict[Tuple[int, int], str]] = None,
-    ) -> str:
-        from execution.perception.pokemon.navigation import edge_hazard_annotations, filter_open_lane_edge_cells
+    def _describe_edges(self, kinds: Dict[Tuple[int, int], str]) -> str:
+        from execution.perception.pokemon.navigation import filter_open_lane_edge_cells
         gmap = self._global_map()
         lines = []
         for direction in DIRECTIONS:
@@ -361,16 +357,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if cells:
                 runs = edge_runs(cells, direction)
                 open_cells = [c for r in runs if self._run_pocket_bounds(direction, r) is None for c in r]
-                open_lane_cells = filter_open_lane_edge_cells(
-                    open_cells or cells, direction, kinds, gmap, people=people
-                )
+                open_lane_cells = filter_open_lane_edge_cells(open_cells or cells, direction, kinds, gmap)
                 listed = ", ".join(f"({x}, {y})" for x, y in cells)
-                path = shortest_path(kinds, (0, 0), open_lane_cells or open_cells or cells, people=people)
+                path = shortest_path(kinds, (0, 0), open_lane_cells or open_cells or cells)
                 if path:
                     target = path[-1][2]
                     runs_text = format_path_runs(compress_path(path))
                     listed += f" (shortest path to {target}: {runs_text})"
-                listed += edge_hazard_annotations(cells, kinds, people=people)
                 note = self._edge_pocket_note(direction, cells)
                 if note:
                     listed += note
@@ -507,7 +500,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                            getattr(self._env, "blocked_cells", None))
         self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                               + "\nWalkable cells on each edge of the screen:\n"
-                              + self._describe_edges(kinds, people=people))
+                              + self._describe_edges(kinds))
         return self._screen_tiles
 
     def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
@@ -741,7 +734,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                      getattr(self._env, "blocked_cells", None))
             after_tiles = (verbalize_tiles(after_identified, after_people, after_kinds)
                            + "\nWalkable cells on each edge of the screen:\n"
-                           + self._describe_edges(after_kinds, people=after_people))
+                           + self._describe_edges(after_kinds))
             if move_tag:
                 after_tiles += f"\n{move_tag}"
             after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", after_tiles)
