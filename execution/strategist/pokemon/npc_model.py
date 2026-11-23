@@ -67,6 +67,110 @@ KINDS = ("person", "trainer", "pokemon", "object")
 OUTCOMES = ("info", "gift", "battle", "choice", "other")
 NAME_TYPES = ("personal", "class")
 TAG = re.compile(r"^\s*([A-Z][A-Z.' ]{1,12}):")
+BATTLE_START_LINE_PATTERN = re.compile(
+    r"^\s*(?:Wild\s+\S+.*?\s+appeared!|.+?\s+wants\s+to\s+(?:battle|fight)!|.+?\s+sent\s+out\s+\S+!)\s*$",
+    re.IGNORECASE,
+)
+BATTLE_START_TEXT_PATTERN = re.compile(
+    r"^\s*(?:Wild\s+\S+[\s\S]*?\s+appeared!|[\s\S]+?\s+wants\s+to\s+(?:battle|fight)!|[\s\S]+?\s+sent\s+out\s+\S+!)"
+    r"(?:\s*(?:Wild\s+\S+[\s\S]*?\s+appeared!|[\s\S]+?\s+wants\s+to\s+(?:battle|fight)!|[\s\S]+?\s+sent\s+out\s+\S+!))*\s*$",
+    re.IGNORECASE,
+)
+HEALING_SERVICE_PATTERN = re.compile(
+    r"\b(?:Welcome\s+to\s+our\s+POK[eé]MON\s+CENTER|heal\s+your\s+POK[eé]MON\s+(?:back\s+)?to\s+perfect\s+health"
+    r"|Your\s+POK[eé]MON\s+are\s+fighting\s+fit)\b",
+    re.IGNORECASE,
+)
+SHOP_SERVICE_PATTERN = re.compile(
+    r"(?:May\s+I\s+help\s+you\?|Is\s+there\s+anything\s+else\s+I\s+can\s+do\?"
+    r"|That\s+will\s+be\s+[\s\S]*?OK\?|Here\s+you\s+are!\s*Thank\s+you!)",
+    re.IGNORECASE,
+)
+GIFT_OR_QUEST_PATTERN = re.compile(
+    r"\b(?:received|got\s+a?\s*[A-Z0-9]|handed|delivered|gave\s+you|take\s+this|took\s+the|order\s+came\s+in)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_dialogue_lines(text: str) -> List[str]:
+    return [ln.strip() for ln in (text or "").splitlines() if ln.strip() and not ln.strip().startswith("```")]
+
+
+def is_battle_start_text(text: str) -> bool:
+    lines = _clean_dialogue_lines(text)
+    if not lines:
+        return False
+    if all(BATTLE_START_LINE_PATTERN.match(ln) is not None for ln in lines):
+        return True
+    return bool(BATTLE_START_TEXT_PATTERN.match(" ".join(lines)))
+
+
+def strip_battle_start_lines(text: str) -> str:
+    if not text:
+        return ""
+    lines = [ln for ln in (text or "").splitlines()
+             if not ln.strip().startswith("```") and BATTLE_START_LINE_PATTERN.match(ln.strip()) is None]
+    cleaned = "\n".join(ln for ln in lines if ln.strip()).strip()
+    if cleaned and BATTLE_START_TEXT_PATTERN.match(" ".join(cleaned.splitlines())):
+        return ""
+    return cleaned
+
+
+def is_routine_service_text(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    if GIFT_OR_QUEST_PATTERN.search(text):
+        return False
+    return bool(HEALING_SERVICE_PATTERN.search(text) or SHOP_SERVICE_PATTERN.search(text))
+
+
+def routine_service_summary(text: str) -> Optional[Tuple[str, str]]:
+    if not is_routine_service_text(text):
+        return None
+    if HEALING_SERVICE_PATTERN.search(text):
+        return ("The Pokémon Center nurse welcomed the player and healed their Pokémon to full health.", "other")
+    if SHOP_SERVICE_PATTERN.search(text):
+        return ("The Poké Mart clerk greeted the player and served them at the shop counter.", "other")
+    return None
+
+
+def routine_trainer_challenge_summary(reg: Any, conv: Any) -> Optional[Tuple[str, str]]:
+    if getattr(conv, "trigger", None) != "npc_started":
+        return None
+    if getattr(conv, "led_to", None) != "battle" and getattr(conv, "outcome", None) != "battle":
+        return None
+    text = (getattr(conv, "text", None) or "").strip()
+    if not text or not is_routine_conversation(reg, conv):
+        return None
+    if is_battle_start_text(text) or is_routine_service_text(text):
+        return None
+    first = " ".join(_clean_dialogue_lines(text))[:120]
+    return (f'A trainer challenged the player to a battle: "{first}"', "battle")
+
+
+def is_routine_conversation(reg: Any, conv: Any) -> bool:
+    if getattr(conv, "trigger", None) == "battle_start":
+        return True
+    text = (getattr(conv, "text", None) or "").strip()
+    if not text:
+        return True
+    if is_battle_start_text(text) or is_routine_service_text(text):
+        return True
+    if getattr(conv, "trigger", None) == "npc_started" and (
+            getattr(conv, "led_to", None) == "battle" or getattr(conv, "outcome", None) == "battle"):
+        if GIFT_OR_QUEST_PATTERN.search(text):
+            return False
+        if any(TAG.match(ln) for ln in text.splitlines()):
+            return False
+        if getattr(conv, "name_type", None) == "personal":
+            return False
+        npc_id = getattr(conv, "npc", None)
+        if npc_id in getattr(reg, "npcs", {}):
+            npc = reg.get(npc_id)
+            if npc.real_name and npc.name_type == "personal":
+                return False
+        return True
+    return False
 
 
 def _grey(frame: np.ndarray) -> np.ndarray:
@@ -220,7 +324,8 @@ def try_merge(reg, keep, drop) -> bool:
 def _interacted_with(reg, npc) -> bool:
     for cid in npc.conversations:
         conv = reg.conversations.get(cid)
-        if conv is not None and (conv.text or conv.crops or conv.trigger == "a_press" or conv.complete):
+        if (conv is not None and conv.trigger != "battle_start"
+                and (conv.text or conv.crops or conv.trigger == "a_press" or conv.complete)):
             return True
     return False
 
@@ -366,10 +471,22 @@ def _same_text(text: str) -> str:
 
 def run_summaries(reg, vlm_call: Callable[..., Any], game: str, gmap, only=None) -> None:
     todo = [c for c in (only if only is not None else reg.conversations.values())
-            if c.text.strip() and not c.summarised][:MAX_BATCH]
+            if c.trigger != "battle_start" and c.text.strip() and not c.summarised][:MAX_BATCH]
+    for c in list(todo):
+        if is_battle_start_text(c.text):
+            if hasattr(reg, "_mark_battle_start"):
+                reg._mark_battle_start(c)
+            else:
+                c.trigger, c.read, c.summarised = "battle_start", True, True
+            todo.remove(c)
+            continue
+        service = routine_service_summary(c.text) or routine_trainer_challenge_summary(reg, c)
+        if service is not None:
+            c.summary, c.outcome, c.summarised = service[0], service[1], True
+            todo.remove(c)
     done = {}
     for c in reg.conversations.values():
-        if c.summary:
+        if c.summary and c.trigger != "battle_start":
             done.setdefault(_same_text(c.text), c)
     for c in list(todo):
         twin = done.get(_same_text(c.text))

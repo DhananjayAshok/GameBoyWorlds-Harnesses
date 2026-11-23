@@ -842,13 +842,15 @@ class PokemonStrategist:
 
     def _should_extract_knowledge(self, report: SupervisorReport, conversation_digest: str,
                                   closed: List[Tuple[Tuple[str, ...], str]], town_event: Any,
-                                  episode_status: Optional[str] = None) -> bool:
+                                  episode_status: Optional[str] = None,
+                                  episode_number: Optional[int] = None) -> bool:
         if episode_status == "lost_battle":
             return False
         if not (report.narrative or any(r.notes and r.notes.strip() for r in report.executor_reports)):
             return False
         if conversation_digest.strip():
-            return True
+            if self.npcs is None or episode_number is None or self.npcs.has_noteworthy_conversation(episode_number):
+                return True
         if town_event is not None:
             return True
         if closed and not self.notepad.text.strip():
@@ -1119,7 +1121,7 @@ class PokemonStrategist:
             events.append(town_event)
         conversation_digest = self._conversation_digest(n)
         extracted = False
-        if self._should_extract_knowledge(report, conversation_digest, closed, town_event, record.status):
+        if self._should_extract_knowledge(report, conversation_digest, closed, town_event, record.status, n):
             self._extract_knowledge(report.digest + conversation_digest, before, frame, n)
             extracted = True
         if closed:
