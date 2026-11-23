@@ -1,5 +1,5 @@
 import re
-from typing import Iterable
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -665,3 +665,98 @@ def has_player_pokemon_fainted_text(texts: Iterable[str]) -> bool:
         if text and PLAYER_FAINT_PATTERN.search(str(text)) is not None:
             return True
     return False
+
+
+_ROW_BIT_WEIGHTS = np.array([128, 64, 32, 16, 8, 4, 2, 1], dtype=np.uint8)
+
+HUD_SLASH_TEMPLATES = {
+    (0, 2, 4, 8, 16, 32, 64, 128),
+    (2, 4, 8, 16, 32, 64, 128, 0),
+}
+
+HUD_DIGIT_TEMPLATES = {
+    (0, 56, 76, 198, 198, 100, 56, 0): 0,
+    (0, 24, 56, 24, 24, 24, 126, 0): 1,
+    (0, 124, 198, 14, 120, 224, 254, 0): 2,
+    (0, 124, 198, 14, 124, 224, 254, 0): 2,
+    (0, 126, 12, 56, 6, 198, 124, 0): 3,
+    (0, 28, 60, 108, 204, 254, 12, 0): 4,
+    (0, 252, 128, 252, 6, 198, 124, 0): 5,
+    (0, 252, 192, 252, 6, 198, 124, 0): 5,
+    (0, 124, 192, 252, 198, 198, 124, 0): 6,
+    (0, 254, 198, 12, 24, 48, 48, 0): 7,
+    (0, 124, 198, 124, 198, 198, 124, 0): 8,
+    (0, 124, 198, 198, 126, 6, 124, 0): 9,
+}
+
+
+def _tile_row_signature(tile_2d: np.ndarray) -> Tuple[int, ...]:
+    dark = (tile_2d < DARK_INK).astype(np.uint8)
+    return tuple(int(v) for v in (dark @ _ROW_BIT_WEIGHTS))
+
+
+def _read_tile_hp_fraction(img: np.ndarray, ty: int, slash_tx: int) -> Optional[Tuple[int, int]]:
+    y0 = ty * TILE_SIZE
+    if img.shape[0] < y0 + TILE_SIZE or img.shape[1] < (slash_tx + 4) * TILE_SIZE:
+        return None
+    slash_sig = _tile_row_signature(img[y0:y0 + TILE_SIZE, slash_tx * TILE_SIZE:(slash_tx + 1) * TILE_SIZE])
+    if slash_sig not in HUD_SLASH_TEMPLATES:
+        return None
+    cur_digits: List[str] = []
+    max_digits: List[str] = []
+    for tx, target in (
+        (slash_tx - 3, cur_digits),
+        (slash_tx - 2, cur_digits),
+        (slash_tx - 1, cur_digits),
+        (slash_tx + 1, max_digits),
+        (slash_tx + 2, max_digits),
+        (slash_tx + 3, max_digits),
+    ):
+        tile = img[y0:y0 + TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+        if float((tile >= LIGHT_BACKGROUND).mean()) < 0.50:
+            return None
+        sig = _tile_row_signature(tile)
+        if not any(sig):
+            if target:
+                return None
+            continue
+        digit = HUD_DIGIT_TEMPLATES.get(sig)
+        if digit is None:
+            return None
+        target.append(str(digit))
+    if not cur_digits or not max_digits:
+        return None
+    cur_hp, max_hp = int("".join(cur_digits)), int("".join(max_digits))
+    if 0 <= cur_hp <= max_hp and 10 <= max_hp <= 999:
+        return (cur_hp, max_hp)
+    return None
+
+
+def read_battle_hud_hp(frame: np.ndarray) -> Optional[Tuple[int, int]]:
+    """Return (cur_hp, max_hp) read from the player's battle HUD at tile row 10, or None if not visible."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return None
+    if is_party_menu_screen(img) or is_pack_screen(img):
+        return None
+    return _read_tile_hp_fraction(img, ty=10, slash_tx=14)
+
+
+def read_party_menu_hp(frame: np.ndarray) -> Optional[Tuple[int, int]]:
+    """Return (cur_hp, max_hp) read from the selected (or lead) Pokemon on the party menu screen, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if not is_party_menu_screen(img):
+        return None
+    for slot_ty in (1, 3, 5, 7, 9, 11):
+        for cursor_ty in (slot_ty - 1, slot_ty):
+            if 0 <= cursor_ty < 12 and is_cursor_tile(
+                img[cursor_ty * TILE_SIZE:(cursor_ty + 1) * TILE_SIZE, :TILE_SIZE]
+            ):
+                hp = _read_tile_hp_fraction(img, ty=slot_ty, slash_tx=16)
+                if hp is not None:
+                    return hp
+    return _read_tile_hp_fraction(img, ty=1, slash_tx=16)

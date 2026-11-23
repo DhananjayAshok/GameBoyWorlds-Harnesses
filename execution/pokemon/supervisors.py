@@ -638,11 +638,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if "No healing item was used in menu" in notes:
             self._healing_bag_empty = True
             return
+        menu_hp = CombatExecutor.extract_player_hp_from_text(notes)
         m = re.search(r"\b(?:recovered(?:\s+by)?|restored)\s+(\d+)(?:\s*HP)?\b", notes, re.IGNORECASE)
         if m:
             self._healing_bag_empty = False
-            delta = int(m.group(1))
-            if self._last_seen_battle_hp is not None:
+            if menu_hp is not None:
+                self._last_seen_battle_hp = menu_hp
+            elif self._last_seen_battle_hp is not None:
+                delta = int(m.group(1))
                 cur_hp, max_hp = self._last_seen_battle_hp
                 self._last_seen_battle_hp = (min(max_hp, cur_hp + delta), max_hp)
         elif re.search(
@@ -650,9 +653,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             notes,
             re.IGNORECASE,
         ):
-            if self._last_seen_battle_hp is not None:
+            if menu_hp is not None:
+                self._last_seen_battle_hp = (menu_hp[1], menu_hp[1])
+            elif self._last_seen_battle_hp is not None:
                 _, max_hp = self._last_seen_battle_hp
                 self._last_seen_battle_hp = (max_hp, max_hp)
+        elif menu_hp is not None:
+            self._last_seen_battle_hp = menu_hp
 
     def _party_hp_block(self) -> str:
         if self._last_seen_battle_hp is None and not self._healing_bag_empty:

@@ -18,7 +18,8 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_empty_battle_bag_menu, is_evolution_screen,
                                                  is_move_selection_screen, is_overworld_pack_menu,
                                                  is_pack_item_list_screen, is_pack_screen,
-                                                 is_party_menu_screen, is_same_battle_frame)
+                                                 is_party_menu_screen, is_same_battle_frame,
+                                                 read_battle_hud_hp, read_party_menu_hp)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
@@ -1599,6 +1600,15 @@ Press: <one of up, down, left, right, confirm, back>
         return last
 
     def _last_seen_player_hp(self) -> Optional[Tuple[int, int]]:
+        last_hud: Optional[Tuple[int, int]] = None
+        for step in self.report.steps:
+            if isinstance(step, EnvironmentStepRecord):
+                for frame in (step.frame_before, step.frame_after):
+                    found_hud = read_battle_hud_hp(frame)
+                    if found_hud is not None:
+                        last_hud = found_hud
+        if last_hud is not None:
+            return last_hud
         last: Optional[Tuple[int, int]] = None
         for call in self.report.vlm_call_log:
             if isinstance(call, ExecutorVLMCallRecord) and call.tag in (self.STEP_TAG, self.MOVE_TAG):
@@ -2070,6 +2080,24 @@ Press: <one of up, down, left, right, confirm, back>
         self.report.notes = notes
         return code
 
+    def _last_seen_party_hp(self) -> Optional[Tuple[int, int]]:
+        last_party: Optional[Tuple[int, int]] = None
+        for step in self.report.steps:
+            if isinstance(step, EnvironmentStepRecord):
+                for frame in (step.frame_before, step.frame_after):
+                    found_party = read_party_menu_hp(frame)
+                    if found_party is not None:
+                        last_party = found_party
+        if last_party is not None:
+            return last_party
+        last_vlm: Optional[Tuple[int, int]] = None
+        for call in self.report.vlm_call_log:
+            if isinstance(call, ExecutorVLMCallRecord) and call.tag == self.STEP_TAG:
+                found = CombatExecutor.extract_player_hp_from_text(str(call.response))
+                if found is not None:
+                    last_vlm = found
+        return last_vlm
+
     def _finish(self, code: int, reason: str) -> int:
         if self.dialogue_crops:
             self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
@@ -2077,11 +2105,18 @@ Press: <one of up, down, left, right, confirm, back>
         notes_lines = [f"Presses: {', '.join(self.presses) or 'none'}"]
         if self.dialogue_text:
             notes_lines.append(self.dialogue_text)
+        saw_heal = self._saw_healing_item_effect()
+        party_hp = self._last_seen_party_hp()
+        if party_hp is not None and (
+            saw_heal
+            or re.search(r"\b(?:item|bag|potion|restore\s+hp|heal|pokemon|party)\b", self._task or "", re.IGNORECASE)
+        ):
+            notes_lines.append(f"[Party HP seen in menu: {party_hp[0]}/{party_hp[1]} HP]")
         if (
             self.is_start_menu
             and re.search(r"\b(?:item|bag|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
             and re.search(r"\b(?:heal|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
-            and not self._saw_healing_item_effect()
+            and not saw_heal
         ):
             notes_lines.append("[No healing item was used in menu: bag had no usable healing item]")
         self.report.termination_reason = reason

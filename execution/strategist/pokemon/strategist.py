@@ -396,6 +396,9 @@ class PokemonStrategist:
         fought, fled = fought_and_fled_battles_in_digest(digest)
         self._fought_since_heal += fought
         self._fled_since_heal += fled
+        m_rec = HEALING_ITEM_USED_PATTERN.search(digest)
+        if m_rec:
+            self._healing_bag_empty = False
         hp = CombatExecutor.extract_player_hp_from_text(digest)
         if hp is None and record.supervisor_report is not None:
             for ex in record.supervisor_report.executor_reports:
@@ -421,9 +424,7 @@ class PokemonStrategist:
             self._last_battle_hp_episode = record.n
             self._fought_since_last_hp = 0
         else:
-            m_rec = HEALING_ITEM_USED_PATTERN.search(digest)
             if m_rec and self._last_battle_hp is not None and fought == 0:
-                self._healing_bag_empty = False
                 cur_hp, max_hp = self._last_battle_hp
                 self._last_battle_hp = (min(max_hp, cur_hp + int(m_rec.group(1))), max_hp)
                 self._last_battle_hp_episode = record.n
