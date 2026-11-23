@@ -665,11 +665,20 @@ class GridMoveExecutor(PolicyExecutor):
                                   f"Stopped moving {direction} with {remaining} steps left")
         return None
 
+    def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
+        if not callable(self.people_fn):
+            return None
+        try:
+            return self.people_fn()
+        except Exception:  # noqa: BLE001
+            return None
+
     def _walk(self, goals: Dict[Tuple[int, int], Optional[str]], prefer_lateral: bool = False) -> Optional[int]:
         current_goals = dict(goals)
         reroutes = 0
         while True:
-            path = shortest_path(self.cell_kinds, (0, 0), current_goals, prefer_lateral=prefer_lateral)
+            people = self._people_now()
+            path = shortest_path(self.cell_kinds, (0, 0), current_goals, prefer_lateral=prefer_lateral, people=people)
             if path is None:
                 if reroutes > 0:
                     return self._fail(MOVE_BLOCKED, "move_blocked",
@@ -729,7 +738,10 @@ class GridMoveExecutor(PolicyExecutor):
                         if shifted_goals:
                             blocked_neighbor = DIRECTIONS.get(failed_dir)
                             self._refresh_local_perception(blocked_neighbor=blocked_neighbor)
-                            if shortest_path(self.cell_kinds, (0, 0), shifted_goals, prefer_lateral=prefer_lateral) is not None:
+                            if shortest_path(
+                                self.cell_kinds, (0, 0), shifted_goals,
+                                prefer_lateral=prefer_lateral, people=self._people_now(),
+                            ) is not None:
                                 current_goals = shifted_goals
                                 reroutes += 1
                                 self.report.termination_reason = None
@@ -764,14 +776,6 @@ Location: <(x, y), Ambiguous, or Not Found>
 Candidates: <if Ambiguous, each candidate with its coordinates and what sets it apart from the others; otherwise None>
 [STOP]"""
 
-    def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
-        if not callable(self.people_fn):
-            return None
-        try:
-            return self.people_fn()
-        except Exception:  # noqa: BLE001
-            return None
-
     def _resolve_explicit_target(self) -> Optional[Tuple[int, int]]:
         coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
         if len(coords) != 1:
@@ -779,12 +783,13 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
         target = coords[0]
         if target == (0, 0):
             return target
+        people = self._people_now()
         if self.cell_kinds.get(target) == WALKABLE:
-            if shortest_path(self.cell_kinds, (0, 0), [target]) is not None:
+            if shortest_path(self.cell_kinds, (0, 0), [target], people=people) is not None:
                 return target
         else:
-            goals = approach_cells(self.cell_kinds, target, identified=self.identified, people=self._people_now())
-            if goals and shortest_path(self.cell_kinds, (0, 0), goals) is not None:
+            goals = approach_cells(self.cell_kinds, target, identified=self.identified, people=people)
+            if goals and shortest_path(self.cell_kinds, (0, 0), goals, people=people) is not None:
                 return target
         return target
 
@@ -946,9 +951,10 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         if not coords:
             return direction
         gmap = getattr(self._env, "_map", None)
+        people = self._people_now()
         cells = edge_cells(self.cell_kinds, direction)
         forward_cells = filter_forward_edge_cells(cells, direction)
-        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap)
+        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap, people=people)
         if any(c in open_cells for c in coords):
             return direction
         # If an explicit corner or edge coordinate has an open exit on another edge that it touches
@@ -978,7 +984,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             if not matching:
                 continue
             d_forward = filter_forward_edge_cells(d_cells, d)
-            d_open = filter_open_lane_edge_cells(d_forward, d, self.cell_kinds, gmap)
+            d_open = filter_open_lane_edge_cells(d_forward, d, self.cell_kinds, gmap, people=people)
             in_open = int(any(c in d_open for c in matching))
             depth = 0
             if seg is not None:
@@ -1008,7 +1014,8 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             return None
         forward_cells = filter_forward_edge_cells(cells, direction)
         gmap = getattr(self._env, "_map", None)
-        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap)
+        people = self._people_now()
+        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap, people=people)
 
         on_edge_coords = [c for c in coords if c in cells]
         if on_edge_coords:
@@ -1026,7 +1033,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                     preferred = [nearest]
             if not preferred:
                 preferred = [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
-            path = shortest_path(self.cell_kinds, (0, 0), preferred)
+            path = shortest_path(self.cell_kinds, (0, 0), preferred, people=people)
             target = path[-1][2] if path else preferred[0]
             return direction, target
 
@@ -1043,11 +1050,11 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         if len(runs) == 1:
             run = runs[0]
             if is_bare_direction or len(run) <= self.MAX_DETERMINISTIC_CORRIDOR_WIDTH:
-                path = shortest_path(self.cell_kinds, (0, 0), run)
+                path = shortest_path(self.cell_kinds, (0, 0), run, people=people)
                 target = path[-1][2] if path else run[0]
                 return direction, target
-        elif is_bare_direction and open_cells:
-            path = shortest_path(self.cell_kinds, (0, 0), open_cells)
+        elif open_cells and (is_bare_direction or not coords):
+            path = shortest_path(self.cell_kinds, (0, 0), open_cells, people=people)
             if path:
                 return direction, path[-1][2]
         return None
@@ -1097,7 +1104,10 @@ Location: <(x, y) or Not Found>
             prompt = (self.LOCATE_PROMPT.replace("[TARGET]", self._task.strip())
                       .replace("[GRID_DESCRIPTION]", GRID_DESCRIPTION)
                       .replace("[SCREEN_TILES]", self.screen_tiles)
-                      .replace("[EDGE_CELLS]", verbalize_edges(self.cell_kinds)))
+                      .replace("[EDGE_CELLS]", verbalize_edges(
+                          self.cell_kinds, people=self._people_now(),
+                          global_map=getattr(self._env, "_map", None),
+                      )))
             output = self._locate(prompt)
             location = (parse_key_value(output, "Location") or "").strip()
             direction = (parse_key_value(output, "Direction") or "").strip().lower()
@@ -1129,7 +1139,9 @@ Location: <(x, y) or Not Found>
                 return self._fail(MOVE_BAD_LOCATION, "bad_location",
                                   f"{location!r} is not a walkable cell on the {direction} edge")
             gmap = getattr(self._env, "_map", None)
-            open_cells = filter_open_lane_edge_cells(candidate_cells, direction, self.cell_kinds, gmap)
+            open_cells = filter_open_lane_edge_cells(
+                candidate_cells, direction, self.cell_kinds, gmap, people=self._people_now()
+            )
             if target not in open_cells and open_cells:
                 axis = 0 if direction in ("up", "down") else 1
                 adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= 2]

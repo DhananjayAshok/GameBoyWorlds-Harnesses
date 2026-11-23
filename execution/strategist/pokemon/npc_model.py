@@ -386,8 +386,19 @@ def _apply_card(reg, npc, card: Dict[str, Any]) -> None:
     if card["description"]:
         npc.description = card["description"]
     if card["facing"] and npc.sightings:
+        from execution.perception.pokemon import sprites as S
         view = look.views[min(npc.sightings[0].view, len(look.views) - 1)]
         view.facing = card["facing"]
+        auto = reg._p.get("auto", 12) if hasattr(reg, "_p") else 12
+        for other_view in look.views:
+            if other_view is view or other_view.partial or other_view.facing is not None:
+                continue
+            dist, flipped = S.mask_distance(other_view.key, view.key)
+            if dist <= auto:
+                if flipped and view.facing in ("left", "right"):
+                    other_view.facing = "left" if view.facing == "right" else "right"
+                else:
+                    other_view.facing = view.facing
     npc.needs = None
 
 
