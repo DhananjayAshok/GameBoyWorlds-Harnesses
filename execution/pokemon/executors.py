@@ -1262,7 +1262,7 @@ Choose what to do next:
 - fight: attack, and say which of the four moves to use (1 is the top one)
 - progress: press through battle text, or continue when there is no choice to make
 - run: try to escape. This never works against another trainer
-- bag: open the bag to use an item; only choose it if an item is needed
+- bag: open the bag to use an item; choose this in a trainer battle when your active Pokemon's HP is critically low (at or below ~35-50% of max HP) and you cannot safely knock out the opponent first, unless a note below says the bag has no usable item
 - pokemon: open your team to switch; only choose it if switching is needed
 
 Respond in exactly this format:
@@ -1954,9 +1954,18 @@ Press: <one of up, down, left, right, confirm, back>
         if self.dialogue_crops:
             self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
                                                parameters=self._parameters))
+        notes_lines = [f"Presses: {', '.join(self.presses) or 'none'}"]
+        if self.dialogue_text:
+            notes_lines.append(self.dialogue_text)
+        elif (
+            self.is_start_menu
+            and re.search(r"\b(?:item|bag|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
+            and re.search(r"\b(?:heal|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
+            and not self._saw_healing_item_effect()
+        ):
+            notes_lines.append("[No healing item was used in menu: bag had no usable healing item]")
         self.report.termination_reason = reason
-        self.report.notes = "\n".join(filter(None, [f"Presses: {', '.join(self.presses) or 'none'}",
-                                                    self.dialogue_text]))
+        self.report.notes = "\n".join(filter(None, notes_lines))
         return code
 
     def _agent_state(self):
@@ -1985,6 +1994,23 @@ Press: <one of up, down, left, right, confirm, back>
         if not self.presses:
             return ""
         return f"\nPresses made so far, in order: {', '.join(self.presses)}.\n"
+
+    def _saw_healing_item_effect(self) -> bool:
+        if self.dialogue_text and re.search(
+            r"\b(?:recovered\s+by\s+\d+|restored\s+\d+\s*HP|HP\s+was\s+restored)\b",
+            self.dialogue_text,
+            re.IGNORECASE,
+        ):
+            return True
+        for call in self.report.vlm_call_log:
+            if isinstance(call, ExecutorVLMCallRecord) and call.tag == self.STEP_TAG:
+                if re.search(
+                    r"\b(?:recovered\s+by\s+\d+|restored\s+\d+\s*HP|HP\s+was\s+restored)\b",
+                    str(call.response),
+                    re.IGNORECASE,
+                ):
+                    return True
+        return False
 
     def _execute(self) -> int:
         self._last_terminated = False

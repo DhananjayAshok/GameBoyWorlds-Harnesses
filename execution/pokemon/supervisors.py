@@ -108,11 +108,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def __init__(self, task: str, env, game: str, max_steps: int,
                  tile_recognizer: TileRecognizer, episode_number: int, guidance: Optional[str] = None,
                  battle_tips: Optional[List[str]] = None,
-                 screen_people: Optional[Callable[[], Dict[Tuple[int, int], str]]] = None, **kwargs: Any) -> None:
+                 screen_people: Optional[Callable[[], Dict[Tuple[int, int], str]]] = None,
+                 initial_battle_hp: Optional[Tuple[int, int]] = None,
+                 initial_healing_bag_empty: bool = False, **kwargs: Any) -> None:
         self._screen_people = screen_people
         self._current_tag: Optional[str] = None
         self._guidance = guidance
         self._battle_tips = list(battle_tips or [])
+        self._last_seen_battle_hp: Optional[Tuple[int, int]] = initial_battle_hp
+        self._healing_bag_empty: bool = bool(initial_healing_bag_empty)
         self._losses_at_start = env.get_info()["pokemon_core"].get("n_battles_lost", 0)
         gmap_init = getattr(env, "_map", None)
         self._defeats_at_start = len(getattr(gmap_init, "defeats", ()) or ())
@@ -440,6 +444,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 else:
                     route_note = where
                 lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({route_note})")
+        hp_block = self._party_hp_block()
+        if hp_block:
+            lines.insert(1 if lines else 0, hp_block)
         return PLAYTHROUGH_AREA_MAP_BLOCK.replace("[AREA_MAP]", "\n".join(lines))
 
     def _format_leg_movement(
@@ -604,12 +611,69 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             location_failed=report.outcome in LOCATION_FAIL_CODES,
                             ambiguous=report.outcome == MOVE_TARGET_AMBIGUOUS)
 
+    def _update_party_hp_from_combat(self, report: ExecutorReport) -> None:
+        if getattr(self.last_executor, "_bag_unavailable", False):
+            self._healing_bag_empty = True
+        hp = CombatExecutor.extract_player_hp_from_text(report.notes or "")
+        if hp is not None:
+            self._last_seen_battle_hp = hp
+
+    def _update_party_hp_from_menu(self, report: ExecutorReport) -> None:
+        notes = report.notes or ""
+        if "No healing item was used in menu" in notes:
+            self._healing_bag_empty = True
+            return
+        m = re.search(r"\b(?:recovered\s+by|restored)\s+(\d+)\b", notes, re.IGNORECASE)
+        if m:
+            self._healing_bag_empty = False
+            delta = int(m.group(1))
+            if self._last_seen_battle_hp is not None:
+                cur_hp, max_hp = self._last_seen_battle_hp
+                self._last_seen_battle_hp = (min(max_hp, cur_hp + delta), max_hp)
+        elif re.search(
+            r"\b(?:fighting\s+fit|fully\s+healed|restored\s+(?:your\s+POK[eé]MON\s+)?to\s+full\s+health)\b",
+            notes,
+            re.IGNORECASE,
+        ):
+            if self._last_seen_battle_hp is not None:
+                _, max_hp = self._last_seen_battle_hp
+                self._last_seen_battle_hp = (max_hp, max_hp)
+
+    def _party_hp_block(self) -> str:
+        if self._last_seen_battle_hp is None and not self._healing_bag_empty:
+            return ""
+        lines: List[str] = []
+        if self._last_seen_battle_hp is not None:
+            cur_hp, max_hp = self._last_seen_battle_hp
+            low = cur_hp * 2 <= max_hp
+            bag_note = (
+                " (healing bag was already checked and has no usable healing items)"
+                if self._healing_bag_empty else ""
+            )
+            if low and not self._healing_bag_empty:
+                lines.append(
+                    f"Active Pokemon last seen battle HP: {cur_hp}/{max_hp} HP (LOW — at or below 50% max HP; "
+                    f"before walking further along a route/cave or talking to a trainer, use Menu(open the ITEM menu "
+                    f"and use a Potion to heal your active Pokemon, then close the menu) first)."
+                )
+            elif low and self._healing_bag_empty:
+                lines.append(
+                    f"Active Pokemon last seen battle HP: {cur_hp}/{max_hp} HP (LOW — at or below 50% max HP){bag_note}."
+                )
+            else:
+                lines.append(f"Active Pokemon last seen battle HP: {cur_hp}/{max_hp} HP{bag_note}.")
+        elif self._healing_bag_empty:
+            lines.append("Bag healing item status: No usable healing items in bag (checked earlier).")
+        return "\n".join(lines)
+
     def _process_combat(self, report: ExecutorReport) -> Dict[str, Any]:
+        self._update_party_hp_from_combat(report)
         return self._result("combat", report, report.outcome == BATTLE_ENDED,
                             dialogue=report.notes,
                             left_battle=report.outcome in (BATTLE_LEFT_TO_DIALOGUE, BATTLE_LEFT_TO_MENU))
 
     def _process_menu(self, report: ExecutorReport) -> Dict[str, Any]:
+        self._update_party_hp_from_menu(report)
         succeeded = (report.outcome in (MENU_OK, MENU_LEFT_TO_DIALOGUE, MENU_LEFT_TO_BATTLE)
                      and bool(report.steps))
         return self._result("menu", report,
@@ -757,6 +821,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _battle_instructions(self, frame) -> str:
         tips = PLAYTHROUGH_BATTLE_TIPS_BLOCK.replace("[TIPS]", self._tips_text()) if self._battle_tips else ""
+        hp_line = self._party_hp_block()
+        if hp_line:
+            tips = f"\n{hp_line}\n" + tips
         output = self._vlm_call("battle_instructions",
                                 texts=self._fill_prompt(PLAYTHROUGH_BATTLE_INSTRUCTIONS_PROMPT)
                                 .replace("[BATTLE_TIPS_BLOCK]", tips),

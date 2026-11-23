@@ -67,6 +67,52 @@ HEALING_DIGEST_PATTERN = re.compile(
     r"|healed\s+(?:the\s+|your\s+|all\s+)?(?:POK[eé]MON|party)|take\s+a\s+rest)\b",
     re.IGNORECASE,
 )
+HEALING_ITEM_BOUGHT_PATTERN = re.compile(
+    r"\b(?:here\s+you\s+are!\s*thank\s+you!|bought\s+\d*\s*(?:super\s+|hyper\s+|max\s+)?potions?"
+    r"|bought\s+as\s+many\s+potions)\b",
+    re.IGNORECASE,
+)
+HEALING_ITEM_USED_PATTERN = re.compile(
+    r"\b(?:recovered\s+by|restored)\s+(\d+)\b",
+    re.IGNORECASE,
+)
+HEALING_BAG_EMPTY_PATTERN = re.compile(
+    r"(?:No\s+healing\s+item\s+was\s+used\s+in\s+menu"
+    r"|bag\s+is\s+empty\s*\(only\s+CANCEL\)"
+    r"|closed\s+the\s+bag\s+without\s+using\s+an\s+item)",
+    re.IGNORECASE,
+)
+
+
+def is_healing_item_bought_digest(digest: str) -> bool:
+    if not digest:
+        return False
+    if HEALING_ITEM_BOUGHT_PATTERN.search(digest):
+        return True
+    return bool("here you are!" in digest.lower() and "potion" in digest.lower())
+
+
+def is_healing_bag_empty_digest(digest: str) -> bool:
+    if not digest or is_healing_digest(digest) or is_healing_item_bought_digest(digest):
+        return False
+    if HEALING_BAG_EMPTY_PATTERN.search(digest):
+        return True
+    if "Text seen along the way, in order:" in digest:
+        text_sec = digest.split("Text seen along the way, in order:", 1)[1]
+        chunks = re.split(r"\n-\s+while\s+doing\s+\"", text_sec)
+        for ch in chunks[1:]:
+            if "\":" not in ch:
+                continue
+            obj, body = ch.split("\":", 1)
+            body = body.strip()
+            if (
+                re.search(r"\b(?:item|bag|potion|restore\s+hp)\b", obj, re.IGNORECASE)
+                and body.startswith("Presses:")
+                and len(body.splitlines()) == 1
+                and not HEALING_ITEM_USED_PATTERN.search(body)
+            ):
+                return True
+    return False
 BATTLE_CHUNK_PATTERN = re.compile(
     r"\b(?:Wild\s+[A-Z0-9♀♂.'-]+\s+appeared|wants\s+to\s+(?:battle|fight)"
     r"|sent\s+out\s+[A-Z0-9♀♂.'-]+!|used\s+[A-Z0-9♀♂.' -]+!|Got\s+away\s+safely!)",
@@ -260,6 +306,7 @@ class PokemonStrategist:
         self._last_battle_hp: Optional[Tuple[int, int]] = None
         self._last_battle_hp_episode: Optional[int] = None
         self._fought_since_last_hp: int = 0
+        self._healing_bag_empty: bool = False
 
         self._started_at = datetime.now()
         self._session_dir = self._resolve_session_dir()
@@ -334,6 +381,10 @@ class PokemonStrategist:
     def _record_party_episode(self, record: EpisodeRecord,
                               strategist_calls: Optional[List[StrategistVLMCallRecord]] = None) -> None:
         digest = record.supervisor_report.digest if record.supervisor_report is not None else ""
+        if is_healing_item_bought_digest(digest):
+            self._healing_bag_empty = False
+        elif is_healing_bag_empty_digest(digest):
+            self._healing_bag_empty = True
         if is_real_battle_loss(record) or is_healing_digest(digest):
             self._fought_since_heal = 0
             self._fled_since_heal = 0
@@ -370,6 +421,12 @@ class PokemonStrategist:
             self._last_battle_hp_episode = record.n
             self._fought_since_last_hp = 0
         else:
+            m_rec = HEALING_ITEM_USED_PATTERN.search(digest)
+            if m_rec and self._last_battle_hp is not None and fought == 0:
+                self._healing_bag_empty = False
+                cur_hp, max_hp = self._last_battle_hp
+                self._last_battle_hp = (min(max_hp, cur_hp + int(m_rec.group(1))), max_hp)
+                self._last_battle_hp_episode = record.n
             self._fought_since_last_hp += fought
 
     def _party_status_block(self) -> str:
@@ -395,13 +452,24 @@ class PokemonStrategist:
             if fought_after_hp > 0:
                 hp_note += f", followed by {fought_after_hp} more battle(s) without healing"
             parts.append(hp_note)
+        if self._healing_bag_empty:
+            parts.append("bag was already checked and has no usable healing items")
         status = "; ".join(parts)
         low_hp = (last_hp is not None and last_hp[0] * 2 <= last_hp[1]) or fought >= 3
-        warning = (
-            " — party HP is low/weakened; enter a Pokemon Center to heal before continuing onto a route or trainer battles."
-            if low_hp else
-            " — party has taken battle attrition and has not healed at a Pokemon Center yet."
-        )
+        if low_hp:
+            if self._healing_bag_empty:
+                warning = (
+                    " — party HP is low/weakened and the bag has no healing items; "
+                    "enter a Pokemon Center to heal (or buy Potions) before continuing onto a route or trainer battles."
+                )
+            else:
+                warning = (
+                    " — party HP is low/weakened; open the Start menu to heal your active Pokemon with a Potion "
+                    "from the ITEM menu (or enter a nearby Pokemon Center to heal) before walking further along a "
+                    "route/cave or engaging trainer battles."
+                )
+        else:
+            warning = " — party has taken battle attrition and has not healed at a Pokemon Center yet."
         return f"\nParty health status: {status}{warning}\n"
 
     def _load_prior_episodes(self) -> List[EpisodeRecord]:
@@ -1015,6 +1083,8 @@ class PokemonStrategist:
             tile_recognizer=self.tiles, episode_number=n, guidance=guidance, parameters=self._parameters,
             max_new_tokens=self._supervisor_max_new_tokens, battle_tips=battle_tips(self.guide),
             screen_people=self._screen_people if self.npcs is not None else None,
+            initial_battle_hp=self._last_battle_hp,
+            initial_healing_bag_empty=self._healing_bag_empty,
             **self._supervisor_kwargs,
         )
         env.marker = lambda: (len(supervisor.report.narrative), len(supervisor.report.event_log))
