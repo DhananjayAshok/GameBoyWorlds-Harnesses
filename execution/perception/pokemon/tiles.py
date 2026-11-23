@@ -87,6 +87,14 @@ INDOOR_LADDER_SIGN_DESC_PATTERN = re.compile(
     r"^(?:wooden\s+sign(?:post)?|freestanding\s+sign(?:post)?|signpost)$",
     re.IGNORECASE,
 )
+TABLETOP_SURFACE_DESC_PATTERN = re.compile(
+    r"\b(?:table|desk|counter)\b",
+    re.IGNORECASE,
+)
+ITEM_BALL_DESC_PATTERN = re.compile(
+    r"\b(?:ball|item)\b",
+    re.IGNORECASE,
+)
 
 
 def is_solid_shade_piece(image: Optional[np.ndarray]) -> bool:
@@ -108,11 +116,60 @@ def is_indoor_floor_ladder_quarter(
     return not bool(np.any((arr > 60) & (arr < 150)))
 
 
+def is_overworld_item_ball_quarter(
+    tag: str, description: Optional[str], image: Optional[np.ndarray] = None
+) -> bool:
+    if image is None or image.size == 0:
+        return False
+    arr = np.squeeze(np.asarray(image))
+    if arr.shape != (8, 8):
+        return False
+    if description and TABLETOP_SURFACE_DESC_PATTERN.search(description):
+        return False
+
+    def _top_left_dome(a: np.ndarray) -> bool:
+        border = ((0, 3), (1, 3), (2, 2), (3, 2), (4, 2), (5, 2), (6, 3), (7, 3))
+        if not all(int(a[r, c]) == 0 for r, c in border):
+            return False
+        interior = [int(a[r, c]) for r in range(8) for c in range(4 if r in (0, 1, 6, 7) else 3, 8)]
+        if not all(v >= 150 for v in interior):
+            return False
+        if not all(int(a[r, c]) >= 240 for r in (5, 6, 7) for c in range(4, 8)):
+            return False
+        bg = a[2:8, 0:2]
+        if bool(np.all(bg == bg[0:1, :])):
+            return False
+        return True
+
+    def _bottom_left_rim(a: np.ndarray) -> bool:
+        if not (int(a[0, 4]) == 0 and int(a[0, 5]) == 0 and int(a[0, 6]) >= 240 and int(a[0, 7]) >= 240):
+            return False
+        if not (int(a[1, 6]) == 0 and int(a[1, 7]) == 0 and int(a[1, 4]) > 0):
+            return False
+        if not (int(a[2, 6]) > 0 and int(a[2, 7]) > 0):
+            return False
+        sub = a[2:8, 2:8]
+        if bool(np.all(sub == sub[0:1, :])):
+            return False
+        if any(int(a[r, c]) == 0 and int(a[r, c + 1]) == 0 for r in range(2, 8) for c in range(2, 7)):
+            return False
+        return True
+
+    return (
+        _top_left_dome(arr)
+        or _top_left_dome(arr[:, ::-1])
+        or _bottom_left_rim(arr)
+        or _bottom_left_rim(arr[:, ::-1])
+    )
+
+
 def normalize_tabletop_tag(tag: str, description: Optional[str], image: Optional[np.ndarray] = None) -> str:
     if tag in WARP_QUARTER_TAGS and is_solid_shade_piece(image):
         return "ground"
     if is_indoor_floor_ladder_quarter(tag, description, image):
         return "staircase"
+    if is_overworld_item_ball_quarter(tag, description, image):
+        return "item"
     if description:
         stripped = description.strip()
         if tag == "obstacle" and TABLETOP_OBJECT_PATTERN.search(stripped):
@@ -215,8 +272,13 @@ def verbalize_tiles(
             continue
         entry = by_cell.setdefault((x, y), {}).setdefault(tag, {"quarters": set(), "descriptions": []})
         entry["quarters"].add(quarter)
-        if tile.description and tile.description not in entry["descriptions"]:
-            entry["descriptions"].append(tile.description)
+        desc = (
+            "Poke Ball on the ground"
+            if tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description))
+            else tile.description
+        )
+        if desc and desc not in entry["descriptions"]:
+            entry["descriptions"].append(desc)
     for cell, label in (people or {}).items():
         if isinstance(label, str) and label.startswith("sign:"):
             sign_note = label[len("sign:"):].strip()
@@ -325,7 +387,12 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
                 continue
             if is_npc_head_overhang and quarter in ("bottom_left", "bottom_right") and tag == "npc":
                 continue
-            groups.setdefault((tag, tile.description), set()).add(quarter)
+            desc = (
+                "Poke Ball on the ground"
+                if tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description))
+                else tile.description
+            )
+            groups.setdefault((tag, desc), set()).add(quarter)
     parts = []
     for (tag, description), quarters in groups.items():
         where = cell_part(quarters).strip().strip("()")
@@ -484,6 +551,8 @@ class TileRecognizer(StrategistArtifact):
             return Tile(image=None, hash=None, tag="entrance", description="doorway")
         if "staircase" in tags:
             return Tile(image=None, hash=None, tag="staircase", description="staircase")
+        if "item" in tags:
+            return Tile(image=None, hash=None, tag="item", description="Poke Ball on the ground")
         if "sign" in tags:
             return Tile(image=None, hash=None, tag="sign", description="signpost")
         if "npc" in tags or kind == "occupied":
@@ -602,6 +671,8 @@ class TileRecognizer(StrategistArtifact):
             new_tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
             if tile.tag == "sign" and new_tag == "staircase":
                 tile.description = "indoor floor ladder"
+            elif new_tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description)):
+                tile.description = "Poke Ball on the ground"
             tile.tag = new_tag
 
     @update
@@ -610,6 +681,8 @@ class TileRecognizer(StrategistArtifact):
             new_tag = normalize_tabletop_tag(tile.tag, tile.description, getattr(tile, "image", None))
             if tile.tag == "sign" and new_tag == "staircase":
                 tile.description = "indoor floor ladder"
+            elif new_tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description)):
+                tile.description = "Poke Ball on the ground"
             tile.tag = new_tag
             self.tiles.append(tile)
             self._by_hash[tile.hash] = tile

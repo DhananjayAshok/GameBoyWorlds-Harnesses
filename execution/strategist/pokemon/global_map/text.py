@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 LEGEND = ('@ you   . walkable   # blocked   = ledge (jump down only)   < ledge (jump left only)   D door/stairs   '
-          '" tall grass   ~ water   n person   % not yet recognised   ? never seen')
+          'i item ball   " tall grass   ~ water   n person   % not yet recognised   ? never seen')
 SECTORS = ("east", "north-east", "north", "north-west", "west", "south-west", "south", "south-east")
 
 
@@ -24,6 +24,8 @@ def glyph(c: Optional[MapCell]) -> str:
         return "n"
     if is_door(c):
         return "D"
+    if "item" in tags:
+        return "i"
     if "water" in tags:
         return "~"
     if c.kind == WALKABLE and "tall grass" in tags:
