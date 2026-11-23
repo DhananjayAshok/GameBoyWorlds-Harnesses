@@ -323,22 +323,21 @@ def _ordered_directions_for_goals(start: Cell, goals: set, prefer_lateral: bool 
     return tuple(primary + [d for d in DIRECTIONS if d not in primary])
 
 
-def shortest_path(
+def _bfs_shortest_path(
     kinds: Dict[Cell, str],
     start: Cell,
-    goals: Iterable[Cell],
-    prefer_lateral: bool = False,
+    goals: set,
+    direction_order: Tuple[str, ...],
+    avoid_set: Optional[set] = None,
 ) -> Optional[List[Tuple[str, str, Cell]]]:
-    goals = set(goals)
-    if start in goals:
-        return []
-    direction_order = _ordered_directions_for_goals(start, goals, prefer_lateral=prefer_lateral)
     previous: Dict[Cell, Tuple[Cell, str, str]] = {start: None}
     queue = deque([start])
     while queue:
         cell = queue.popleft()
         for direction, nxt in neighbours(cell, direction_order):
             if not in_bounds(nxt):
+                continue
+            if avoid_set and nxt in avoid_set and nxt not in goals:
                 continue
             kind = kinds.get(nxt, BLOCKED)
             if kind == WALKABLE:
@@ -347,6 +346,8 @@ def shortest_path(
                 dx, dy = DIRECTIONS[direction]
                 landing, move = (nxt[0] + dx, nxt[1] + dy), "jump"
                 if not in_bounds(landing) or kinds.get(landing, BLOCKED) != WALKABLE:
+                    continue
+                if avoid_set and landing in avoid_set and landing not in goals:
                     continue
             else:
                 continue
@@ -362,6 +363,25 @@ def shortest_path(
                 return path[::-1]
             queue.append(landing)
     return None
+
+
+def shortest_path(
+    kinds: Dict[Cell, str],
+    start: Cell,
+    goals: Iterable[Cell],
+    prefer_lateral: bool = False,
+    avoid_cells: Optional[Iterable[Cell]] = None,
+) -> Optional[List[Tuple[str, str, Cell]]]:
+    goals = set(goals)
+    if start in goals:
+        return []
+    direction_order = _ordered_directions_for_goals(start, goals, prefer_lateral=prefer_lateral)
+    avoid_set = (set(avoid_cells) - goals - {start}) if avoid_cells else None
+    if avoid_set:
+        avoided_path = _bfs_shortest_path(kinds, start, goals, direction_order, avoid_set=avoid_set)
+        if avoided_path is not None:
+            return avoided_path
+    return _bfs_shortest_path(kinds, start, goals, direction_order, avoid_set=None)
 
 
 def compress_path(path: List[Tuple[str, str, Cell]]) -> List[Tuple[str, int, str]]:
@@ -470,6 +490,102 @@ def is_on_edge(cell: Cell, direction: str) -> bool:
     }[direction]
 
 
+AVOID_MARKER_PATTERN = re.compile(
+    r"\b(?:"
+    r"avoid(?:ing|s)?"
+    r"|do\s+not|don't|not|never"
+    r"|without"
+    r"|except|excluding"
+    r"|instead\s+of|rather\s+than|other\s+than"
+    r"|away\s+from|clear\s+of"
+    r"|stay(?:ing)?\s+(?:off|away\s+from|clear\s+of)"
+    r"|keep(?:ing)?\s+(?:off|away\s+from|clear\s+of)"
+    r"|bypass(?:ing)?"
+    r"|skip(?:ping)?"
+    r"|ignor(?:e|ing)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+POSITIVE_ROUTE_BREAK_PATTERN = re.compile(
+    r"\b(?:"
+    r"via|through|along|toward|towards"
+    r"|by\s+(?:walking|moving|going|stepping|heading|continuing|taking|using)"
+    r"|to\s+(?:exit|reach|enter|take|walk|move|go|step|head|continue|leave|pass|cross|get)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+COMPLETED_AVOID_OBJECT_THEN_ROUTE_PATTERN = re.compile(
+    r"\b(?:the|a|an|this|that|any)\s+[a-z][\w\s-]*?\b(?:"
+    r"via|through|along|toward|towards"
+    r"|by\s+(?:walking|moving|going|stepping|heading|continuing|taking|using)"
+    r"|to\s+(?:exit|reach|enter|take|walk|move|go|step|head|continue|leave|pass|cross|get)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+COORD_NP_CONTINUATION_PATTERN = re.compile(
+    r"^\s*(?:,\s*)?(?:(?:and|or|nor)\s+)?(?:,\s*)?(?:(?:the|a|an|any|another)\s+[\w\s-]{1,30}?\s+)?(?:(?:at|on|in)\s+)?$",
+    re.IGNORECASE,
+)
+
+CLAUSE_CONJUNCTION_SPLIT_PATTERN = re.compile(
+    r"\b(?:and|but|then|while)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_task_cells(text: Optional[str]) -> Tuple[List[Cell], List[Cell]]:
+    if not text:
+        return [], []
+    positive: List[Cell] = []
+    avoided: List[Cell] = []
+    prev_end = 0
+    prev_avoided = False
+    for match in COORDINATE_PATTERN.finditer(text):
+        cell = (int(match.group(1)), int(match.group(2)))
+        prefix = text[prev_end:match.start()]
+        prev_end = match.end()
+
+        if (
+            prev_avoided
+            and not AVOID_MARKER_PATTERN.search(prefix)
+            and not POSITIVE_ROUTE_BREAK_PATTERN.search(prefix)
+            and COORD_NP_CONTINUATION_PATTERN.match(prefix)
+        ):
+            is_avoided = True
+        else:
+            clause = re.split(r"[,;.:()\[\]]", prefix)[-1]
+            conj_parts = CLAUSE_CONJUNCTION_SPLIT_PATTERN.split(clause)
+            if len(conj_parts) > 1:
+                last_part = conj_parts[-1]
+                if AVOID_MARKER_PATTERN.search(last_part):
+                    after_avoid = AVOID_MARKER_PATTERN.split(last_part)[-1]
+                    is_avoided = not bool(COMPLETED_AVOID_OBJECT_THEN_ROUTE_PATTERN.search(after_avoid))
+                elif (
+                    AVOID_MARKER_PATTERN.search(conj_parts[-2])
+                    and not POSITIVE_ROUTE_BREAK_PATTERN.search(last_part)
+                    and COORD_NP_CONTINUATION_PATTERN.match(last_part)
+                ):
+                    is_avoided = True
+                else:
+                    is_avoided = False
+            else:
+                if AVOID_MARKER_PATTERN.search(clause):
+                    after_avoid = AVOID_MARKER_PATTERN.split(clause)[-1]
+                    is_avoided = not bool(COMPLETED_AVOID_OBJECT_THEN_ROUTE_PATTERN.search(after_avoid))
+                else:
+                    is_avoided = False
+
+        prev_avoided = is_avoided
+        if is_avoided:
+            avoided.append(cell)
+        else:
+            positive.append(cell)
+    return positive, avoided
+
+
 def parse_cell(text: Optional[str]) -> Optional[Cell]:
     if not text:
         return None
@@ -479,10 +595,20 @@ def parse_cell(text: Optional[str]) -> Optional[Cell]:
     return int(match.group(1)), int(match.group(2))
 
 
-def parse_all_cells(text: Optional[str]) -> List[Cell]:
+def parse_all_cells(text: Optional[str], include_avoided: bool = False) -> List[Cell]:
     if not text:
         return []
-    return [(int(m.group(1)), int(m.group(2))) for m in COORDINATE_PATTERN.finditer(text)]
+    if include_avoided:
+        return [(int(m.group(1)), int(m.group(2))) for m in COORDINATE_PATTERN.finditer(text)]
+    positive, _ = classify_task_cells(text)
+    return positive
+
+
+def parse_avoided_cells(text: Optional[str]) -> List[Cell]:
+    if not text:
+        return []
+    _, avoided = classify_task_cells(text)
+    return avoided
 
 
 def parse_edge_direction(text: Optional[str]) -> Optional[str]:
@@ -596,11 +722,63 @@ def _offscreen_continuation_depth(
     return min(best_depth, max_depth)
 
 
+def _is_warp_edge_cell(
+    cell: Cell,
+    seg: Optional[Dict[Cell, Any]] = None,
+    px: int = 0,
+    py: int = 0,
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+) -> bool:
+    if seg is not None:
+        sc = seg.get((px + cell[0], py + cell[1]))
+        if sc is not None and any(t in WARP_TAGS for t in getattr(sc, "tags", ())):
+            return True
+    if identified is not None:
+        from execution.perception.pokemon.tiles import filter_cell_warp_quarter_tags, normalize_tabletop_tag
+
+        cell_q = {
+            q: normalize_tabletop_tag(
+                identified[(cell[0], cell[1], q)].tag,
+                getattr(identified[(cell[0], cell[1], q)], "description", None),
+                getattr(identified[(cell[0], cell[1], q)], "image", None),
+            )
+            for q in QUARTERS
+            if (cell[0], cell[1], q) in identified and hasattr(identified[(cell[0], cell[1], q)], "tag")
+        }
+        if set(filter_cell_warp_quarter_tags(cell_q).values()) & WARP_TAGS:
+            return True
+    return False
+
+
+def warp_cells(
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    global_map: Optional[Any] = None,
+) -> set:
+    warps = set()
+    seg = None
+    px = py = 0
+    if global_map is not None and getattr(global_map, "current", None) and getattr(global_map, "pos", None) is not None:
+        try:
+            _, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+            seg = global_map.current
+        except Exception:  # noqa: BLE001
+            seg = None
+    if seg is None and identified is None:
+        return warps
+    for x in X_RANGE:
+        for y in Y_RANGE:
+            c = (x, y)
+            if _is_warp_edge_cell(c, seg=seg, px=px, py=py, identified=identified):
+                warps.add(c)
+    return warps
+
+
 def filter_open_lane_edge_cells(
     cells: Iterable[Cell],
     direction: str,
     kinds: Dict[Cell, str],
     global_map: Optional[Any] = None,
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
 ) -> List[Cell]:
     cells_list = list(cells)
     if not cells_list:
@@ -614,6 +792,14 @@ def filter_open_lane_edge_cells(
             seg = global_map.current
         except Exception:  # noqa: BLE001
             seg = None
+
+    non_warp = [
+        c for c in cells_list
+        if not _is_warp_edge_cell(c, seg=seg, px=px, py=py, identified=identified)
+        and (seg is None or _offscreen_continuation_depth(seg, (px + c[0], py + c[1]), direction, 1) > 0)
+    ]
+    if non_warp:
+        cells_list = non_warp
 
     if seg is not None:
         depths = {
@@ -686,16 +872,28 @@ def format_path_runs(runs: List[Tuple[str, int, str]]) -> str:
     return ", ".join(parts)
 
 
-def verbalize_edges(kinds: Dict[Cell, str]) -> str:
+def verbalize_edges(
+    kinds: Dict[Cell, str],
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+) -> str:
+    warps = warp_cells(identified=identified)
     lines = []
     for direction in DIRECTIONS:
         cells = edge_cells(kinds, direction)
         if cells:
+            open_cells = filter_open_lane_edge_cells(cells, direction, kinds, identified=identified)
             listed = ", ".join(f"({x}, {y})" for x, y in cells)
-            path = shortest_path(kinds, (0, 0), cells)
+            path = shortest_path(kinds, (0, 0), open_cells or cells, avoid_cells=warps)
             if path:
                 target = path[-1][2]
-                runs_text = format_path_runs(compress_path(path))
+                lat_path = shortest_path(
+                    kinds,
+                    (0, 0),
+                    [target],
+                    prefer_lateral=not (abs(target[0]) >= 4 and abs(target[1]) == 4),
+                    avoid_cells=warps,
+                )
+                runs_text = format_path_runs(compress_path(lat_path or path))
                 listed += f" (shortest path to {target}: {runs_text})"
         else:
             listed = "none"

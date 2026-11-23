@@ -23,8 +23,9 @@ from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
                                                      filter_forward_edge_cells, filter_open_lane_edge_cells, in_bounds,
-                                                     is_boundary_exit_direction, parse_all_cells, parse_cell,
-                                                     parse_edge_direction, shortest_path, verbalize_edges)
+                                                     is_boundary_exit_direction, parse_all_cells, parse_avoided_cells,
+                                                     parse_cell, parse_edge_direction, shortest_path, verbalize_edges,
+                                                     warp_cells)
 from execution.pokemon.executor_actions import CheckInteractionAction
 from execution.report import EnvironmentStepRecord, ExecutorVLMCallRecord
 from utils import log_error, ocr, parse_int, parse_key_value, parse_yes_no
@@ -668,9 +669,18 @@ class GridMoveExecutor(PolicyExecutor):
 
     def _walk(self, goals: Dict[Tuple[int, int], Optional[str]], prefer_lateral: bool = False) -> Optional[int]:
         current_goals = dict(goals)
+        current_avoid = {c for c in parse_avoided_cells(self._task) if in_bounds(c)} | warp_cells(
+            self.identified, getattr(self._env, "_map", None)
+        )
         reroutes = 0
         while True:
-            path = shortest_path(self.cell_kinds, (0, 0), current_goals, prefer_lateral=prefer_lateral)
+            path = shortest_path(
+                self.cell_kinds,
+                (0, 0),
+                current_goals,
+                prefer_lateral=prefer_lateral,
+                avoid_cells=current_avoid,
+            )
             if path is None:
                 if reroutes > 0:
                     return self._fail(MOVE_BLOCKED, "move_blocked",
@@ -727,11 +737,23 @@ class GridMoveExecutor(PolicyExecutor):
                             self.report.notes = None
                             facing = shifted_goals[(0, 0)]
                             break
+                        shifted_avoid = {
+                            (ax - dx, ay - dy)
+                            for (ax, ay) in current_avoid
+                            if in_bounds((ax - dx, ay - dy))
+                        }
                         if shifted_goals:
                             blocked_neighbor = DIRECTIONS.get(failed_dir)
                             self._refresh_local_perception(blocked_neighbor=blocked_neighbor)
-                            if shortest_path(self.cell_kinds, (0, 0), shifted_goals, prefer_lateral=prefer_lateral) is not None:
+                            if shortest_path(
+                                self.cell_kinds,
+                                (0, 0),
+                                shifted_goals,
+                                prefer_lateral=prefer_lateral,
+                                avoid_cells=shifted_avoid,
+                            ) is not None:
                                 current_goals = shifted_goals
+                                current_avoid = shifted_avoid
                                 reroutes += 1
                                 self.report.termination_reason = None
                                 self.report.notes = None
@@ -924,10 +946,11 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         kinds = self._live_cell_kinds()
         if kinds is None:
             return []
+        avoided_set = {c for c in parse_avoided_cells(self._task) if in_bounds(c)}
         axis = 0 if direction in ("up", "down") else 1
         candidates = []
         for cell in target_run:
-            if cell == target:
+            if cell == target or cell in avoided_set:
                 continue
             rel = (cell[0] - target[0], cell[1] - target[1])
             if not in_bounds(rel) or kinds.get(rel) != WALKABLE:
@@ -949,7 +972,9 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         gmap = getattr(self._env, "_map", None)
         cells = edge_cells(self.cell_kinds, direction)
         forward_cells = filter_forward_edge_cells(cells, direction)
-        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap)
+        open_cells = filter_open_lane_edge_cells(
+            forward_cells, direction, self.cell_kinds, gmap, identified=self.identified
+        )
         if any(c in open_cells for c in coords):
             return direction
         # If an explicit corner or edge coordinate has an open exit on another edge that it touches
@@ -979,7 +1004,9 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             if not matching:
                 continue
             d_forward = filter_forward_edge_cells(d_cells, d)
-            d_open = filter_open_lane_edge_cells(d_forward, d, self.cell_kinds, gmap)
+            d_open = filter_open_lane_edge_cells(
+                d_forward, d, self.cell_kinds, gmap, identified=self.identified
+            )
             in_open = int(any(c in d_open for c in matching))
             depth = 0
             if seg is not None:
@@ -1002,14 +1029,26 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         if direction not in DIRECTIONS:
             return None
         coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
+        avoided_set = {c for c in parse_avoided_cells(self._task) if in_bounds(c)}
         if coords:
             direction = self._rebind_direction_for_coords(direction, coords)
         cells = edge_cells(self.cell_kinds, direction)
         if not cells:
             return None
+        if avoided_set:
+            non_avoided_cells = [c for c in cells if c not in avoided_set]
+            if non_avoided_cells:
+                cells = non_avoided_cells
         forward_cells = filter_forward_edge_cells(cells, direction)
         gmap = getattr(self._env, "_map", None)
-        open_cells = filter_open_lane_edge_cells(forward_cells, direction, self.cell_kinds, gmap)
+        path_avoid = avoided_set | warp_cells(self.identified, gmap)
+        open_cells = filter_open_lane_edge_cells(
+            forward_cells, direction, self.cell_kinds, gmap, identified=self.identified
+        )
+        if avoided_set:
+            non_avoided_open = [c for c in open_cells if c not in avoided_set]
+            if non_avoided_open:
+                open_cells = non_avoided_open
 
         on_edge_coords = [c for c in coords if c in cells]
         if on_edge_coords:
@@ -1027,16 +1066,20 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                     preferred = [nearest]
             if not preferred:
                 preferred = [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
-            path = shortest_path(self.cell_kinds, (0, 0), preferred)
+            path = shortest_path(self.cell_kinds, (0, 0), preferred, avoid_cells=path_avoid)
             target = path[-1][2] if path else preferred[0]
             return direction, target
 
         if len(coords) == 1:
             waypoint = coords[0]
-            axis = 0 if direction in ("up", "down") else 1
-            aligned = [c for c in open_cells if c[axis] == waypoint[axis]] or [c for c in forward_cells if c[axis] == waypoint[axis]]
-            if len(aligned) == 1:
-                return direction, aligned[0]
+            if self.cell_kinds.get(waypoint) in (WALKABLE, LEDGE, LEDGE_LEFT):
+                axis = 0 if direction in ("up", "down") else 1
+                aligned = (
+                    [c for c in open_cells if c[axis] == waypoint[axis]]
+                    or [c for c in forward_cells if c[axis] == waypoint[axis]]
+                )
+                if len(aligned) == 1:
+                    return direction, aligned[0]
 
         stripped = self._task.strip().lower()
         is_bare_direction = stripped in ("up", "down", "left", "right", "north", "south", "west", "east")
@@ -1044,11 +1087,11 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         if len(runs) == 1:
             run = runs[0]
             if is_bare_direction or len(run) <= self.MAX_DETERMINISTIC_CORRIDOR_WIDTH:
-                path = shortest_path(self.cell_kinds, (0, 0), run)
+                path = shortest_path(self.cell_kinds, (0, 0), run, avoid_cells=path_avoid)
                 target = path[-1][2] if path else run[0]
                 return direction, target
         elif is_bare_direction and open_cells:
-            path = shortest_path(self.cell_kinds, (0, 0), open_cells)
+            path = shortest_path(self.cell_kinds, (0, 0), open_cells, avoid_cells=path_avoid)
             if path:
                 return direction, path[-1][2]
         return None
@@ -1098,7 +1141,7 @@ Location: <(x, y) or Not Found>
             prompt = (self.LOCATE_PROMPT.replace("[TARGET]", self._task.strip())
                       .replace("[GRID_DESCRIPTION]", GRID_DESCRIPTION)
                       .replace("[SCREEN_TILES]", self.screen_tiles)
-                      .replace("[EDGE_CELLS]", verbalize_edges(self.cell_kinds)))
+                      .replace("[EDGE_CELLS]", verbalize_edges(self.cell_kinds, identified=self.identified)))
             output = self._locate(prompt)
             location = (parse_key_value(output, "Location") or "").strip()
             direction = (parse_key_value(output, "Direction") or "").strip().lower()
@@ -1121,7 +1164,12 @@ Location: <(x, y) or Not Found>
             target = parse_cell(location)
             if direction not in DIRECTIONS:
                 return self._fail(MOVE_BAD_LOCATION, "bad_direction", f"Unusable direction {direction!r}")
+            avoided_set = {c for c in parse_avoided_cells(self._task) if in_bounds(c)}
             cells = edge_cells(self.cell_kinds, direction)
+            if avoided_set:
+                non_avoided_cells = [c for c in cells if c not in avoided_set]
+                if non_avoided_cells:
+                    cells = non_avoided_cells
             forward_cells = filter_forward_edge_cells(cells, direction)
             candidate_cells = forward_cells or cells
             if target is not None and target not in candidate_cells and candidate_cells:
@@ -1130,7 +1178,13 @@ Location: <(x, y) or Not Found>
                 return self._fail(MOVE_BAD_LOCATION, "bad_location",
                                   f"{location!r} is not a walkable cell on the {direction} edge")
             gmap = getattr(self._env, "_map", None)
-            open_cells = filter_open_lane_edge_cells(candidate_cells, direction, self.cell_kinds, gmap)
+            open_cells = filter_open_lane_edge_cells(
+                candidate_cells, direction, self.cell_kinds, gmap, identified=self.identified
+            )
+            if avoided_set:
+                non_avoided_open = [c for c in open_cells if c not in avoided_set]
+                if non_avoided_open:
+                    open_cells = non_avoided_open
             if target not in open_cells and open_cells:
                 axis = 0 if direction in ("up", "down") else 1
                 adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= 2]
