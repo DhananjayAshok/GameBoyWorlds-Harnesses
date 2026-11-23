@@ -430,10 +430,12 @@ class GlobalMap(StrategistArtifact):
 
     def mark_explored(self, episode: int) -> None:
         for si, seg in enumerate(self.segments):
-            if not seg:
+            if not seg or si in self.merged_into:
                 continue
             info = self.info(si)
-            done = any(c.kind == WALKABLE for c in seg.values()) and not self.frontier(si)
+            reach = self.reachable_cells(si)
+            unentered = sum(1 for d in self.reachable_door_list(si, reach) if d["leads_to"] is None)
+            done = bool(reach) and not self.frontier(si) and unentered == 0
             if done and info.explored is None:
                 info.explored = episode
                 self.stats["segments_explored"] += 1
@@ -1199,9 +1201,129 @@ class GlobalMap(StrategistArtifact):
         self.stats["merges_judged_same" if same else "merges_judged_different"] += 1
         return bool(same)
 
+    def _warp_anchored_overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
+        src_seg = self.segments[source] if 0 <= source < len(self.segments) else {}
+        dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
+        if not src_seg or not dst_seg or self._has_min_observations(source):
+            return None
+        for _, a, pa, b, pb in self.warps:
+            ra, rpa = self.resolve(a, pa)
+            rb, rpb = self.resolve(b, pb)
+            if rb == source and ra != source:
+                src_entry = rpb
+                dep_seg, dep_door = ra, self._door_at(ra, rpa)
+            elif ra == source and rb != source:
+                src_entry = rpa
+                dep_seg, dep_door = rb, self._door_at(rb, rpb)
+            else:
+                continue
+            for _, a2, pa2, b2, pb2 in self.warps:
+                ra2, rpa2 = self.resolve(a2, pa2)
+                rb2, rpb2 = self.resolve(b2, pb2)
+                if ra2 == dep_seg and rb2 == target and self._same_door(dep_seg, dep_door, rpa2):
+                    dst_door = self._door_at(target, rpb2)
+                elif rb2 == dep_seg and ra2 == target and self._same_door(dep_seg, dep_door, rpb2):
+                    dst_door = self._door_at(target, rpa2)
+                else:
+                    continue
+                offset = (dst_door[0] - src_entry[0], dst_door[1] - src_entry[1])
+                matches = shared = core_matches = core_shared = 0
+                for (x, y), c in src_seg.items():
+                    if c.kind == OCCUPIED or (c.pixels is not None and int(c.pixels.min()) == int(c.pixels.max())):
+                        continue
+                    cd = dst_seg.get((x + offset[0], y + offset[1]))
+                    if cd is None or cd.kind == OCCUPIED or (
+                        cd.pixels is not None and int(cd.pixels.min()) == int(cd.pixels.max())
+                    ):
+                        continue
+                    shared += 1
+                    if c.hashes == cd.hashes:
+                        matches += 1
+                    if max(abs(x - src_entry[0]), abs(y - src_entry[1])) <= RELOCALISE_WARP_CORE_RADIUS:
+                        core_shared += 1
+                        if c.hashes == cd.hashes:
+                            core_matches += 1
+                if (
+                    shared >= CONSOLIDATE_MIN_CELLS
+                    and matches >= RELOCALISE_WARP_MIN_FRACTION * shared
+                    and core_shared > 0
+                    and core_matches >= RELOCALISE_MIN_FRACTION * core_shared
+                ):
+                    return {
+                        "offset": offset,
+                        "matches": matches,
+                        "shared": shared,
+                        "agreement": matches / shared,
+                        "votes": matches,
+                        "rival": 0,
+                        "rival_agreement": 0.0,
+                    }
+        return None
+
+    def _heal_aliased_merged_doors(self) -> int:
+        healed = 0
+        for src in list(self.merged_into):
+            target, (dx, dy) = self.resolve(src, (0, 0))
+            seg = self.segments[target] if 0 <= target < len(self.segments) else None
+            if not seg:
+                continue
+            by_depart: Dict[Tuple[int, Cell], List[Cell]] = defaultdict(list)
+            for _, a, pa, b, pb in self.warps:
+                ra, rpa = self.resolve(a, pa)
+                rb, rpb = self.resolve(b, pb)
+                if ra == rb:
+                    continue
+                if rb == target:
+                    by_depart[(ra, self._door_at(ra, rpa))].append(rpb)
+                elif ra == target:
+                    by_depart[(rb, self._door_at(rb, rpb))].append(rpa)
+            for pts in by_depart.values():
+                door_cells = [
+                    (p[0] + ox, p[1] + oy)
+                    for p in pts
+                    for ox in range(-DOOR_SNAP_REACH, DOOR_SNAP_REACH + 1)
+                    for oy in range(-DOOR_SNAP_REACH, DOOR_SNAP_REACH + 1)
+                    if (p[0] + ox, p[1] + oy) in seg and is_door(seg[(p[0] + ox, p[1] + oy)])
+                ]
+                unique_doors = sorted(set(door_cells), key=lambda g: (seg[g].first_seen, seg[g].last_seen))
+                if len(unique_doors) > 1 and (dx, dy) in unique_doors:
+                    aliased = (dx, dy)
+                    canonical = next(
+                        (d for d in unique_doors if d != aliased and seg[d].hashes == seg[aliased].hashes),
+                        None,
+                    )
+                    if (
+                        canonical is not None
+                        and max(abs(canonical[0] - aliased[0]), abs(canonical[1] - aliased[1])) <= DOOR_SNAP_REACH
+                    ):
+                        nb_grounds = [
+                            seg[nb]
+                            for ox, oy in DIRECTIONS.values()
+                            for nb in [(aliased[0] + ox, aliased[1] + oy)]
+                            if nb in seg and seg[nb].kind == WALKABLE and not is_door(seg[nb])
+                        ]
+                        if nb_grounds:
+                            ref = nb_grounds[0]
+                            seg[aliased] = MapCell(
+                                WALKABLE, ("ground",), ref.hashes, ref.first_seen, ref.last_seen, ref.pixels
+                            )
+                            self.warps = [
+                                (
+                                    t,
+                                    a,
+                                    (canonical if self.resolve(a, pa) == (target, aliased) else pa),
+                                    b,
+                                    (canonical if self.resolve(b, pb) == (target, aliased) else pb),
+                                )
+                                for t, a, pa, b, pb in self.warps
+                            ]
+                            healed += 1
+        return healed
+
     def consolidate(self, judge: Optional[Callable[[int, int, Dict[str, Any]], Optional[bool]]] = None
                     ) -> List[Dict[str, Any]]:
         self.prune_transient_segments()
+        self._heal_aliased_merged_doors()
         merged = []
         while True:
             live = [si for si, seg in enumerate(self.segments) if seg and si not in self.merged_into]
@@ -1209,13 +1331,22 @@ class GlobalMap(StrategistArtifact):
             for i, target in enumerate(live):
                 for source in live[i + 1:]:
                     o = self.overlap(source, target)
-                    if (o is None or o["matches"] < CONSOLIDATE_MIN_CELLS
-                            or o["agreement"] < CONSOLIDATE_MIN_AGREEMENT):
-                        continue
-                    if (o["votes"] < CONSOLIDATE_MARGIN * o["rival"]
-                            and (o["votes"] < CONSOLIDATE_MIN_VOTES
-                                 or o["agreement"] - o["rival_agreement"] < CONSOLIDATE_AGREEMENT_LEAD)):
-                        continue
+                    valid_o = (
+                        o is not None
+                        and o["matches"] >= CONSOLIDATE_MIN_CELLS
+                        and o["agreement"] >= CONSOLIDATE_MIN_AGREEMENT
+                        and (
+                            o["votes"] >= CONSOLIDATE_MARGIN * o["rival"]
+                            or (
+                                o["votes"] >= CONSOLIDATE_MIN_VOTES
+                                and o["agreement"] - o["rival_agreement"] >= CONSOLIDATE_AGREEMENT_LEAD
+                            )
+                        )
+                    )
+                    if not valid_o:
+                        o = self._warp_anchored_overlap(source, target)
+                        if o is None:
+                            continue
                     if best is not None and o["matches"] <= best["matches"]:
                         continue
                     if self.merge_breaks_doors(source, target, o["offset"]):
@@ -1225,6 +1356,7 @@ class GlobalMap(StrategistArtifact):
                         continue
                     best = dict(o, source=source, target=target)
             if best is None:
+                self._heal_aliased_merged_doors()
                 return merged
             self._merge(best["source"], best["target"], best["offset"])
             self.stats["consolidated"] += 1
@@ -1816,11 +1948,137 @@ class GlobalMap(StrategistArtifact):
             count += 1
         return count
 
-    def frontier(self, segment: Optional[int] = None) -> List[Cell]:
-        seg = self.current if segment is None else self.segments[segment]
+    def reachable_cells(self, segment: Optional[int] = None) -> set:
+        from collections import deque
+        from .routes import walked_squares
+
+        si = self.segment if segment is None else segment
+        seg = self.segments[si] if 0 <= si < len(self.segments) else {}
+        if not seg:
+            return set()
+        seeds = set(walked_squares(self, si))
+        if self.segment == si and self.pos in seg:
+            seeds.add(self.pos)
+        if not seeds:
+            return {g for g, c in seg.items() if c.kind == WALKABLE}
+        visited = set(seeds)
+        queue = deque(seeds)
+        while queue:
+            cell = queue.popleft()
+            for direction, (dx, dy) in DIRECTIONS.items():
+                nxt = (cell[0] + dx, cell[1] + dy)
+                c = seg.get(nxt)
+                if c is None:
+                    continue
+                if (c.kind == LEDGE and direction == "down") or (c.kind == LEDGE_LEFT and direction == "left"):
+                    land = (nxt[0] + dx, nxt[1] + dy)
+                    lc = seg.get(land)
+                    if lc is not None and lc.kind in (WALKABLE, UNKNOWN, OCCUPIED) and land not in visited:
+                        visited.add(land)
+                        queue.append(land)
+                elif c.kind in (WALKABLE, UNKNOWN, OCCUPIED) or is_door(c):
+                    if nxt not in visited:
+                        visited.add(nxt)
+                        queue.append(nxt)
+        return visited
+
+    def is_door_reachable(
+        self,
+        segment: int,
+        door: Dict[str, Any],
+        reachable: Optional[set] = None,
+    ) -> bool:
+        from collections import deque
+
+        if door.get("leads_to") is not None:
+            return True
+        seg = self.segments[segment] if 0 <= segment < len(self.segments) else {}
+        if not seg:
+            return False
+        reach = self.reachable_cells(segment) if reachable is None else reachable
+        if not reach:
+            return True
+        for c in door["cells"]:
+            if c in reach or any((c[0] + dx, c[1] + dy) in reach for dx, dy in DIRECTIONS.values()):
+                return True
+        xs = [g[0] for g in seg]
+        ys = [g[1] for g in seg]
+        x_min, x_max = min(xs) - 4, max(xs) + 4
+        y_min, y_max = min(ys) - 4, max(ys) + 4
+        targets = set(door["cells"]) | {
+            (c[0] + dx, c[1] + dy)
+            for c in door["cells"]
+            for dx, dy in DIRECTIONS.values()
+            if seg.get((c[0] + dx, c[1] + dy)) is None
+            or seg[(c[0] + dx, c[1] + dy)].kind in (WALKABLE, UNKNOWN, OCCUPIED)
+        }
+        visited = set(reach)
+        queue = deque(reach)
+        while queue:
+            cur = queue.popleft()
+            if cur in targets:
+                return True
+            for dx, dy in DIRECTIONS.values():
+                nxt = (cur[0] + dx, cur[1] + dy)
+                if nxt in visited or not (x_min <= nxt[0] <= x_max and y_min <= nxt[1] <= y_max):
+                    continue
+                mc = seg.get(nxt)
+                if mc is None or mc.kind in (WALKABLE, UNKNOWN, OCCUPIED) or is_door(mc):
+                    visited.add(nxt)
+                    queue.append(nxt)
+        return False
+
+    def reachable_door_list(
+        self,
+        segment: Optional[int] = None,
+        reachable: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        si = self.segment if segment is None else segment
+        reach = self.reachable_cells(si) if reachable is None else reachable
+        return [d for d in self.door_list(si) if self.is_door_reachable(si, d, reach)]
+
+    def branch_exploration(self, from_segment: int, target_segment: int) -> Dict[str, Any]:
+        from collections import deque
+
+        start_seg = self.resolve(from_segment, (0, 0))[0]
+        root_target = self.resolve(target_segment, (0, 0))[0]
+        if root_target == start_seg or not (0 <= root_target < len(self.segments)) or not self.segments[root_target]:
+            return {"exhausted": False, "segments": [], "frontiers": 0, "unentered_doors": 0}
+        seen = {start_seg, root_target}
+        queue = deque([root_target])
+        order: List[int] = []
+        total_frontiers = 0
+        total_unentered = 0
+        while queue:
+            si = queue.popleft()
+            order.append(si)
+            reach = self.reachable_cells(si)
+            total_frontiers += len(self.frontier(si, reachable=reach))
+            for d in self.reachable_door_list(si, reach):
+                leads = d.get("leads_to")
+                if leads is None:
+                    total_unentered += 1
+                else:
+                    nxt = self.resolve(leads, (0, 0))[0]
+                    if nxt not in seen and 0 <= nxt < len(self.segments) and self.segments[nxt]:
+                        seen.add(nxt)
+                        queue.append(nxt)
+        return {
+            "exhausted": total_frontiers == 0 and total_unentered == 0,
+            "segments": order,
+            "frontiers": total_frontiers,
+            "unentered_doors": total_unentered,
+        }
+
+    def frontier(self, segment: Optional[int] = None, reachable: Optional[set] = None) -> List[Cell]:
+        si = self.segment if segment is None else segment
+        seg = self.segments[si] if 0 <= si < len(self.segments) else {}
+        if not seg:
+            return []
+        reach = self.reachable_cells(si) if reachable is None else reachable
         out = []
         for g, c in seg.items():
-            if c.kind != WALKABLE:
+            if c.kind != WALKABLE or (reach and g not in reach):
                 continue
             if any((g[0] + dx, g[1] + dy) not in seg for dx, dy in DIRECTIONS.values()):
                 out.append(g)

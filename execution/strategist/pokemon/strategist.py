@@ -618,6 +618,7 @@ class PokemonStrategist:
         free = self._env.get_info()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
         status = self.global_map.on_step(frame, self._identified if free else {}, free)
         self._consolidate()
+        self.global_map.mark_explored(self.start_episode + self._episodes_run)
         # People are read off the screen only where the map placed it; otherwise they are told as remembered.
         self._map_placed = status in PLACED_STATUS
         self._people_where = ("here" if self._map_placed
@@ -939,10 +940,23 @@ class PokemonStrategist:
     def _remember_all(self, facts: List[str], n: int) -> None:
         remember_all(self.knowledge, facts, self._vlm_caller("knowledge"), self._game, n, self._parameters)
 
+    def _explore_context_block(self) -> str:
+        from execution.strategist.pokemon.global_map.text import door_lines
+
+        if not self.global_map.current:
+            return "(none)"
+        self.global_map.mark_explored(self.start_episode + self._episodes_run)
+        lines = list(door_lines(self.global_map))
+        exp = explore_text(self.global_map)
+        if exp and exp != "(none)":
+            lines.append(exp)
+        return "\n".join(lines) or "(none)"
+
     def _update_notepad(self, digest: str, summary: str, n: int) -> None:
         prompt = (self._fill(P.NOTEPAD_UPDATE_PROMPT)
                   .replace("[DIGEST]", digest)
-                  .replace("[SUMMARY]", summary or "(none)"))
+                  .replace("[SUMMARY]", summary or "(none)")
+                  .replace("[EXPLORE]", self._explore_context_block()))
         update = ask(self._vlm_caller("notepad_update"), prompt, _parse_notepad_update, "Notepad update",
                      self.MAX_NOTEPAD_ATTEMPTS, self._parameters)
         if update is None:
@@ -1124,7 +1138,8 @@ class PokemonStrategist:
         else:
             closed = check_goals(self.goals, report.digest, self.notepad.text, self._vlm_caller, self._game, n,
                                  current=self._current_place(), parameters=self._parameters,
-                                 episode_status=record.status, subgoal_every=self._subgoal_every)
+                                 episode_status=record.status, subgoal_every=self._subgoal_every,
+                                 explore=self._explore_context_block())
         summary, town = self._review(report.digest)
         record.summary = summary or record.summary
         town_event = record_new_town(self.guide, town, self._current_place(), n, self._parameters)

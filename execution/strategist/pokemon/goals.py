@@ -433,7 +433,7 @@ def _should_decide_goal(subtree: GoalSubtree, episode_number: int,
 def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCaller, game: str,
                 episode_number: int, current: str = "Unknown",
                 parameters: Optional[dict] = None, episode_status: Optional[str] = None,
-                subgoal_every: int = 5) -> List[Tuple[GoalPath, str]]:
+                subgoal_every: int = 5, explore: str = "(none)") -> List[Tuple[GoalPath, str]]:
     closed: List[Tuple[GoalPath, str]] = []
     subtree = goals.frontier()
     checked_active = False
@@ -449,7 +449,7 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
             if (not checked_active
                     and _should_decide_goal(subtree, episode_number, episode_status, subgoal_every)
                     and _decide(goals, path, subtree, digest, notepad, vlm_caller, game, episode_number,
-                                current, parameters)):
+                                current, parameters, explore=explore)):
                 closed.append((path, "abandoned"))
             return closed
         goals.set_status(path, "complete", episode_number=episode_number)
@@ -461,13 +461,14 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
 
 def _decide(goals: GoalTree, path: GoalPath, subtree: GoalSubtree, digest: str, notepad: str,
             vlm_caller: VLMCaller, game: str, episode_number: int, current: str,
-            parameters: Optional[dict]) -> bool:
+            parameters: Optional[dict], explore: str = "(none)") -> bool:
     can_abandon = len(path) - 1 >= MIN_ABANDON_DEPTH
     choices = ("CONTINUE", "UPDATE", "ABANDON") if can_abandon else ("CONTINUE", "UPDATE")
     parent = goals.tree.at(path[:-1]) if len(path) > 1 else None
     siblings = [child.root.description for child in parent.subtrees if child is not subtree] if parent else []
     prompt = (_goal_prompt(P.GOAL_DECISION_PROMPT, game, path, subtree, notepad, current)
               .replace("[DIGEST]", digest)
+              .replace("[EXPLORE]", explore or "(none)")
               .replace("[ABANDON_OPTION]", P.GOAL_ABANDON_OPTION if can_abandon else "")
               .replace("[CHOICES]", ", ".join(choices)))
     decision = ask(vlm_caller("goal_decision"), prompt, _parse_decision(choices, siblings), "Goal decision",

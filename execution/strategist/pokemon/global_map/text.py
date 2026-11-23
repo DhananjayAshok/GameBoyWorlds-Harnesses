@@ -149,8 +149,9 @@ def segment_ascii(gmap: GlobalMap, segment: int, mark: Optional[Cell] = None) ->
 
 
 def _door_text(gmap: GlobalMap, segment: int) -> str:
-    leads = [gmap.area_label(d["leads_to"]) for d in gmap.door_list(segment) if d["leads_to"] is not None]
-    unentered = sum(1 for d in gmap.door_list(segment) if d["leads_to"] is None)
+    doors = gmap.reachable_door_list(segment)
+    leads = [gmap.area_label(d["leads_to"]) for d in doors if d["leads_to"] is not None]
+    unentered = sum(1 for d in doors if d["leads_to"] is None)
     parts = [f"one to {name}" for name in leads] + ([f"{unentered} not entered yet"] if unentered else [])
     return ", ".join(parts) or "none known"
 
@@ -329,6 +330,22 @@ def _unentered_door_cues(gmap: GlobalMap, door_cells: List[Cell]) -> str:
     return ("; " + "; ".join(cues)) if cues else ""
 
 
+def _leads_to_description(gmap: GlobalMap, leads_to: int) -> str:
+    label = gmap.area_label(leads_to)
+    branch = gmap.branch_exploration(gmap.segment, leads_to)
+    if branch["exhausted"]:
+        chain = [gmap.area_label(si) for si in branch["segments"]]
+        if len(chain) > 1:
+            return (
+                f"leads to {label} -> {' -> '.join(chain[1:])} "
+                f"(dead-end branch, fully explored — no unentered doors or unexplored exits)"
+            )
+        return f"leads to {label} (dead-end branch, fully explored — no unentered doors or unexplored exits)"
+    if gmap.info(leads_to).explored is not None:
+        return f"leads to {label}, fully explored"
+    return f"leads to {label}"
+
+
 def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -> List[str]:
     from execution.perception.pokemon.navigation import approach_cells, in_bounds, shortest_path
     from .routes import _snap, compress_moves, path_in_segment, walked_squares
@@ -337,7 +354,7 @@ def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -
     walked = walked_squares(gmap, gmap.segment)
     reached = _mapped_paths_from_start(gmap)
     doors = []
-    for door in gmap.door_list():
+    for door in gmap.reachable_door_list():
         leads_to = door["leads_to"]
         if leads_to is not None and gmap.resolve(leads_to, (0, 0))[0] == gmap.segment:
             continue
@@ -363,8 +380,7 @@ def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -
         return []
     lines = ["Doors and stairs in this area (x = steps to the right, y = steps up, measured from you):"]
     for steps, dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_info, cues in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
-        behind = (f"leads to {gmap.area_label(leads_to)}"
-                  + (", fully explored" if gmap.info(leads_to).explored is not None else "")
+        behind = (_leads_to_description(gmap, leads_to)
                   if leads_to is not None else f"NOT entered yet{cues}")
         if path_moves:
             if on_screen_blocked:

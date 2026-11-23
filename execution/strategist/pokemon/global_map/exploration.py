@@ -43,9 +43,21 @@ def explore_text(gmap: GlobalMap) -> str:
     edge = len(gmap.frontier())
     if edge:
         lines.append(f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''}.")
-    unentered = sum(door["leads_to"] is None for door in gmap.door_list())
+    doors = gmap.reachable_door_list()
+    unentered = sum(door["leads_to"] is None for door in doors)
     if unentered:
         lines.append(f"- {here}, where you are: {unentered} door(s) or stairs not entered yet.")
+    for door in doors:
+        leads_to = door["leads_to"]
+        if leads_to is None or gmap.resolve(leads_to, (0, 0))[0] == gmap.segment:
+            continue
+        branch = gmap.branch_exploration(gmap.segment, leads_to)
+        if branch["exhausted"]:
+            chain = " -> ".join(gmap.area_label(si) for si in branch["segments"])
+            lines.append(
+                f"- Door/stairs in {here} leading to {chain}: dead-end branch, fully explored "
+                f"(0 unexplored edges, 0 unentered doors)."
+            )
     groups = explore_elsewhere(gmap)
     if groups:
         lines.append("Other areas with unexplored edges, grouped by the way out of here:")
