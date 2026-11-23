@@ -19,6 +19,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_move_selection_screen, is_overworld_pack_menu,
                                                  is_pack_item_list_screen, is_pack_screen,
                                                  is_party_menu_screen, is_same_battle_frame,
+                                                 is_start_menu_screen,
                                                  read_battle_hud_hp, read_party_menu_hp)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
@@ -1410,7 +1411,7 @@ Press: <one of up, down, left, right, confirm, back>
     def _non_battle_menu_outcome(self, frame: np.ndarray) -> Optional[AgentState]:
         if effective_agent_state(AgentState.IN_MENU, frame) == AgentState.IN_DIALOGUE:
             return AgentState.IN_DIALOGUE
-        if is_overworld_pack_menu(frame):
+        if is_overworld_pack_menu(frame) or is_start_menu_screen(frame):
             return AgentState.IN_MENU
         if has_menu_cursor(frame) and not has_bottom_dialogue_box(frame) and not is_party_menu_screen(frame):
             return AgentState.IN_MENU
@@ -2051,7 +2052,7 @@ Objective: "[TASK]"
 
 The image is the current screen.
 [HISTORY]
-First decide whether the objective for the menu or choice box on screen has already been achieved (including if the menu, info screen, or yes/no box has already closed into plain dialogue or the overworld). If it has not, choose the single button press that best moves towards it.
+First decide whether the entire objective (including closing the Pack/Item and Start menus back to the overworld if asked) has already been achieved on screen. If it has not, answer Complete: no and choose the single button press that best moves towards it. On an item list screen after using a healing item on a party Pokemon (even if the item list cursor is invisible), do not press confirm on the item again—press back once to close the Pack/Item menu to the Start menu, and press back again to close the Start menu to the overworld.
 
 The presses you can make:
 - up, down, left, right: move the cursor
@@ -2242,6 +2243,9 @@ Press: <one of up, down, left, right, confirm, back>
             if code is not None:
                 return code
 
+        needs_menu_closed = self.is_start_menu or bool(
+            re.search(r"\b(?:close|exit|return\s+to\s+(?:the\s+)?overworld)\b", self._task or "", re.IGNORECASE)
+        )
         consecutive_invalid = 0
         for _ in range(self._max_steps):
             frame = self._get_state()["core"]["current_frame"]
@@ -2253,6 +2257,8 @@ Press: <one of up, down, left, right, confirm, back>
                       .replace("[HISTORY]", self._history_block()))
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
+            press_raw = (parse_key_value(output, "Press") or "").strip().lower()
+            press = next((option for option in MENU_PRESSES if option in press_raw), None)
             if parse_yes_no(output, "Complete") and (self.presses or self.is_start_menu):
                 if (self._has_menu_bottom_box(frame)
                         and not has_menu_cursor(frame)
@@ -2267,9 +2273,13 @@ Press: <one of up, down, left, right, confirm, back>
                     if settled_state != AgentState.IN_MENU:
                         code, reason = LEFT_MENU_OUTCOMES.get(settled_state, (MENU_OK, "menu_closed"))
                         return self._finish(code, reason)
-                return self._finish(MENU_OK, "objective_complete")
-            press = (parse_key_value(output, "Press") or "").strip().lower()
-            press = next((option for option in MENU_PRESSES if option in press), None)
+                    frame = settled_frame
+                if needs_menu_closed and (
+                    is_pack_screen(frame) or is_party_menu_screen(frame) or is_start_menu_screen(frame)
+                ):
+                    press = "back"
+                else:
+                    return self._finish(MENU_OK, "objective_complete")
             if press is None:
                 self._record_invalid(output)
                 consecutive_invalid += 1
@@ -2300,7 +2310,7 @@ Press: <one of up, down, left, right, confirm, back>
                 after_settle = self._get_state()["core"]["current_frame"]
                 if was_party_menu and not is_party_menu_screen(after_settle):
                     self.press_outcomes[-1] = (
-                        f"{press} (used on party Pokemon, settled healing/effect text, and returned to item menu)"
+                        f"{press} (used on party Pokemon, settled healing/effect text, and returned to item menu — press back to close the item and Start menus)"
                     )
                 elif was_party_menu:
                     self.press_outcomes[-1] = f"{press} (settled party text)"

@@ -47,10 +47,10 @@ def is_cursor_tile(raw_tile: np.ndarray) -> bool:
     if col_vals[peak_idx] <= col_vals[-1] + 2:
         return False
     nz_rows = [i for i, v in enumerate(row_sums) if v > 0]
-    if not (5 <= len(nz_rows) <= 7):
+    if not (5 <= len(nz_rows) <= 7) or nz_rows[-1] - nz_rows[0] + 1 != len(nz_rows):
         return False
     rmax = max(row_sums)
-    if rmax < 4 or (row_sums[3] != rmax and row_sums[4] != rmax):
+    if rmax < 4 or row_sums.count(rmax) != 1 or (row_sums[3] != rmax and row_sums[4] != rmax):
         return False
     if row_sums[0] > 1 and row_sums[7] > 1:
         return False
@@ -104,14 +104,18 @@ def is_battle_decision_screen(frame: np.ndarray) -> bool:
     return has_battle_menu_box(frame) or has_menu_cursor(frame)
 
 
+BATTLE_FRAME_DIFF_TOLERANCE = 32
+
+
 def is_same_battle_frame(earlier: np.ndarray, later: np.ndarray) -> bool:
-    """Return True if two battle frames are identical outside the bottom-right scroll-arrow corner."""
+    """Return True if two battle frames are identical (within minor DMG/CGB fade tolerance) outside the bottom-right scroll-arrow corner."""
     if earlier.shape != later.shape:
         return False
     if np.array_equal(earlier, later):
         return True
-    a, b = _grey_frame(earlier), _grey_frame(later)
-    differ = a != b
+    a = _grey_frame(earlier).astype(int)
+    b = _grey_frame(later).astype(int)
+    differ = np.abs(a - b) > BATTLE_FRAME_DIFF_TOLERANCE
     if np.any(differ[:120, :]) or np.any(differ[120:, :140]):
         return False
     return True
@@ -504,6 +508,32 @@ def is_overworld_pack_menu(frame: np.ndarray) -> bool:
     return False
 
 
+def is_start_menu_screen(frame: np.ndarray) -> bool:
+    """Return True if the right-hand overworld Start menu box is open on screen."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if has_bottom_dialogue_box(img) or is_party_menu_screen(img) or is_pack_screen(img):
+        return False
+    for left_tx in (9, 10):
+        x0 = left_tx * TILE_SIZE
+        n_left_v = sum(
+            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, x0:x0 + TILE_SIZE])
+            for ty in range(1, 15)
+        )
+        n_right_v = sum(
+            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 19 * TILE_SIZE:20 * TILE_SIZE])
+            for ty in range(1, 15)
+        )
+        if n_left_v >= 10 and n_right_v >= 10:
+            inner = img[TILE_SIZE:14 * TILE_SIZE, (left_tx + 1) * TILE_SIZE:19 * TILE_SIZE]
+            if float((inner >= LIGHT_BACKGROUND).mean()) >= 0.70:
+                return True
+    return False
+
+
 def is_battle_screen(frame: np.ndarray) -> bool:
     """Return True if the screen shows a battle backdrop above a bottom battle box."""
     img = _grey_frame(frame)
@@ -514,7 +544,8 @@ def is_battle_screen(frame: np.ndarray) -> bool:
     if (has_top_dialogue_box(img)
             or has_modal_preview_box(img)
             or is_party_menu_screen(img)
-            or is_pack_screen(img)):
+            or is_pack_screen(img)
+            or is_start_menu_screen(img)):
         return False
     upper = img[:BATTLE_UPPER_BOTTOM, :]
     if float((upper >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_UPPER_WHITE_FRACTION:

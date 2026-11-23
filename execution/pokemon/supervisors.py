@@ -1176,6 +1176,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 result["report"].final_state = follow_up["report"].final_state
                 if result["tag"] == "menu":
                     follow_up["report"].initial_state = result["report"].initial_state
+                    combined_notes = "\n".join(filter(None, [result.get("notes"), follow_up.get("notes")]))
+                    if combined_notes:
+                        follow_up["notes"] = combined_notes
+                        follow_up["report"].notes = combined_notes
                     if combined_text:
                         follow_up["dialogue"] = combined_text
                     result = follow_up
