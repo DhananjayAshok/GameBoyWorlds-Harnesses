@@ -60,6 +60,11 @@ DISTINCTIVE_LEAD = 2
 DISTINCTIVE_MAX_COPIES = 2
 # Two ends of door links this close (in squares, either way) count as the same door.
 DOOR_REACH = 1
+# A non-door warp endpoint snaps to a unique nearby door component within this radius.
+DOOR_SNAP_REACH = 3
+# Re-localisation onto a known warp destination accepts this overall fraction when the core around the door matches.
+RELOCALISE_WARP_MIN_FRACTION = 0.6
+RELOCALISE_WARP_CORE_RADIUS = 2
 # A verdict on merging two differently named areas stands until their overlap grows this many times larger.
 MERGE_REJUDGE_GROWTH = 1.5
 # Consecutive unplaceable free-roam frames before a new segment is opened.
@@ -657,7 +662,13 @@ class GlobalMap(StrategistArtifact):
                 self.stats["off_grid_frames"] += 1
             return "moved" if delta != (0, 0) else "stayed"
         shift = self._grid_shift(frame)
-        found = self.relocalise(frame, shift=shift, allowed=lambda si, q: not self.arrival_breaks_doors(si, q))
+        warp_targets = self._known_warp_targets(direction, max_steps, reported) if self.faded else None
+        found = self.relocalise(
+            frame,
+            shift=shift,
+            allowed=lambda si, q: not self.arrival_breaks_doors(si, q),
+            warp_targets=warp_targets,
+        )
         if found is not None and self._blacks_out(frame, *found, shift):
             if direction in DIRECTIONS and self.pending is None:
                 self.pending = (direction, max_steps, reported)
@@ -856,20 +867,81 @@ class GlobalMap(StrategistArtifact):
             self.stats["off_grid_unplaced"] += 1
         return shift
 
+    def _known_warp_targets(self, direction: Optional[str] = None, max_steps: int = 0,
+                            reported: Optional[int] = None, for_merge: bool = False) -> set:
+        targets = set()
+        if not for_merge:
+            if not self.faded or self.pos is None:
+                return targets
+            cur_seg, cur_pos = self.resolve(self.segment, self.pos)
+            dep_pos = self._warp_departure_pos(direction, max_steps, reported)
+            for _, a, pa, b, pb in self.warps:
+                ra, rpa = self.resolve(a, pa)
+                rb, rpb = self.resolve(b, pb)
+                if ra == rb:
+                    continue
+                if ra == cur_seg and (
+                    self._same_door(cur_seg, rpa, cur_pos) or self._same_door(cur_seg, rpa, dep_pos)
+                ):
+                    targets.add((rb, self._door_at(rb, rpb)))
+                if rb == cur_seg and (
+                    self._same_door(cur_seg, rpb, cur_pos) or self._same_door(cur_seg, rpb, dep_pos)
+                ):
+                    targets.add((ra, self._door_at(ra, rpa)))
+            return targets
+        cur_seg = self.segment
+        for _, a, pa, b, pb in self.warps:
+            ra, rpa = self.resolve(a, pa)
+            rb, rpb = self.resolve(b, pb)
+            if rb != cur_seg or ra == cur_seg:
+                continue
+            for _, a2, pa2, b2, pb2 in self.warps:
+                ra2, rpa2 = self.resolve(a2, pa2)
+                rb2, rpb2 = self.resolve(b2, pb2)
+                if ra2 == rb2 or cur_seg in (ra2, rb2):
+                    continue
+                if ra2 == ra and self._same_door(ra, rpa, rpa2):
+                    db2 = self._door_at(rb2, rpb2)
+                    targets.add((rb2, (db2[0] + self.pos[0] - rpb[0], db2[1] + self.pos[1] - rpb[1])))
+                if rb2 == ra and self._same_door(ra, rpa, rpb2):
+                    da2 = self._door_at(ra2, rpa2)
+                    targets.add((ra2, (da2[0] + self.pos[0] - rpb[0], da2[1] + self.pos[1] - rpb[1])))
+        return targets
+
     def _try_merge(self, frame: np.ndarray) -> None:
         if self.segment == 0 or self.stats["placed"] - self.segment_born > MERGE_WINDOW:
             return
-        found = self.relocalise(frame, exclude=self.segment)
+        warp_targets = self._known_warp_targets(for_merge=True)
+        found = self.relocalise(frame, exclude=self.segment, warp_targets=warp_targets)
         if found is None:
             return
         target, target_pos = found
         offset = (target_pos[0] - self.pos[0], target_pos[1] - self.pos[1])
         if self.merge_breaks_doors(self.segment, target, offset):
-            self.stats["merge_door_vetoes"] += 1
-            return
+            alt_offset = None
+            for t_seg, t_pos in warp_targets:
+                if t_seg == target:
+                    cand = (t_pos[0] - self.pos[0], t_pos[1] - self.pos[1])
+                    if not self.merge_breaks_doors(self.segment, target, cand):
+                        alt_offset = cand
+                        break
+            if alt_offset is None:
+                ov = self.overlap(self.segment, target)
+                if (
+                    ov is not None
+                    and ov["agreement"] >= CONSOLIDATE_MIN_AGREEMENT
+                    and not self.merge_breaks_doors(self.segment, target, ov["offset"])
+                ):
+                    alt_offset = ov["offset"]
+            if alt_offset is None:
+                self.stats["merge_door_vetoes"] += 1
+                return
+            offset = alt_offset
         if self.names_differ(self.segment, target):
             return
         self._merge(self.segment, target, offset)
+        if self.segment == target and self.pos != target_pos:
+            self.pos = target_pos
 
     def _merge(self, source: int, target: int, offset: Cell) -> None:
         dx, dy = offset
@@ -879,6 +951,10 @@ class GlobalMap(StrategistArtifact):
         for (x, y), c in src.items():
             g = (x + dx, y + dy)
             old = dst.get(g)
+            if old is not None and (is_door(old) or old.kind != OCCUPIED) and (
+                c.kind in (OCCUPIED, UNKNOWN) or not c.tags or "player" in c.tags
+            ):
+                continue
             if old is None or old.kind in (OCCUPIED, UNKNOWN) or c.last_seen >= old.last_seen:
                 dst[g] = c
         for (x, y), v in self.visits[source].items():
@@ -1106,6 +1182,15 @@ class GlobalMap(StrategistArtifact):
         verdict = self.merge_verdicts.get(key)
         if verdict is not None and overlap["matches"] < MERGE_REJUDGE_GROWTH * verdict["matches"]:
             return verdict["same"]
+        if (
+            overlap.get("matches", 0) >= 60
+            and overlap.get("agreement", 0.0) >= 0.9
+            and any(
+                self._is_doorless_inplace_warp(a, pa, b, pb, source, target, overlap["offset"])
+                for _, a, pa, b, pb in self.warps
+            )
+        ):
+            return True
         if judge is None:
             return False
         same = judge(source, target, overlap)
@@ -1146,7 +1231,8 @@ class GlobalMap(StrategistArtifact):
             merged.append(best)
 
     def relocalise(self, frame: np.ndarray, exclude: Optional[int] = None, shift: Cell = (0, 0),
-                   allowed: Optional[Callable[[int, Cell], bool]] = None) -> Optional[Tuple[int, Cell]]:
+                   allowed: Optional[Callable[[int, Cell], bool]] = None,
+                   warp_targets: Optional[set] = None) -> Optional[Tuple[int, Cell]]:
         a = _screen(frame)
         local: Dict[Cell, Tuple[Optional[str], ...]] = {}
         blank_local: List[Cell] = []
@@ -1159,6 +1245,14 @@ class GlobalMap(StrategistArtifact):
                 continue
             quarters = split_quarters(piece)
             local[(x, y)] = self._cell_hashes(quarters)
+        core_local = {
+            k: v for k, v in local.items()
+            if max(abs(k[0]), abs(k[1])) <= RELOCALISE_WARP_CORE_RADIUS
+        }
+        core_blank = [
+            k for k in blank_local
+            if max(abs(k[0]), abs(k[1])) <= RELOCALISE_WARP_CORE_RADIUS
+        ]
         best = None
         for si, seg in enumerate(self.segments):
             if si == exclude or not seg:
@@ -1174,6 +1268,17 @@ class GlobalMap(StrategistArtifact):
             ranked = sorted((self._screen_agreement(seg, local, o, blank_local), o)
                             for o, _ in votes.most_common(RELOCALISE_CANDIDATES))[::-1]
             close = [(o, overlap) for (m, overlap), o in ranked if m >= RELOCALISE_CLOSE_CALL * ranked[0][0][0]]
+            seg_warps = [wp for w_si, wp in (warp_targets or ()) if w_si == si]
+            if len(close) > 1 and seg_warps:
+                warp_close = [
+                    (o, overlap) for o, overlap in close
+                    if any(max(abs(o[0] - wp[0]), abs(o[1] - wp[1])) <= DOOR_REACH for wp in seg_warps)
+                ]
+                if len(warp_close) == 1:
+                    w_off, w_ov = warp_close[0]
+                    cm, cov = self._screen_agreement(seg, core_local, w_off, core_blank)
+                    if cov > 0 and cm >= RELOCALISE_MIN_FRACTION * cov:
+                        close = warp_close
             if len(close) > 1:
                 distinctive = sorted(
                     ((self._distinctive_matches(seg, index, local, o, block_index), o, overlap)
@@ -1187,7 +1292,12 @@ class GlobalMap(StrategistArtifact):
             n = self._screen_agreement(seg, local, offset, blank_local)[0]
             # a small room shows few content cells: ask for most of them rather than the fixed minimum
             needed = min(RELOCALISE_MIN_CELLS, max(10, int(0.6 * len(local))))
-            if n >= needed and n >= RELOCALISE_MIN_FRACTION * overlap:
+            min_fraction = RELOCALISE_MIN_FRACTION
+            if seg_warps and any(max(abs(offset[0] - wp[0]), abs(offset[1] - wp[1])) <= DOOR_REACH for wp in seg_warps):
+                cm, cov = self._screen_agreement(seg, core_local, offset, core_blank)
+                if cov > 0 and cm >= RELOCALISE_MIN_FRACTION * cov:
+                    min_fraction = RELOCALISE_WARP_MIN_FRACTION
+            if n >= needed and n >= min_fraction * overlap:
                 if self._blacks_out(frame, si, offset, shift):
                     continue
                 if allowed is not None and not allowed(si, offset):
@@ -1258,6 +1368,40 @@ class GlobalMap(StrategistArtifact):
                              for s2, p2, other2, q2 in ends[i + 1:])
         return conflicts
 
+    def _is_doorless_inplace_warp(
+        self,
+        a: int,
+        pa: Cell,
+        b: int,
+        pb: Cell,
+        source: int,
+        target: int,
+        offset: Cell,
+    ) -> bool:
+        if {a, b} != {source, target}:
+            return False
+        dx, dy = offset
+        src_p = pa if a == source else pb
+        dst_p = pb if a == source else pa
+        src_door = self._door_at(source, src_p)
+        dst_door = self._door_at(target, dst_p)
+        src_seg = self.segments[source] if 0 <= source < len(self.segments) else {}
+        dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
+        src_has_door = src_door in src_seg and is_door(src_seg[src_door])
+        dst_has_door = dst_door in dst_seg and is_door(dst_seg[dst_door])
+        if src_has_door or dst_has_door:
+            return False
+        c_src = src_seg.get(src_p)
+        c_dst = dst_seg.get(dst_p)
+        if c_src is None or c_dst is None:
+            return False
+        if c_src.kind in (OCCUPIED, UNKNOWN) or c_dst.kind in (OCCUPIED, UNKNOWN):
+            return False
+        if "unknown" in c_src.tags or "unknown" in c_dst.tags:
+            return False
+        trans_src_p = (src_p[0] + dx, src_p[1] + dy)
+        return max(abs(trans_src_p[0] - dst_p[0]), abs(trans_src_p[1] - dst_p[1])) <= DOOR_REACH
+
     def _is_round_trip_same_door_warp(
         self,
         a: int,
@@ -1271,6 +1415,8 @@ class GlobalMap(StrategistArtifact):
     ) -> bool:
         if {a, b} != {source, target}:
             return False
+        if self._is_doorless_inplace_warp(a, pa, b, pb, source, target, offset):
+            return True
         dx, dy = offset
         src_p = pa if a == source else pb
         dst_p = pb if a == source else pa
@@ -1301,15 +1447,43 @@ class GlobalMap(StrategistArtifact):
         def moved(si: int, p: Cell) -> Tuple[int, Cell]:
             return (target, (p[0] + offset[0], p[1] + offset[1])) if si == source else (si, p)
 
+        src_seg = self.segments[source] if 0 <= source < len(self.segments) else {}
+        dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
+        for g, c_src in src_seg.items():
+            if not is_door(c_src):
+                continue
+            g_dst = (g[0] + offset[0], g[1] + offset[1])
+            c_dst = dst_seg.get(g_dst)
+            if c_dst is not None and c_dst.kind != OCCUPIED and not is_door(c_dst):
+                snapped = self._door_at(target, g_dst)
+                if snapped != g_dst and max(abs(snapped[0] - g_dst[0]), abs(snapped[1] - g_dst[1])) > DOOR_REACH:
+                    return True
+
         after: List[Tuple[int, int, Cell, int, Cell]] = []
         after_moves: List[Optional[str]] = []
+        before_warps: List[Tuple[int, int, Cell, int, Cell]] = []
         for (t, a, pa, b, pb), m in zip(self.warps, self.warp_moves):
             if self._is_round_trip_same_door_warp(a, pa, b, pb, m, source, target, offset):
                 continue
             after.append((t, *moved(a, pa), *moved(b, pb)))
             after_moves.append(m)
-        return (self.door_conflicts(after, after_moves, self._same_door)
-                > self.door_conflicts(self.warps, self.warp_moves, self._same_door))
+            before_warps.append((t, a, pa, b, pb))
+
+        before_conflicts, ends = 0, []
+        for _, a, pa, b, pb in before_warps:
+            if a == b:
+                before_conflicts += 1
+                continue
+            ends += [(a, pa, b, pb), (b, pb, a, pa)]
+        for i, (s, p, other, q) in enumerate(ends):
+            before_conflicts += any(
+                s == s2
+                and self._same_door(s, p, p2)
+                and {other, other2} != {source, target}
+                and (other != other2 or not self._same_door(other, q, q2))
+                for s2, p2, other2, q2 in ends[i + 1:]
+            )
+        return self.door_conflicts(after, after_moves, self._same_door) > before_conflicts
 
     def arrival_breaks_doors(self, segment: int, pos: Cell) -> bool:
         if not self.faded:
@@ -1430,10 +1604,34 @@ class GlobalMap(StrategistArtifact):
         return self.new_cells_by_episode[episode]
 
     def _door_at(self, segment: int, pos: Cell) -> Cell:
-        seg = self.segments[segment]
+        seg = self.segments[segment] if 0 <= segment < len(self.segments) else {}
+        if not seg:
+            return pos
         near = [(max(abs(ox), abs(oy)), abs(ox) + abs(oy), g) for ox, oy in NEIGHBOURS_8 + ((0, 0),)
                 for g in [(pos[0] + ox, pos[1] + oy)] if g in seg and is_door(seg[g])]
-        return min(near)[2] if near else pos
+        if near:
+            return min(near)[2]
+        cand = [
+            (max(abs(ox), abs(oy)), abs(ox) + abs(oy), (pos[0] + ox, pos[1] + oy))
+            for ox in range(-DOOR_SNAP_REACH, DOOR_SNAP_REACH + 1)
+            for oy in range(-DOOR_SNAP_REACH, DOOR_SNAP_REACH + 1)
+            if (pos[0] + ox, pos[1] + oy) in seg and is_door(seg[(pos[0] + ox, pos[1] + oy)])
+        ]
+        if not cand:
+            return pos
+        doors_in_range = {g for _, _, g in cand}
+        seed = min(cand)[2]
+        comp, stack = set(), [seed]
+        while stack:
+            h = stack.pop()
+            if h in comp:
+                continue
+            comp.add(h)
+            for ox, oy in NEIGHBOURS_8:
+                nb = (h[0] + ox, h[1] + oy)
+                if nb in seg and is_door(seg[nb]) and nb not in comp:
+                    stack.append(nb)
+        return seed if doors_in_range <= comp else pos
 
     def door_labels(self) -> Dict[Tuple[int, Cell], int]:
         labels: Dict[Tuple[int, Cell], int] = {}

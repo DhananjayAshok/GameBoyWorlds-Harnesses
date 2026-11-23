@@ -617,6 +617,7 @@ class PokemonStrategist:
     def _map_opening_screen(self, frame: np.ndarray) -> None:
         free = self._env.get_info()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
         status = self.global_map.on_step(frame, self._identified if free else {}, free)
+        self._consolidate()
         # People are read off the screen only where the map placed it; otherwise they are told as remembered.
         self._map_placed = status in PLACED_STATUS
         self._people_where = ("here" if self._map_placed
