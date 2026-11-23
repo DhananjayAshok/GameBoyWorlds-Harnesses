@@ -16,8 +16,9 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_battle_defeat_text, is_battle_menu_crop,
                                                  is_battle_screen, is_cutscene_frame_changing,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
-                                                 is_move_selection_screen, is_party_menu_screen,
-                                                 is_same_battle_frame)
+                                                 is_move_selection_screen, is_overworld_pack_menu,
+                                                 is_pack_item_list_screen, is_pack_screen,
+                                                 is_party_menu_screen, is_same_battle_frame)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
@@ -1319,6 +1320,7 @@ Press: <one of up, down, left, right, confirm, back>
         self._exited_to_free_roam: bool = False
         self._bag_unavailable: bool = False
         self._in_bag_menu: bool = False
+        self._saw_battle_state: bool = False
         self._battle_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self.battle_lost: bool = False
         super().__init__(env, task, max_steps, **kwargs)
@@ -1333,6 +1335,24 @@ Press: <one of up, down, left, right, confirm, back>
 
     def _current_frame(self) -> np.ndarray:
         return self._get_state()["core"]["current_frame"]
+
+    def _has_battle_menu_cursor(self, frame: np.ndarray) -> bool:
+        if is_pack_item_list_screen(frame):
+            return bool(self._in_bag_menu or not self._saw_battle_state)
+        return has_menu_cursor(frame)
+
+    def _non_battle_menu_outcome(self, frame: np.ndarray) -> Optional[AgentState]:
+        if effective_agent_state(AgentState.IN_MENU, frame) == AgentState.IN_DIALOGUE:
+            return AgentState.IN_DIALOGUE
+        if is_overworld_pack_menu(frame):
+            return AgentState.IN_MENU
+        if has_menu_cursor(frame) and not has_bottom_dialogue_box(frame) and not is_party_menu_screen(frame):
+            return AgentState.IN_MENU
+        if not self._saw_battle_state and (
+            is_party_menu_screen(frame) or is_pack_screen(frame) or has_menu_cursor(frame)
+        ):
+            return AgentState.IN_MENU
+        return None
 
     def _current_map_place(self) -> Optional[Tuple[int, Tuple[int, int]]]:
         gmap = getattr(self._env, "_map", None)
@@ -1401,6 +1421,8 @@ Press: <one of up, down, left, right, confirm, back>
             if self._last_terminated or self._last_truncated:
                 break
             state = self._agent_state()
+            if state == AgentState.IN_BATTLE:
+                self._saw_battle_state = True
             frame = self._current_frame()
             if state == AgentState.FREE_ROAM:
                 if self._confirm_battle_exit(records):
@@ -1424,7 +1446,7 @@ Press: <one of up, down, left, right, confirm, back>
                     dialogue_idle_steps = 0
                 continue
             if state == AgentState.IN_MENU:
-                if has_menu_cursor(frame):
+                if self._non_battle_menu_outcome(frame) is not None or self._has_battle_menu_cursor(frame):
                     break
                 in_battle_intro = is_battle_screen(frame) or is_party_menu_screen(frame)
                 if not in_battle_intro and consecutive_dismisses >= MAX_STAT_DISMISS_STEPS:
@@ -1578,9 +1600,11 @@ Press: <one of up, down, left, right, confirm, back>
         self._exited_to_free_roam = False
         self.battle_lost = False
         self._battle_place = self._current_map_place()
-        if self._agent_state() != AgentState.IN_BATTLE and not is_battle_screen(self._current_frame()):
+        init_state = self._agent_state()
+        self._saw_battle_state = init_state == AgentState.IN_BATTLE
+        if init_state != AgentState.IN_BATTLE and not is_battle_screen(self._current_frame()):
             return self._fail(BATTLE_NOT_IN_BATTLE, "not_in_battle",
-                              f"The player is {self._agent_state().name.lower()}, not in a battle.")
+                              f"The player is {init_state.name.lower()}, not in a battle.")
 
         if not is_battle_decision_screen(self._current_frame()):
             self._begin_scripted("advance through opening battle text")
@@ -1598,11 +1622,21 @@ Press: <one of up, down, left, right, confirm, back>
                 self.history.append(entry)
             if self._exited_to_free_roam:
                 return self._record_outcome(AgentState.FREE_ROAM)
+            post_intro_state = self._agent_state()
+            if post_intro_state == AgentState.IN_BATTLE:
+                self._saw_battle_state = True
+            elif post_intro_state == AgentState.IN_MENU:
+                post_intro_frame = self._current_frame()
+                menu_exit = self._non_battle_menu_outcome(post_intro_frame)
+                if menu_exit is not None or (not self._saw_battle_state and not is_battle_screen(post_intro_frame)):
+                    return self._record_outcome(menu_exit or AgentState.IN_MENU)
 
         consecutive_invalid = 0
         consecutive_failures = 0
         for step in range(self._max_steps):
             state = self._agent_state()
+            if state == AgentState.IN_BATTLE:
+                self._saw_battle_state = True
             if self._exited_to_free_roam or state == AgentState.FREE_ROAM:
                 if not self._exited_to_free_roam:
                     check_records: List[EnvironmentStepRecord] = []
@@ -1646,7 +1680,10 @@ Press: <one of up, down, left, right, confirm, back>
 
             if state == AgentState.IN_MENU:
                 frame = self._current_frame()
-                if not has_menu_cursor(frame):
+                menu_exit = self._non_battle_menu_outcome(frame)
+                if menu_exit is not None:
+                    return self._record_outcome(menu_exit)
+                if not self._has_battle_menu_cursor(frame):
                     self._ensure_scripted("dismiss battle stat overlay")
                     turn_records = []
                     presses, dismisses = self._advance_until_decision(turn_records)
@@ -1665,6 +1702,9 @@ Press: <one of up, down, left, right, confirm, back>
                     if self._agent_state() != AgentState.IN_MENU:
                         continue
                     frame = self._current_frame()
+                    menu_exit = self._non_battle_menu_outcome(frame)
+                    if menu_exit is not None or (not self._saw_battle_state and not is_battle_screen(frame)):
+                        return self._record_outcome(menu_exit or AgentState.IN_MENU)
 
                 if is_empty_battle_bag_menu(frame):
                     self._ensure_scripted("close empty battle bag menu")
@@ -1716,7 +1756,7 @@ Press: <one of up, down, left, right, confirm, back>
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
-                    if self._in_bag_menu:
+                    if self._in_bag_menu and self._agent_state() != AgentState.IN_MENU:
                         self._in_bag_menu = False
                         if (presses == 0
                                 and self._agent_state() == AgentState.IN_BATTLE
@@ -1730,6 +1770,10 @@ Press: <one of up, down, left, right, confirm, back>
                 self.history.append(entry)
                 if self._exited_to_free_roam:
                     return self._record_outcome(AgentState.FREE_ROAM)
+                if self._agent_state() == AgentState.IN_MENU:
+                    menu_exit = self._non_battle_menu_outcome(self._current_frame())
+                    if menu_exit is not None:
+                        return self._record_outcome(menu_exit)
                 if consecutive_failures >= self.MAX_INVALID:
                     return self._fail(BATTLE_ACTION_FAILED, "actions_not_accepted", self._history_block())
                 continue

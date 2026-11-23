@@ -446,8 +446,8 @@ def is_party_menu_screen(frame: np.ndarray) -> bool:
     return False
 
 
-def is_pack_item_list_screen(frame: np.ndarray) -> bool:
-    """Return True if the screen shows the Generation 2 Pack item list without an open action/quantity sub-box."""
+def is_pack_screen(frame: np.ndarray) -> bool:
+    """Return True if the screen shows the Generation 2 Pack screen (with or without an open sub-box)."""
     if frame is None:
         return False
     img = _grey_frame(frame)
@@ -465,6 +465,14 @@ def is_pack_item_list_screen(frame: np.ndarray) -> bool:
     item_area = img[TILE_SIZE:BATTLE_UPPER_BOTTOM, 5 * TILE_SIZE:GRID_COLS * TILE_SIZE]
     if float((item_area >= LIGHT_BACKGROUND).mean()) < 0.70 or int((item_area < DARK_INK).sum()) < 25:
         return False
+    return True
+
+
+def is_pack_item_list_screen(frame: np.ndarray) -> bool:
+    """Return True if the screen shows the Generation 2 Pack item list without an open action/quantity sub-box."""
+    if not is_pack_screen(frame):
+        return False
+    img = _grey_frame(frame)
     for tx in range(10, 16):
         x0 = tx * TILE_SIZE
         n_v = sum(
@@ -478,6 +486,24 @@ def is_pack_item_list_screen(frame: np.ndarray) -> bool:
     return True
 
 
+def is_overworld_pack_menu(frame: np.ndarray) -> bool:
+    """Return True if a Generation 2 Pack screen has an overworld-only multi-row action box (3+ options) or quantity selector open."""
+    if not is_pack_screen(frame):
+        return False
+    img = _grey_frame(frame)
+    if has_quantity_selector_box(img):
+        return True
+    for tx in range(10, 16):
+        x0 = tx * TILE_SIZE
+        n_v = sum(
+            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, x0:x0 + TILE_SIZE])
+            for ty in range(3, 12)
+        )
+        if n_v >= 5:
+            return True
+    return False
+
+
 def is_battle_screen(frame: np.ndarray) -> bool:
     """Return True if the screen shows a battle backdrop above a bottom battle box."""
     img = _grey_frame(frame)
@@ -488,7 +514,7 @@ def is_battle_screen(frame: np.ndarray) -> bool:
     if (has_top_dialogue_box(img)
             or has_modal_preview_box(img)
             or is_party_menu_screen(img)
-            or is_pack_item_list_screen(img)):
+            or is_pack_screen(img)):
         return False
     upper = img[:BATTLE_UPPER_BOTTOM, :]
     if float((upper >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_UPPER_WHITE_FRACTION:
@@ -593,6 +619,11 @@ def is_empty_battle_bag_menu(frame: np.ndarray) -> bool:
         return False
     if not has_bottom_dialogue_box(img):
         return False
+    if is_pack_item_list_screen(img):
+        if not bool((img[2 * TILE_SIZE:3 * TILE_SIZE, 8 * TILE_SIZE:14 * TILE_SIZE] < DARK_INK).any()):
+            return False
+        below_pack = img[3 * TILE_SIZE:11 * TILE_SIZE, 5 * TILE_SIZE:20 * TILE_SIZE]
+        return int((below_pack < DARK_INK).sum()) <= 5 and float((below_pack >= DIALOGUE_BOX_WHITE).mean()) >= 0.98
     if not is_cursor_tile(img[4 * TILE_SIZE:5 * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE]):
         return False
     if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 4 * TILE_SIZE:5 * TILE_SIZE])
