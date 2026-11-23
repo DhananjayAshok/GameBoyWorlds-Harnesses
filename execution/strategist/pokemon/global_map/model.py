@@ -676,7 +676,7 @@ class GlobalMap(StrategistArtifact):
                     self.visits[self.segment][adv_pos] += 1
                 found = (self.segment, adv_pos)
             if found != (self.segment, self.pos):
-                self._link(*found)
+                self._link(*found, departure_pos=self._warp_departure_pos(direction, max_steps, reported))
             self.segment, self.pos = found
             self.residual, self.pending, self.lost, self.anchor = grid_residual(shift), None, 0, _screen(frame)
             self.faded = False
@@ -703,7 +703,11 @@ class GlobalMap(StrategistArtifact):
         self.visits.append(Counter())
         self.blocked_cells.append(set())
         self.segment_info[len(self.segments) - 1] = SegmentInfo()
-        self._link(len(self.segments) - 1, (0, 0))
+        self._link(
+            len(self.segments) - 1,
+            (0, 0),
+            departure_pos=self._warp_departure_pos(direction, max_steps, reported),
+        )
         self.segment, self.pos = len(self.segments) - 1, (0, 0)
         self.residual, self.pending, self.lost, self.anchor = grid_residual(shift), None, 0, _screen(frame)
         self.faded = False
@@ -715,15 +719,45 @@ class GlobalMap(StrategistArtifact):
             self.prune_transient_segments()
         return "new_segment"
 
-    def _link(self, segment: int, pos: Cell) -> None:
+    def _warp_departure_pos(self, direction: Optional[str], max_steps: int = 0,
+                            reported: Optional[int] = None) -> Cell:
+        if not self.faded or self.pos is None:
+            return self.pos
+        seg = self.segments[self.segment] if 0 <= self.segment < len(self.segments) else None
+        if not seg:
+            return self.pos
+        near_here = self._door_at(self.segment, self.pos)
+        if near_here in seg and is_door(seg[near_here]):
+            return near_here
+        move_dir = direction if direction in DIRECTIONS else (
+            self.fade_direction if self.fade_direction in DIRECTIONS else None
+        )
+        if move_dir not in DIRECTIONS:
+            return self.pos
+        dx, dy = DIRECTIONS[move_dir]
+        if reported is not None and reported > 0:
+            candidate = (self.pos[0] + dx * reported, self.pos[1] + dy * reported)
+            door_c = self._door_at(self.segment, candidate)
+            if door_c in seg and is_door(seg[door_c]):
+                return door_c
+        reach = max(int(reported or 0), int(max_steps or 0), MAX_STEP_FILL)
+        for k in range(1, min(reach, MAX_STEP_FILL) + 1):
+            candidate = (self.pos[0] + dx * k, self.pos[1] + dy * k)
+            c = seg.get(candidate)
+            if c is not None and is_door(c):
+                return candidate
+        return self.pos
+
+    def _link(self, segment: int, pos: Cell, departure_pos: Optional[Cell] = None) -> None:
         if not self.faded or self.in_battle or not self.since_battle_moved or segment == self.segment:
             return
-        self.warps.append((self.step, self.segment, self.pos, segment, pos))
+        dep = self.pos if departure_pos is None else departure_pos
+        self.warps.append((self.step, self.segment, dep, segment, pos))
         self.warp_moves.append(self.fade_direction if self.fade_direction in DIRECTIONS else None)
         left = self.segment
         if (self.info(left).name is None and self._has_min_observations(left)
                 and all(entry["segment"] != left for entry in self.naming_queue)):
-            self.naming_queue.append({"segment": left, "exit": self.pos, "step": self.step, "marker": None,
+            self.naming_queue.append({"segment": left, "exit": dep, "step": self.step, "marker": None,
                                       "reason": "door"})
 
     def _blacks_out(self, frame: np.ndarray, segment: int, pos: Cell, shift: Cell = (0, 0)) -> bool:
@@ -1216,12 +1250,57 @@ class GlobalMap(StrategistArtifact):
                              for s2, p2, other2, q2 in ends[i + 1:])
         return conflicts
 
+    def _is_round_trip_same_door_warp(
+        self,
+        a: int,
+        pa: Cell,
+        b: int,
+        pb: Cell,
+        move: Optional[str],
+        source: int,
+        target: int,
+        offset: Cell,
+    ) -> bool:
+        if {a, b} != {source, target}:
+            return False
+        dx, dy = offset
+        src_p = pa if a == source else pb
+        dst_p = pb if a == source else pa
+        src_door = self._door_at(source, src_p)
+        dst_door = self._door_at(target, dst_p)
+        src_seg = self.segments[source] if 0 <= source < len(self.segments) else {}
+        dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
+        src_has_door = src_door in src_seg and is_door(src_seg[src_door])
+        dst_has_door = dst_door in dst_seg and is_door(dst_seg[dst_door])
+        if not src_has_door and move in DIRECTIONS and a == source:
+            mdx, mdy = DIRECTIONS[move]
+            for k in range(1, MAX_STEP_FILL + 1):
+                cand = (src_p[0] + mdx * k, src_p[1] + mdy * k)
+                if cand in src_seg and is_door(src_seg[cand]):
+                    src_door = cand
+                    src_has_door = True
+                    break
+        trans_src_door = (src_door[0] + dx, src_door[1] + dy)
+        if not dst_has_door and trans_src_door in dst_seg and is_door(dst_seg[trans_src_door]):
+            if max(abs(dst_p[0] - trans_src_door[0]), abs(dst_p[1] - trans_src_door[1])) <= 2:
+                dst_door = trans_src_door
+                dst_has_door = True
+        if not (src_has_door and dst_has_door):
+            return False
+        return max(abs(trans_src_door[0] - dst_door[0]), abs(trans_src_door[1] - dst_door[1])) <= DOOR_REACH
+
     def merge_breaks_doors(self, source: int, target: int, offset: Cell) -> bool:
         def moved(si: int, p: Cell) -> Tuple[int, Cell]:
             return (target, (p[0] + offset[0], p[1] + offset[1])) if si == source else (si, p)
 
-        after = [(t, *moved(a, pa), *moved(b, pb)) for t, a, pa, b, pb in self.warps]
-        return (self.door_conflicts(after, self.warp_moves, self._same_door)
+        after: List[Tuple[int, int, Cell, int, Cell]] = []
+        after_moves: List[Optional[str]] = []
+        for (t, a, pa, b, pb), m in zip(self.warps, self.warp_moves):
+            if self._is_round_trip_same_door_warp(a, pa, b, pb, m, source, target, offset):
+                continue
+            after.append((t, *moved(a, pa), *moved(b, pb)))
+            after_moves.append(m)
+        return (self.door_conflicts(after, after_moves, self._same_door)
                 > self.door_conflicts(self.warps, self.warp_moves, self._same_door))
 
     def arrival_breaks_doors(self, segment: int, pos: Cell) -> bool:

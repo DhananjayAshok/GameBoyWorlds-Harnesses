@@ -102,7 +102,7 @@ Cell: <(x, y) of the target, or None>
         cell = (int(match.group(1)), int(match.group(2)))
         if cell == (0, 0) or not in_bounds(cell):
             return None
-        return cell if max(abs(cell[0]), abs(cell[1])) <= 2 else None
+        return cell
 
     def _execute(self, info, target: str, identified=None, **kwargs) -> Tuple[Dict[str, Any], int]:
         from execution.perception.pokemon.navigation import parse_all_cells

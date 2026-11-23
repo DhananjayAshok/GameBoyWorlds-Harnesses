@@ -120,7 +120,7 @@ MAX_INTERACT_DIALOGUE_STEPS = 10
 
 class InteractionExecutor(PolicyExecutor):
     CARDINAL_DIRECTIONS = {cell: name for name, cell in CheckInteractionAction.cardinals.items()}
-    MAX_ALIGN_STEPS = 4
+    MAX_ALIGN_STEPS = 10
 
     def __init__(self, env, task, max_steps: int = 3, identified=None, cell_kinds=None, people_fn=None, **kwargs):
         self.identified = identified
@@ -250,6 +250,39 @@ class InteractionExecutor(PolicyExecutor):
             elif pass_record.action_success == -1:
                 break
 
+    def _current_map_place(self) -> Optional[Tuple[int, Tuple[int, int]]]:
+        gmap = getattr(self._env, "_map", None)
+        if gmap is None or not getattr(gmap, "current", None) or getattr(gmap, "pos", None) is None:
+            return None
+        try:
+            return gmap.resolve(gmap.segment, gmap.pos)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _pre_turn_align(self, direction: str, records: List[EnvironmentStepRecord]) -> Optional[int]:
+        if getattr(self._env, "facing", None) == direction:
+            return 0
+        arrow = GridMoveExecutor.ARROW_ACTIONS.get(direction)
+        if arrow is None:
+            return 0
+        before_place = self._current_map_place()
+        rec = self._take_action(LowLevelAction, low_level_action=arrow)
+        records.append(rec)
+        if self._last_terminated or self._last_truncated:
+            return 0
+        after_place = self._current_map_place()
+        taken = 0
+        if before_place is not None and after_place is not None:
+            if before_place[0] != after_place[0]:
+                taken = 1
+            else:
+                dx, dy = DIRECTIONS[direction]
+                step_dx = after_place[1][0] - before_place[1][0]
+                step_dy = after_place[1][1] - before_place[1][1]
+                if step_dx * dx + step_dy * dy > 0:
+                    taken = 1
+        return taken
+
     def _align_to_target(self, target_cell: Tuple[int, int], records: List[EnvironmentStepRecord]) -> Optional[str]:
         people = None
         if callable(self.people_fn):
@@ -272,7 +305,10 @@ class InteractionExecutor(PolicyExecutor):
         goals = approach_cells(kinds, target_cell, identified=self.identified, people=people)
         if not goals:
             return None
-        path = shortest_path(kinds, (0, 0), goals)
+        avoid = {c for c in parse_avoided_cells(self._task) if in_bounds(c)} | warp_cells(
+            self.identified, getattr(self._env, "_map", None)
+        )
+        path = shortest_path(kinds, (0, 0), goals, avoid_cells=avoid)
         if path is None or len(path) > self.MAX_ALIGN_STEPS:
             return None
         if not path:
@@ -282,15 +318,45 @@ class InteractionExecutor(PolicyExecutor):
         facing = goals[end_cell]
         self._begin_scripted(f"walk to {end_cell} to align with {self._task} at {target_cell}")
         for move_dir, n_steps, _ in runs:
-            step_rec = self._take_action(MoveStepsAction, direction=move_dir, steps=n_steps)
-            records.append(step_rec)
+            pre_taken = self._pre_turn_align(move_dir, records)
             if self._last_terminated or self._last_truncated:
                 return facing
-            if self._agent_state() != AgentState.FREE_ROAM:
+            if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay() or has_emote_bubble(self._current_frame()):
+                if self._agent_state() == AgentState.FREE_ROAM:
+                    self._wait_for_interaction(records)
                 return facing
-            action_return = (step_rec.transition_states[-1]["core"].get("action_return") or {}) if step_rec.transition_states else {}
-            if action_return.get("n_steps_taken", 0) < n_steps:
-                return None
+            remaining = max(0, n_steps - (pre_taken or 0))
+            attempts = 0
+            while remaining > 0:
+                if attempts >= n_steps + 2:
+                    return None
+                attempts += 1
+                step_rec = self._take_action(MoveStepsAction, direction=move_dir, steps=remaining)
+                records.append(step_rec)
+                if self._last_terminated or self._last_truncated:
+                    return facing
+                if self._agent_state() != AgentState.FREE_ROAM:
+                    return facing
+                action_return = (step_rec.transition_states[-1]["core"].get("action_return") or {}) if step_rec.transition_states else {}
+                taken = action_return.get("n_steps_taken", 0)
+                remaining -= taken
+                if (
+                    step_rec.action_success == 2
+                    or self._has_interaction_overlay()
+                    or has_emote_bubble(self._current_frame())
+                ):
+                    self._wait_for_interaction(records)
+                    if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay():
+                        return facing
+                if remaining > 0 and taken == 0 and not action_return.get("rotated"):
+                    self._wait_for_interaction(records, settle_wait=MOVE_SETTLE_WAIT)
+                    if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay():
+                        return facing
+                    return None
+        if self._agent_state() == AgentState.FREE_ROAM and (
+            self._has_interaction_overlay() or has_emote_bubble(self._current_frame())
+        ):
+            self._wait_for_interaction(records)
         return facing
 
     def _execute(self) -> int:
@@ -311,7 +377,11 @@ class InteractionExecutor(PolicyExecutor):
             direction = self._align_to_target(explicit_coords[0], records)
             if self._last_terminated or self._last_truncated:
                 return self._finish(records)
-            if self._agent_state() != AgentState.FREE_ROAM:
+            if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay():
+                if self._agent_state() == AgentState.FREE_ROAM and self._has_interaction_overlay():
+                    self._advance_interaction_overlay(records)
+                if self._agent_state() == AgentState.IN_MENU:
+                    self._settle_interaction_menu_state(records)
                 if self._agent_state() == AgentState.IN_DIALOGUE:
                     self._clear_interaction_dialogue(records)
                 return self._finish(records)
@@ -330,7 +400,11 @@ class InteractionExecutor(PolicyExecutor):
                     direction = self._align_to_target(cell, records)
                     if self._last_terminated or self._last_truncated:
                         return self._finish(records)
-                    if self._agent_state() != AgentState.FREE_ROAM:
+                    if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay():
+                        if self._agent_state() == AgentState.FREE_ROAM and self._has_interaction_overlay():
+                            self._advance_interaction_overlay(records)
+                        if self._agent_state() == AgentState.IN_MENU:
+                            self._settle_interaction_menu_state(records)
                         if self._agent_state() == AgentState.IN_DIALOGUE:
                             self._clear_interaction_dialogue(records)
                         return self._finish(records)
