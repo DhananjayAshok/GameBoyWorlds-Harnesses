@@ -734,7 +734,7 @@ class GlobalMap(StrategistArtifact):
                     lit = _still_lit(new, prior)
                     if not lit.all():
                         b += 1
-                    if new.min() >= WHITE_LEVEL and prior.min() < WHITE_LEVEL:
+                    if new.min() >= WHITE_LEVEL and new.min() == new.max() and prior.min() < WHITE_LEVEL:
                         w += 1
                     if new.max() <= DARK_LEVEL and prior.max() >= BRIGHT_LEVEL:
                         d += 1
@@ -765,14 +765,17 @@ class GlobalMap(StrategistArtifact):
             return True
         if white >= TRANSITION_FLASH_CELLS:
             return True
-        if black + white >= TRANSITION_FLASH_CELLS and best_same == 0:
-            return True
         p2, p98 = np.percentile(a, (2, 98))
         if darkened >= TRANSITION_FLASH_CELLS and p98 <= DARK_LEVEL:
             return True
         if compressed >= TRANSITION_FLASH_CELLS and (p98 - p2) <= 96:
             return True
-        mid_tone = sum(1 for piece in cells_by_xy.values() if np.any((piece > BLACK_LEVEL) & (piece < WHITE_LEVEL)))
+        mid_tone = sum(
+            1 for piece in cells_by_xy.values()
+            if int(piece.max()) > BLACK_LEVEL
+            and int(piece.min()) < int(piece.max())
+            and (int(piece.min()) > BLACK_LEVEL or np.any((piece > BLACK_LEVEL) & (piece < WHITE_LEVEL)))
+        )
         if cells_by_xy and mid_tone < MIN_MID_TONE_CELLS:
             return True
         return False
@@ -1196,6 +1199,20 @@ class GlobalMap(StrategistArtifact):
     def arrival_breaks_doors(self, segment: int, pos: Cell) -> bool:
         if not self.faded:
             return False
+        cur_seg, _ = self.resolve(self.segment, self.pos)
+        dst_seg, dst_pos = self.resolve(segment, pos)
+        if (
+            cur_seg != dst_seg
+            and self._has_min_observations(cur_seg)
+            and self.info(dst_seg).kind != OUTDOORS
+        ):
+            doors = self.door_list(dst_seg)
+            if doors and not any(
+                max(abs(dst_pos[0] - c[0]), abs(dst_pos[1] - c[1])) <= DOOR_REACH
+                for d in doors
+                for c in d["cells"]
+            ):
+                return True
         move = self.fade_direction if self.fade_direction in DIRECTIONS else None
         after = self.warps + [(self.step, self.segment, self.pos, segment, pos)]
         return (self.door_conflicts(after, self.warp_moves + [move], self._same_door)
