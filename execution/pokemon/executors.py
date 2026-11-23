@@ -108,7 +108,8 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
     return kept
 
 
-INTERACT_SETTLE_WAIT = 2
+INTERACT_SETTLE_WAIT = 4
+INTERACT_POST_DIALOGUE_SETTLE_WAIT = 6
 INTERACT_MAX_CUTSCENE_WAIT = 24
 INTERACT_POST_MOTION_WAIT = 4
 INTERACT_MODAL_MAX_PRESSES = 8
@@ -142,9 +143,11 @@ class InteractionExecutor(PolicyExecutor):
 
     def _has_interaction_overlay(self, frame=None) -> bool:
         frame = self._current_frame() if frame is None else frame
-        return has_bottom_dialogue_box(frame) or has_modal_preview_box(frame)
+        return (has_bottom_dialogue_box(frame)
+                or has_modal_preview_box(frame)
+                or (has_top_dialogue_box(frame) and not has_menu_cursor(frame)))
 
-    def _wait_for_interaction(self, records: List[EnvironmentStepRecord]):
+    def _wait_for_interaction(self, records: List[EnvironmentStepRecord], settle_wait: int = INTERACT_SETTLE_WAIT):
         state = self._agent_state()
         waited = 0
         post_motion_remaining = 0
@@ -155,7 +158,7 @@ class InteractionExecutor(PolicyExecutor):
             if waited > 0 and (self._has_interaction_overlay(frame) or is_battle_screen(frame)):
                 break
             emote_open = has_emote_bubble(frame)
-            if waited >= INTERACT_SETTLE_WAIT and not emote_open and post_motion_remaining <= 0:
+            if waited >= settle_wait and not emote_open and post_motion_remaining <= 0:
                 break
             wait_record = self._take_action(WaitAction)
             records.append(wait_record)
@@ -184,7 +187,11 @@ class InteractionExecutor(PolicyExecutor):
             if has_menu_cursor(frame) or is_battle_screen(frame) or has_top_dialogue_box(frame):
                 break
             if waited >= MENU_SETTLE_WAIT and post_motion_remaining <= 0:
-                break
+                if (has_menu_cursor(frame)
+                        or is_battle_screen(frame)
+                        or has_top_dialogue_box(frame)
+                        or waited >= INTERACT_POST_DIALOGUE_SETTLE_WAIT):
+                    break
             wait_record = self._take_action(WaitAction)
             records.append(wait_record)
             waited += 1
@@ -215,7 +222,7 @@ class InteractionExecutor(PolicyExecutor):
                 break
             state = self._agent_state()
             if state == AgentState.FREE_ROAM:
-                state = self._wait_for_interaction(records)
+                state = self._wait_for_interaction(records, settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT)
         return state
 
     def _clear_interaction_dialogue(self, records: List[EnvironmentStepRecord]) -> None:
@@ -227,7 +234,7 @@ class InteractionExecutor(PolicyExecutor):
             if self._last_terminated or self._last_truncated:
                 break
             if self._agent_state() == AgentState.FREE_ROAM:
-                self._wait_for_interaction(records)
+                self._wait_for_interaction(records, settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT)
                 if self._agent_state() == AgentState.FREE_ROAM and self._has_interaction_overlay():
                     self._advance_interaction_overlay(records)
                 if self._agent_state() == AgentState.IN_MENU:
@@ -360,6 +367,10 @@ class InteractionExecutor(PolicyExecutor):
         if state == AgentState.FREE_ROAM and self._has_interaction_overlay():
             saw_overlay = True
             state = self._advance_interaction_overlay(records)
+            if self._last_terminated or self._last_truncated:
+                return self._finish(records)
+        if state == AgentState.IN_MENU and not (self._last_terminated or self._last_truncated):
+            state = self._settle_interaction_menu_state(records)
             if self._last_terminated or self._last_truncated:
                 return self._finish(records)
         if (interact.action_success != 1

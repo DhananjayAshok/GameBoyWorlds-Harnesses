@@ -50,6 +50,9 @@ CONFIRM_FRAMES = 2
 MAX_CONFIRM = 6
 # Squares kept around such a square, in every direction.
 CONFIRM_REACH = 2
+# Stationary WaitAction steps allowed between an A press and delayed dialogue opening, and during pre-battle wipes.
+MAX_A_PRESS_WAIT_STEPS = 8
+MAX_PRE_BATTLE_WAIT_STEPS = 28
 
 
 @dataclass
@@ -253,6 +256,7 @@ class NPCRegistry(StrategistArtifact):
         self._a_facing: Optional[str] = None
         self._resume: Optional[str] = None
         self._last_closed: Optional[str] = None
+        self._moved_since_close: bool = False
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -332,6 +336,7 @@ class NPCRegistry(StrategistArtifact):
         self._tracks = {}
         self._forget_screen()
         self._facing, self._open, self._last_closed = self.last_facing, None, None
+        self._moved_since_close = False
         self._a_step, self._a_facing = None, None
         if self.pending_press is not None:
             p_step, p_facing, p_seg, p_pos = self.pending_press
@@ -821,20 +826,24 @@ class NPCRegistry(StrategistArtifact):
             self._facing = None
         self.last_facing = self._facing
 
+        if self._open is None and ev.direction is not None:
+            self._moved_since_close = True
+
         a_press = self._is_a_press(ev.action, ev.kwargs)
-        # A 1-2 tick delayed text box can open after the A press and up to 2 settle WaitActions.
-        pressed = a_press or (self._a_step is not None and 0 < self._gmap.step - self._a_step <= 3)
+        # A delayed text box can open after the A press and up to MAX_A_PRESS_WAIT_STEPS stationary settle WaitActions.
+        pressed = a_press or (self._a_step is not None and 0 < self._gmap.step - self._a_step <= MAX_A_PRESS_WAIT_STEPS)
         if a_press and ev.was_free:
             self._a_step = self._gmap.step
             self._a_facing = self._facing
-        elif not ev.free or (self._a_step is not None and self._gmap.step - self._a_step > 3) or (
+        elif not ev.free or (self._a_step is not None and self._gmap.step - self._a_step > MAX_A_PRESS_WAIT_STEPS) or (
                 ev.was_free and ev.free and ev.direction is not None):
             self._a_step = None
             self._a_facing = None
 
         crops = self._step_crops(ev)
+        in_battle = state == AgentState.IN_BATTLE or bool(getattr(self._gmap, "in_battle", False) and not ev.free)
         # Text opens a conversation: either entering IN_DIALOGUE from free roam, or a single-step dialogue with crops.
-        if self._open is None and ev.was_free and (
+        if self._open is None and ev.was_free and not in_battle and (
                 state == AgentState.IN_DIALOGUE
                 or (crops and state in (AgentState.FREE_ROAM, AgentState.IN_MENU))):
             if not pressed and self._try_reopen_pre_battle(ev):
@@ -847,13 +856,13 @@ class NPCRegistry(StrategistArtifact):
             self._collect_crops(ev, crops)
             if state == AgentState.FREE_ROAM:
                 self._close_conversation("free_roam", True)
-            elif state == AgentState.IN_BATTLE:
+            elif in_battle:
                 self._close_conversation("battle", True)
-        elif state == AgentState.IN_BATTLE:
+        elif in_battle:
             self._upgrade_recent_to_battle(crops)
 
     def _recent_pre_battle_conversation(self) -> Optional[Conversation]:
-        if self._last_closed is None or self._gmap is None:
+        if self._last_closed is None or self._gmap is None or self._moved_since_close:
             return None
         conv = self.conversations.get(self._last_closed)
         if conv is None or conv.episode != self._episode or conv.trigger == "battle_start":
@@ -861,7 +870,7 @@ class NPCRegistry(StrategistArtifact):
         if conv.led_to != "free_roam" or conv.sign is not None:
             return None
         end_step = conv.map_step_end if conv.map_step_end is not None else conv.map_step_start
-        if self._gmap.step - end_step > 4:
+        if self._gmap.step - end_step > MAX_PRE_BATTLE_WAIT_STEPS:
             return None
         if self._gmap.resolve(self._gmap.segment, self._gmap.pos) != self._gmap.resolve(conv.segment, conv.square):
             return None
@@ -883,7 +892,7 @@ class NPCRegistry(StrategistArtifact):
         conv = self._recent_pre_battle_conversation()
         if conv is None:
             return
-        if crops:
+        if crops and not conv.crops:
             drop_prefix_crops(crops, conv.crops)
         conv.led_to, conv.map_step_end = "battle", self._gmap.step
         if conv.npc in self.npcs and self.get(conv.npc).kind in ("unknown", "person"):
@@ -1192,7 +1201,9 @@ class NPCRegistry(StrategistArtifact):
         if led_to == "battle" and conv.npc is None and conv.sign is None:
             # Nobody known spoke and a battle followed at once: a battle start, never read, summarised or counted.
             self._mark_battle_start(conv)
-        self._last_closed = conv.id
+        if conv.crops or conv.text or self._last_closed is None:
+            self._last_closed = conv.id
+            self._moved_since_close = False
         self._open = None
 
     def attach_model(self, vlm_caller: Optional[Callable[[str], Callable[..., Any]]]) -> None:

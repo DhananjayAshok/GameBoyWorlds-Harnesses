@@ -1142,6 +1142,21 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 attempts.append(note)
                 return "env_done", attempts, subgoal_index
 
+            if result["succeeded"] and self._agent_state() == AgentState.FREE_ROAM and not self._env_done():
+                step_before_settle = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+                self._settle_free_roam()
+                step_after_settle = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+                if step_after_settle != step_before_settle:
+                    result["report"].final_state = self._env.get_info()
+                    after_place = self._record_map_stop()
+                    move_tag = self._format_leg_movement(
+                        before_place, after_place, prior_stops, is_move_action=is_move_action)
+                if self._env_done():
+                    note = f"{request} used up the last of the environment's steps"
+                    self._note(note)
+                    attempts.append(note)
+                    return "env_done", attempts, subgoal_index
+
             if (result["succeeded"]
                     and (self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM)
                     and not self._env_done()

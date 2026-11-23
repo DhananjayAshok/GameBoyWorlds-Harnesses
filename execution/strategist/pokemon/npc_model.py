@@ -71,10 +71,13 @@ BATTLE_START_LINE_PATTERN = re.compile(
     r"^\s*(?:Wild\s+\S+.*?\s+appeared!|.+?\s+wants\s+to\s+(?:battle|fight)!|.+?\s+sent\s+out\s+\S+!)\s*$",
     re.IGNORECASE,
 )
-BATTLE_START_TEXT_PATTERN = re.compile(
-    r"^\s*(?:Wild\s+\S+[\s\S]*?\s+appeared!|[\s\S]+?\s+wants\s+to\s+(?:battle|fight)!|[\s\S]+?\s+sent\s+out\s+\S+!)"
-    r"(?:\s*(?:Wild\s+\S+[\s\S]*?\s+appeared!|[\s\S]+?\s+wants\s+to\s+(?:battle|fight)!|[\s\S]+?\s+sent\s+out\s+\S+!))*\s*$",
-    re.IGNORECASE,
+BATTLE_START_BLOCK_PATTERN = re.compile(
+    r"(?im)^[ \t]*(?:"
+    r"Wild[ \t]+\S+(?:[ \t]+\S+)?(?:\r?\n[ \t]*|[ \t]+)appeared!"
+    r"|[^\r\n!?]{1,25}?\bwants(?:\r?\n[ \t]*|[ \t]+)to(?:\r?\n[ \t]*|[ \t]+)(?:battle|fight)!"
+    r"|[^\r\n!?]{1,25}?\bsent(?:\r?\n[ \t]*|[ \t]+)out(?:\r?\n[ \t]*|[ \t]+)\S+!"
+    r"|Go!(?:\r?\n[ \t]*|[ \t]+)\S+!"
+    r")[ \t]*$"
 )
 HEALING_SERVICE_PATTERN = re.compile(
     r"\b(?:Welcome\s+to\s+our\s+POK[eé]MON\s+CENTER|heal\s+your\s+POK[eé]MON\s+(?:back\s+)?to\s+perfect\s+health"
@@ -86,9 +89,17 @@ SHOP_SERVICE_PATTERN = re.compile(
     r"|That\s+will\s+be\s+[\s\S]*?OK\?|Here\s+you\s+are!\s*Thank\s+you!)",
     re.IGNORECASE,
 )
+ITEM_PICKUP_PATTERN = re.compile(
+    r"^\s*(?!.*\b(?:KEY\s+POCKET|HM\s*0?\d)\b)"
+    r"(?:[A-Za-z0-9.'♂♀\-]{1,12}\s+)?found\s+([A-Z0-9][A-Z0-9\s.'é\-]{1,22}?)!"
+    r"(?:\s+(?:[A-Za-z0-9.'♂♀\-]{1,12}\s+)?put\s+the\s+[\s\S]{1,60}?\s+in\s+the\s+[A-Z0-9\s]+POCKET\.)?\s*$"
+)
 GIFT_OR_QUEST_PATTERN = re.compile(
     r"\b(?:received|got\s+a?\s*[A-Z0-9]|handed|delivered|gave\s+you|take\s+this|took\s+the|order\s+came\s+in)\b",
     re.IGNORECASE,
+)
+NAMED_SPEAKER_INTRO_PATTERN = re.compile(
+    r"(?:\b(?:I'm|I\s+am)\s+[A-Z]{2,}\b|\b(?:GYM\s+LEADER|ELITE\s+FOUR|CHAMPION)\b)"
 )
 
 
@@ -96,24 +107,30 @@ def _clean_dialogue_lines(text: str) -> List[str]:
     return [ln.strip() for ln in (text or "").splitlines() if ln.strip() and not ln.strip().startswith("```")]
 
 
+def strip_battle_start_lines(text: str) -> str:
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in (text or "").splitlines()
+             if ln.strip() and not ln.strip().startswith("```") and BATTLE_START_LINE_PATTERN.match(ln.strip()) is None]
+    cleaned = "\n".join(lines).strip()
+    if not cleaned:
+        return ""
+    stripped = BATTLE_START_BLOCK_PATTERN.sub("", cleaned)
+    return "\n".join(ln.strip() for ln in stripped.splitlines() if ln.strip()).strip()
+
+
 def is_battle_start_text(text: str) -> bool:
     lines = _clean_dialogue_lines(text)
     if not lines:
         return False
-    if all(BATTLE_START_LINE_PATTERN.match(ln) is not None for ln in lines):
-        return True
-    return bool(BATTLE_START_TEXT_PATTERN.match(" ".join(lines)))
+    return strip_battle_start_lines(text) == ""
 
 
-def strip_battle_start_lines(text: str) -> str:
-    if not text:
-        return ""
-    lines = [ln for ln in (text or "").splitlines()
-             if not ln.strip().startswith("```") and BATTLE_START_LINE_PATTERN.match(ln.strip()) is None]
-    cleaned = "\n".join(ln for ln in lines if ln.strip()).strip()
-    if cleaned and BATTLE_START_TEXT_PATTERN.match(" ".join(cleaned.splitlines())):
-        return ""
-    return cleaned
+def _match_item_pickup(text: str) -> Optional[re.Match[str]]:
+    lines = _clean_dialogue_lines(text)
+    if not lines:
+        return None
+    return ITEM_PICKUP_PATTERN.match(" ".join(lines))
 
 
 def is_routine_service_text(text: str) -> bool:
@@ -121,12 +138,18 @@ def is_routine_service_text(text: str) -> bool:
         return False
     if GIFT_OR_QUEST_PATTERN.search(text):
         return False
+    if _match_item_pickup(text) is not None:
+        return True
     return bool(HEALING_SERVICE_PATTERN.search(text) or SHOP_SERVICE_PATTERN.search(text))
 
 
 def routine_service_summary(text: str) -> Optional[Tuple[str, str]]:
     if not is_routine_service_text(text):
         return None
+    item_match = _match_item_pickup(text)
+    if item_match is not None:
+        item_name = " ".join(item_match.group(1).split())
+        return (f"The player found {item_name}.", "gift")
     if HEALING_SERVICE_PATTERN.search(text):
         return ("The Pokémon Center nurse welcomed the player and healed their Pokémon to full health.", "other")
     if SHOP_SERVICE_PATTERN.search(text):
@@ -135,7 +158,7 @@ def routine_service_summary(text: str) -> Optional[Tuple[str, str]]:
 
 
 def routine_trainer_challenge_summary(reg: Any, conv: Any) -> Optional[Tuple[str, str]]:
-    if getattr(conv, "trigger", None) != "npc_started":
+    if getattr(conv, "trigger", None) not in ("npc_started", "a_press"):
         return None
     if getattr(conv, "led_to", None) != "battle" and getattr(conv, "outcome", None) != "battle":
         return None
@@ -156,9 +179,9 @@ def is_routine_conversation(reg: Any, conv: Any) -> bool:
         return True
     if is_battle_start_text(text) or is_routine_service_text(text):
         return True
-    if getattr(conv, "trigger", None) == "npc_started" and (
+    if getattr(conv, "trigger", None) in ("npc_started", "a_press") and (
             getattr(conv, "led_to", None) == "battle" or getattr(conv, "outcome", None) == "battle"):
-        if GIFT_OR_QUEST_PATTERN.search(text):
+        if GIFT_OR_QUEST_PATTERN.search(text) or NAMED_SPEAKER_INTRO_PATTERN.search(text):
             return False
         if any(TAG.match(ln) for ln in text.splitlines()):
             return False
