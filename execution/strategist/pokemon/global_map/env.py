@@ -79,7 +79,7 @@ class MappingEnvironment:
         self.facing: Optional[str] = None
 
     def step_high_level_action(self, action, **kwargs):
-        from execution.game_api import AgentState
+        from execution.game_api import AgentState, MenuAction, OpenMenuAction
         from execution.perception.pokemon.battle import is_battle_screen
 
         before = self._env.get_info()
@@ -101,9 +101,18 @@ class MappingEnvironment:
                     or after_state == AgentState.IN_BATTLE
                     or (not free and is_battle_screen(frame))
                 )
+                is_menu_action = (
+                    action in (OpenMenuAction, MenuAction)
+                    or (isinstance(action, type) and issubclass(action, (OpenMenuAction, MenuAction)))
+                )
+                in_menu = (
+                    is_menu_action
+                    or before_state == AgentState.IN_MENU
+                    or after_state == AgentState.IN_MENU
+                )
                 direction, max_steps, reported = _movement(action, kwargs, info, self._map)
                 passed = core.get("transition_passed_frames")
-                faded = passed is not None and any(not has_structure(f) for f in passed)
+                faded = not in_menu and passed is not None and any(not has_structure(f) for f in passed)
                 identified = self._tiles.identify_tiles(frame) if free else {}
                 queued = len(self._map.naming_queue)
                 status = self._map.on_step(

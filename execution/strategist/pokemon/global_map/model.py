@@ -578,10 +578,11 @@ class GlobalMap(StrategistArtifact):
             self.lost = 0
         elif free_roam and direction in DIRECTIONS and not self.in_battle:
             self.since_battle_moved = True
-        if faded and not self.in_battle and self.since_battle_moved:
+        if faded and not self.in_battle and self.since_battle_moved and (free_roam or was_free_roam):
             # after a blank screen the position must be recognised from the map, not slid from the last frame
             self.faded = True
-            self.fade_direction = direction
+            if direction in DIRECTIONS:
+                self.fade_direction = direction
         if not free_roam:
             # remember a move under way so the next free-roam frame is placed relative to the last good one
             if was_free_roam and direction in DIRECTIONS:
