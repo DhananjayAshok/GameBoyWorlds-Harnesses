@@ -61,7 +61,9 @@ def is_cursor_tile(raw_tile: np.ndarray) -> bool:
 
 
 def has_menu_cursor(frame: np.ndarray) -> bool:
-    """Return True if any 8x8 grid tile on screen contains a right-pointing menu cursor."""
+    """Return True if any 8x8 grid tile on screen contains a right-pointing menu cursor (or active Pack item list)."""
+    if frame is None:
+        return False
     img = _grey_frame(frame)
     max_ty = min(GRID_ROWS, img.shape[0] // TILE_SIZE)
     max_tx = min(GRID_COLS, img.shape[1] // TILE_SIZE)
@@ -71,7 +73,7 @@ def has_menu_cursor(frame: np.ndarray) -> bool:
             x0 = tx * TILE_SIZE
             if is_cursor_tile(img[y0:y0 + TILE_SIZE, x0:x0 + TILE_SIZE]):
                 return True
-    return False
+    return is_pack_item_list_screen(img)
 
 
 def has_battle_menu_box(frame: np.ndarray) -> bool:
@@ -414,6 +416,68 @@ def has_top_dialogue_box(frame: np.ndarray) -> bool:
     return True
 
 
+def is_party_menu_screen(frame: np.ndarray) -> bool:
+    """Return True if the upper screen shows the Generation 1 or Generation 2 party menu layout."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    dark = img < DARK_INK
+    light = img >= LIGHT_BACKGROUND
+    if (
+        float(dark[22, 88:156].mean()) >= 0.90
+        and float(dark[17, 88:104].mean()) >= 0.85
+        and float(dark[17:23, 152:156].mean()) >= 0.85
+        and float(light[16, 88:156].mean()) >= 0.95
+        and float(light[23, 88:156].mean()) >= 0.95
+        and int(dark[8:16, 8:80].sum()) >= 40
+    ):
+        return True
+    if (
+        float(dark[10, 48:96].mean()) >= 0.90
+        and float(dark[13, 48:96].mean()) >= 0.90
+        and float(light[8:10, 48:96].mean()) >= 0.95
+        and float(light[14:16, 48:96].mean()) >= 0.95
+        and int(dark[10:14, 32:48].sum()) >= 18
+        and int(dark[0:8, 8:96].sum()) >= 40
+    ):
+        return True
+    return False
+
+
+def is_pack_item_list_screen(frame: np.ndarray) -> bool:
+    """Return True if the screen shows the Generation 2 Pack item list without an open action/quantity sub-box."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    top_bar = img[:TILE_SIZE, :]
+    if float((top_bar < DARK_INK).mean()) < 0.65 or int((top_bar >= LIGHT_BACKGROUND).sum()) < 40:
+        return False
+    sidebar = img[TILE_SIZE:BATTLE_UPPER_BOTTOM, :5 * TILE_SIZE]
+    label_band = img[58:76, 2:38]
+    if float((sidebar < LIGHT_BACKGROUND).mean()) < 0.65 or float((label_band < DARK_INK).mean()) < 0.60:
+        return False
+    item_area = img[TILE_SIZE:BATTLE_UPPER_BOTTOM, 5 * TILE_SIZE:GRID_COLS * TILE_SIZE]
+    if float((item_area >= LIGHT_BACKGROUND).mean()) < 0.70 or int((item_area < DARK_INK).sum()) < 25:
+        return False
+    for tx in range(10, 16):
+        x0 = tx * TILE_SIZE
+        n_v = sum(
+            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, x0:x0 + TILE_SIZE])
+            for ty in range(3, 12)
+        )
+        if n_v >= 4:
+            return False
+    if has_quantity_selector_box(img):
+        return False
+    return True
+
+
 def is_battle_screen(frame: np.ndarray) -> bool:
     """Return True if the screen shows a battle backdrop above a bottom battle box."""
     img = _grey_frame(frame)
@@ -421,7 +485,10 @@ def is_battle_screen(frame: np.ndarray) -> bool:
         return False
     if not has_bottom_dialogue_box(img):
         return False
-    if has_top_dialogue_box(img) or has_modal_preview_box(img):
+    if (has_top_dialogue_box(img)
+            or has_modal_preview_box(img)
+            or is_party_menu_screen(img)
+            or is_pack_item_list_screen(img)):
         return False
     upper = img[:BATTLE_UPPER_BOTTOM, :]
     if float((upper >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_UPPER_WHITE_FRACTION:

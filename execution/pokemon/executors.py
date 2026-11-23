@@ -8,15 +8,15 @@ from execution.game_api import (AgentState, BattleMenuAction, InteractAction, Lo
                                 WaitAction)
 
 from execution.executors import PolicyExecutor
-from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_emote_bubble,
-                                                 has_menu_cursor, has_modal_preview_box,
+from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bottom_location_banner,
+                                                 has_emote_bubble, has_menu_cursor, has_modal_preview_box,
                                                  has_player_pokemon_fainted_text, has_quantity_selector_box,
                                                  has_top_dialogue_box,
                                                  is_battle_decision_screen,
                                                  is_battle_defeat_text, is_battle_menu_crop,
                                                  is_battle_screen, is_cutscene_frame_changing,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
-                                                 is_move_selection_screen,
+                                                 is_move_selection_screen, is_party_menu_screen,
                                                  is_same_battle_frame)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
@@ -1426,7 +1426,7 @@ Press: <one of up, down, left, right, confirm, back>
             if state == AgentState.IN_MENU:
                 if has_menu_cursor(frame):
                     break
-                in_battle_intro = is_battle_screen(frame)
+                in_battle_intro = is_battle_screen(frame) or is_party_menu_screen(frame)
                 if not in_battle_intro and consecutive_dismisses >= MAX_STAT_DISMISS_STEPS:
                     break
                 extra = self._take_action(MenuAction, menu_action="confirm")
@@ -1706,7 +1706,11 @@ Press: <one of up, down, left, right, confirm, back>
                 else:
                     consecutive_failures = 0
                 presses, dismisses = 0, 0
-                if self._agent_state() != AgentState.IN_MENU:
+                if self._agent_state() != AgentState.IN_MENU or (
+                    press == "confirm"
+                    and is_party_menu_screen(self._current_frame())
+                    and not has_menu_cursor(self._current_frame())
+                ):
                     presses, dismisses = self._advance_until_decision(turn_records)
                     if self._last_terminated:
                         return self._fail(BATTLE_TERMINATED, "terminated")
@@ -1942,10 +1946,12 @@ Press: <one of up, down, left, right, confirm, back>
 [STOP]"""
 
     MAX_MENU_DIALOGUE_SETTLE_STEPS = 20
+    MAX_STALLED_MENU_DISMISSES = 4
 
     def __init__(self, env, task, max_steps: int = 25, is_start_menu: bool = False, **kwargs):
         self.is_start_menu = is_start_menu
         self.presses: List[str] = []
+        self.press_outcomes: List[str] = []
         self.dialogue_crops: List[Any] = []
         self.dialogue_text: str = ""
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
@@ -1962,7 +1968,7 @@ Press: <one of up, down, left, right, confirm, back>
         notes_lines = [f"Presses: {', '.join(self.presses) or 'none'}"]
         if self.dialogue_text:
             notes_lines.append(self.dialogue_text)
-        elif (
+        if (
             self.is_start_menu
             and re.search(r"\b(?:item|bag|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
             and re.search(r"\b(?:heal|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
@@ -1998,11 +2004,12 @@ Press: <one of up, down, left, right, confirm, back>
     def _history_block(self) -> str:
         if not self.presses:
             return ""
-        return f"\nPresses made so far, in order: {', '.join(self.presses)}.\n"
+        outcomes = self.press_outcomes if len(self.press_outcomes) == len(self.presses) else self.presses
+        return f"\nPresses made so far, in order: {', '.join(outcomes)}.\n"
 
     def _saw_healing_item_effect(self) -> bool:
         if self.dialogue_text and re.search(
-            r"\b(?:recovered\s+by\s+\d+|restored\s+\d+\s*HP|HP\s+was\s+restored)\b",
+            r"\b(?:recovered\s+(?:by\s+)?\d+(?:\s*HP)?|restored\s+\d+\s*HP|HP\s+was\s+restored)\b",
             self.dialogue_text,
             re.IGNORECASE,
         ):
@@ -2010,17 +2017,23 @@ Press: <one of up, down, left, right, confirm, back>
         for call in self.report.vlm_call_log:
             if isinstance(call, ExecutorVLMCallRecord) and call.tag == self.STEP_TAG:
                 if re.search(
-                    r"\b(?:recovered\s+by\s+\d+|restored\s+\d+\s*HP|HP\s+was\s+restored)\b",
+                    r"\b(?:recovered\s+(?:by\s+)?\d+(?:\s*HP)?|restored\s+\d+\s*HP|HP\s+was\s+restored)\b",
                     str(call.response),
                     re.IGNORECASE,
                 ):
                     return True
         return False
 
+    @staticmethod
+    def _has_menu_bottom_box(frame: np.ndarray) -> bool:
+        return has_bottom_dialogue_box(frame) or (
+            is_party_menu_screen(frame) and has_bottom_location_banner(frame)
+        )
+
     def _should_settle_menu_dialogue(self, before_frame: np.ndarray, after_frame: np.ndarray, press: str) -> bool:
         if press not in ("confirm", "back"):
             return False
-        if not (has_bottom_dialogue_box(before_frame) and has_bottom_dialogue_box(after_frame)):
+        if not (self._has_menu_bottom_box(before_frame) and self._has_menu_bottom_box(after_frame)):
             return False
         if has_menu_cursor(after_frame):
             return False
@@ -2041,7 +2054,7 @@ Press: <one of up, down, left, right, confirm, back>
             state = effective_agent_state(self._agent_state(), frame)
             if state != AgentState.IN_MENU:
                 return
-            if not has_bottom_dialogue_box(frame) or has_menu_cursor(frame):
+            if not self._has_menu_bottom_box(frame) or has_menu_cursor(frame):
                 return
             wait_rec = self._take_action(WaitAction)
             drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
@@ -2049,7 +2062,7 @@ Press: <one of up, down, left, right, confirm, back>
                 return
             after_wait = self._get_state()["core"]["current_frame"]
             state = effective_agent_state(self._agent_state(), after_wait)
-            if state != AgentState.IN_MENU or not has_bottom_dialogue_box(after_wait) or has_menu_cursor(after_wait):
+            if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_wait) or has_menu_cursor(after_wait):
                 return
             if not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
                 stalled_dismisses = 0
@@ -2060,11 +2073,11 @@ Press: <one of up, down, left, right, confirm, back>
                 return
             after_dismiss = self._get_state()["core"]["current_frame"]
             state = effective_agent_state(self._agent_state(), after_dismiss)
-            if state != AgentState.IN_MENU or not has_bottom_dialogue_box(after_dismiss) or has_menu_cursor(after_dismiss):
+            if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_dismiss) or has_menu_cursor(after_dismiss):
                 return
             if is_same_battle_frame(dismiss_rec.frame_before, dismiss_rec.frame_after):
                 stalled_dismisses += 1
-                if stalled_dismisses >= 2:
+                if stalled_dismisses >= self.MAX_STALLED_MENU_DISMISSES:
                     return
             else:
                 stalled_dismisses = 0
@@ -2097,7 +2110,7 @@ Press: <one of up, down, left, right, confirm, back>
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
             if parse_yes_no(output, "Complete") and (self.presses or self.is_start_menu):
-                if (has_bottom_dialogue_box(frame)
+                if (self._has_menu_bottom_box(frame)
                         and not has_menu_cursor(frame)
                         and not has_quantity_selector_box(frame)):
                     self._settle_menu_dialogue()
@@ -2121,6 +2134,8 @@ Press: <one of up, down, left, right, confirm, back>
                 continue
             consecutive_invalid = 0
             self.presses.append(press)
+            self.press_outcomes.append(press)
+            was_party_menu = is_party_menu_screen(frame)
             record = self._take_action(MenuAction, menu_action=press)
             drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
             if self._last_terminated:
@@ -2139,6 +2154,14 @@ Press: <one of up, down, left, right, confirm, back>
                 if self._last_truncated:
                     return self._finish(MENU_TRUNCATED, "truncated")
                 after_settle = self._get_state()["core"]["current_frame"]
+                if was_party_menu and not is_party_menu_screen(after_settle):
+                    self.press_outcomes[-1] = (
+                        f"{press} (used on party Pokemon, settled healing/effect text, and returned to item menu)"
+                    )
+                elif was_party_menu:
+                    self.press_outcomes[-1] = f"{press} (settled party text)"
+                else:
+                    self.press_outcomes[-1] = f"{press} (settled menu dialogue)"
                 state = effective_agent_state(self._agent_state(), after_settle)
                 if state != AgentState.IN_MENU:
                     code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))

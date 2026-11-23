@@ -73,7 +73,7 @@ HEALING_ITEM_BOUGHT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 HEALING_ITEM_USED_PATTERN = re.compile(
-    r"\b(?:recovered\s+by|restored)\s+(\d+)\b",
+    r"\b(?:recovered(?:\s+by)?|restored)\s+(\d+)(?:\s*HP)?\b",
     re.IGNORECASE,
 )
 HEALING_BAG_EMPTY_PATTERN = re.compile(

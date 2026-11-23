@@ -624,7 +624,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if "No healing item was used in menu" in notes:
             self._healing_bag_empty = True
             return
-        m = re.search(r"\b(?:recovered\s+by|restored)\s+(\d+)\b", notes, re.IGNORECASE)
+        m = re.search(r"\b(?:recovered(?:\s+by)?|restored)\s+(\d+)(?:\s*HP)?\b", notes, re.IGNORECASE)
         if m:
             self._healing_bag_empty = False
             delta = int(m.group(1))
