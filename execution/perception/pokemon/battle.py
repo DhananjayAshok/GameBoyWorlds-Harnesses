@@ -309,6 +309,42 @@ def has_modal_preview_box(frame: np.ndarray) -> bool:
     return bool(find_modal_preview_boxes(frame))
 
 
+def has_quantity_selector_box(frame: np.ndarray) -> bool:
+    """Return True if an enclosed quantity/price selector sub-box is open above the bottom dialogue box."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    max_ty = min(GRID_ROWS, img.shape[0] // TILE_SIZE)
+    max_tx = min(GRID_COLS, img.shape[1] // TILE_SIZE)
+    if max_ty < GRID_ROWS or max_tx < GRID_COLS:
+        return False
+    tiles = [[img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+              for tx in range(max_tx)] for ty in range(max_ty)]
+    h_border = [[is_horizontal_border_tile(tiles[ty][tx]) for tx in range(max_tx)] for ty in range(max_ty)]
+    v_border = [[is_vertical_border_tile(tiles[ty][tx]) for tx in range(max_tx)] for ty in range(max_ty)]
+    for top_ty in range(6, 11):
+        for bot_ty in range(top_ty + 2, min(top_ty + 5, 13)):
+            for left_tx in range(5, 14):
+                for right_tx in range(max(left_tx + 5, 15), 20):
+                    check_end = min(right_tx, 13)
+                    if check_end <= left_tx + 2:
+                        continue
+                    if not all(h_border[top_ty][tx] and h_border[bot_ty][tx]
+                               for tx in range(left_tx + 1, check_end)):
+                        continue
+                    if not all(v_border[ty][left_tx] for ty in range(top_ty + 1, bot_ty)):
+                        continue
+                    y0, y1 = (top_ty + 1) * TILE_SIZE, bot_ty * TILE_SIZE
+                    x0, x1 = (left_tx + 1) * TILE_SIZE, check_end * TILE_SIZE
+                    inner = img[y0:y1, x0:x1]
+                    if inner.size == 0 or float((inner >= LIGHT_BACKGROUND).mean()) < 0.50:
+                        continue
+                    if int((inner < DARK_INK).sum()) < 15:
+                        continue
+                    return True
+    return False
+
+
 def has_emote_bubble(frame: np.ndarray) -> bool:
     """Return True if an overworld speech/exclamation ('!') emote bubble is drawn above a sprite."""
     if frame is None:

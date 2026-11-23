@@ -51,7 +51,7 @@ EXECUTOR_STEPS = {
     "on_screen_move": 20,
     "off_screen_move": 20,
     "interaction": 3,
-    "menu": 15,
+    "menu": 25,
     "combat": 60,
     "dialogue": 10,
     "free": 15,

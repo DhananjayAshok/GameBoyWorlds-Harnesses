@@ -10,7 +10,8 @@ from execution.game_api import (AgentState, BattleMenuAction, InteractAction, Lo
 from execution.executors import PolicyExecutor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_emote_bubble,
                                                  has_menu_cursor, has_modal_preview_box,
-                                                 has_player_pokemon_fainted_text, has_top_dialogue_box,
+                                                 has_player_pokemon_fainted_text, has_quantity_selector_box,
+                                                 has_top_dialogue_box,
                                                  is_battle_decision_screen,
                                                  is_battle_defeat_text, is_battle_menu_crop,
                                                  is_battle_screen, is_cutscene_frame_changing,
@@ -1938,7 +1939,9 @@ Complete: <yes or no>
 Press: <one of up, down, left, right, confirm, back>
 [STOP]"""
 
-    def __init__(self, env, task, max_steps: int = 15, is_start_menu: bool = False, **kwargs):
+    MAX_MENU_DIALOGUE_SETTLE_STEPS = 20
+
+    def __init__(self, env, task, max_steps: int = 25, is_start_menu: bool = False, **kwargs):
         self.is_start_menu = is_start_menu
         self.presses: List[str] = []
         self.dialogue_crops: List[Any] = []
@@ -2012,6 +2015,58 @@ Press: <one of up, down, left, right, confirm, back>
                     return True
         return False
 
+    def _should_settle_menu_dialogue(self, before_frame: np.ndarray, after_frame: np.ndarray, press: str) -> bool:
+        if press not in ("confirm", "back"):
+            return False
+        if not (has_bottom_dialogue_box(before_frame) and has_bottom_dialogue_box(after_frame)):
+            return False
+        if has_menu_cursor(after_frame):
+            return False
+        q_before = has_quantity_selector_box(before_frame)
+        q_after = has_quantity_selector_box(after_frame)
+        if not (has_menu_cursor(before_frame) or q_before):
+            return False
+        if not q_before and q_after:
+            return False
+        return True
+
+    def _settle_menu_dialogue(self) -> None:
+        stalled_dismisses = 0
+        for _ in range(self.MAX_MENU_DIALOGUE_SETTLE_STEPS):
+            if self._last_terminated or self._last_truncated:
+                return
+            frame = self._get_state()["core"]["current_frame"]
+            state = effective_agent_state(self._agent_state(), frame)
+            if state != AgentState.IN_MENU:
+                return
+            if not has_bottom_dialogue_box(frame) or has_menu_cursor(frame):
+                return
+            wait_rec = self._take_action(WaitAction)
+            drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+            if self._last_terminated or self._last_truncated:
+                return
+            after_wait = self._get_state()["core"]["current_frame"]
+            state = effective_agent_state(self._agent_state(), after_wait)
+            if state != AgentState.IN_MENU or not has_bottom_dialogue_box(after_wait) or has_menu_cursor(after_wait):
+                return
+            if not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                stalled_dismisses = 0
+                continue
+            dismiss_rec = self._take_action(MenuAction, menu_action="back")
+            drop_prefix_crops(captured_dialogue_crops([dismiss_rec]), self.dialogue_crops)
+            if self._last_terminated or self._last_truncated:
+                return
+            after_dismiss = self._get_state()["core"]["current_frame"]
+            state = effective_agent_state(self._agent_state(), after_dismiss)
+            if state != AgentState.IN_MENU or not has_bottom_dialogue_box(after_dismiss) or has_menu_cursor(after_dismiss):
+                return
+            if is_same_battle_frame(dismiss_rec.frame_before, dismiss_rec.frame_after):
+                stalled_dismisses += 1
+                if stalled_dismisses >= 2:
+                    return
+            else:
+                stalled_dismisses = 0
+
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
@@ -2040,6 +2095,19 @@ Press: <one of up, down, left, right, confirm, back>
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
             if parse_yes_no(output, "Complete") and (self.presses or self.is_start_menu):
+                if (has_bottom_dialogue_box(frame)
+                        and not has_menu_cursor(frame)
+                        and not has_quantity_selector_box(frame)):
+                    self._settle_menu_dialogue()
+                    if self._last_terminated:
+                        return self._finish(MENU_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(MENU_TRUNCATED, "truncated")
+                    settled_frame = self._get_state()["core"]["current_frame"]
+                    settled_state = effective_agent_state(self._agent_state(), settled_frame)
+                    if settled_state != AgentState.IN_MENU:
+                        code, reason = LEFT_MENU_OUTCOMES.get(settled_state, (MENU_OK, "menu_closed"))
+                        return self._finish(code, reason)
                 return self._finish(MENU_OK, "objective_complete")
             press = (parse_key_value(output, "Press") or "").strip().lower()
             press = next((option for option in MENU_PRESSES if option in press), None)
@@ -2057,10 +2125,22 @@ Press: <one of up, down, left, right, confirm, back>
                 return self._finish(MENU_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(MENU_TRUNCATED, "truncated")
-            state = effective_agent_state(self._agent_state(), self._get_state()["core"]["current_frame"])
+            after_frame = self._get_state()["core"]["current_frame"]
+            state = effective_agent_state(self._agent_state(), after_frame)
             if state != AgentState.IN_MENU:
                 code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                 return self._finish(code, reason)
+            if self._should_settle_menu_dialogue(frame, after_frame, press):
+                self._settle_menu_dialogue()
+                if self._last_terminated:
+                    return self._finish(MENU_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._finish(MENU_TRUNCATED, "truncated")
+                after_settle = self._get_state()["core"]["current_frame"]
+                state = effective_agent_state(self._agent_state(), after_settle)
+                if state != AgentState.IN_MENU:
+                    code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
+                    return self._finish(code, reason)
         return self._finish(MENU_OUT_OF_STEPS, "out_of_steps")
 
 
