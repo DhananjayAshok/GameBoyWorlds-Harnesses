@@ -102,6 +102,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
     MAX_SUBGOAL_ATTEMPTS = 4
     MAX_SUBGOAL_ITERATIONS = 12
     MAX_REPLANS = 2
+    MAX_CONTINUATION_REPLANS = 3
     MAX_TOTAL_EXECUTOR_CALLS = 30
     MAX_INTERRUPTION_CHAIN = 6
 
@@ -787,9 +788,21 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return "quit", reason or "No new plan was given.", []
         return "replan", None, subgoals
 
-    def _task_check(self, frame) -> Tuple[bool, str]:
-        output = self._vlm_call("task_check", texts=self._fill_prompt(PLAYTHROUGH_TASK_CHECK_PROMPT),
-                                images=[frame])
+    def _task_check(self, frame, *, can_continue: bool = True) -> Tuple[bool, str]:
+        remaining_calls = max(0, self._max_steps - self._calls)
+        if can_continue and remaining_calls > 0:
+            continuation_note = (
+                f"\nNote: A continuation replan is available ({remaining_calls} action call(s) remaining in this episode's budget) "
+                f"if the task needs further movement steps."
+            )
+        else:
+            continuation_note = (
+                "\nNote: No further continuation replan will occur in this episode. Judge strictly whether the stages "
+                "named in \"Your task\" have already been achieved on screen; do not answer no merely to use remaining "
+                "action calls for extra forward movement."
+            )
+        prompt = self._fill_prompt(PLAYTHROUGH_TASK_CHECK_PROMPT).replace("[CONTINUATION_NOTE]", continuation_note)
+        output = self._vlm_call("task_check", texts=prompt, images=[frame])
         summary = (parse_key_value(output, "Summary") or "").strip()
         return bool(parse_yes_no(output, "Task complete")), summary
 
@@ -1282,6 +1295,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return self._finish("no_plan", "The planner did not produce any subgoals.")
 
         replans = 0
+        continuation_replans = 0
+        calls_at_plan_start = self._calls
         index = 0
         while index < len(self.plan):
             subgoal = self.plan[index]
@@ -1295,7 +1310,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     self._settle_free_roam()
                     frame = self._current_frame()
                     self._perceive(frame)
-                    complete, summary = self._task_check(frame)
+                    complete, summary = self._task_check(frame, can_continue=False)
                     if complete:
                         return self._finish("completed", None, summary)
                     if self._env_done():
@@ -1309,17 +1324,23 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     return self._finish("lost_battle", "The player lost a battle and blacked out.")
                 frame = self._current_frame()
                 self._perceive(frame)
-                complete, summary = self._task_check(frame)
+                can_continue = (
+                    continuation_replans < self.MAX_CONTINUATION_REPLANS
+                    and not self._out_of_calls()
+                    and not self._env_done()
+                    and self._calls > calls_at_plan_start
+                )
+                complete, summary = self._task_check(frame, can_continue=can_continue)
                 if complete:
                     return self._finish("completed", None, summary)
-                if (replans >= self.MAX_REPLANS or self._out_of_calls()
-                        or self._env_done()):
+                if not can_continue:
                     return self._finish("plan_done_task_incomplete",
                                         "Worked through the plan without finishing the task.",
                                         summary)
                 self._note(f"The plan was finished but the task is not done: {summary}")
+                calls_at_plan_start = self._calls
                 self.plan = self._plan_subgoals(frame)
-                replans += 1
+                continuation_replans += 1
                 if not self.plan:
                     return self._finish("plan_done_task_incomplete",
                                         "Worked through the plan without finishing the task.",
@@ -1330,7 +1351,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if outcome == "env_done":
                 frame = self._current_frame()
                 self._perceive(frame)
-                complete, summary = self._task_check(frame)
+                complete, summary = self._task_check(frame, can_continue=False)
                 return self._finish("completed" if complete else "env_done",
                                     None if complete else "The environment ran out of steps "
                                                           "before the plan was finished.",
@@ -1343,7 +1364,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     frame = self._current_frame()
                     if self._agent_state() == AgentState.FREE_ROAM and not self._is_in_dialogue(frame):
                         self._perceive(frame)
-                        complete, summary = self._task_check(frame)
+                        complete, summary = self._task_check(frame, can_continue=False)
                         if complete:
                             return self._finish("completed", None, summary)
                 return self._finish("out_of_calls", self._out_of_calls_reason(), summary)
@@ -1359,6 +1380,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             replans += 1
             if decision == "quit":
                 return self._finish("quit", reason)
+            calls_at_plan_start = self._calls
             self.plan = subgoals
             index = 0
 
