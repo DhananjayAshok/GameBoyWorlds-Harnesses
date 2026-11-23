@@ -1776,7 +1776,17 @@ Press: <one of up, down, left, right, confirm, back>
         if reason != "battle_lost":
             last_hp = self._last_seen_player_hp()
             if last_hp is not None:
-                notes_lines.append(f"[Party HP seen in battle: {last_hp[0]}/{last_hp[1]} HP]")
+                evolved = bool(
+                    re.search(r"\bevolved\s+into\b", "\n".join(self.dialogue_text), re.IGNORECASE)
+                    and not re.search(r"\bstopped\s+evolving\b", "\n".join(self.dialogue_text), re.IGNORECASE)
+                )
+                if evolved:
+                    notes_lines.append(
+                        f"[Party HP seen in battle: {last_hp[0]}/{last_hp[1]} HP "
+                        f"(pre-evolution HUD; evolution increased current and max HP equally)]"
+                    )
+                else:
+                    notes_lines.append(f"[Party HP seen in battle: {last_hp[0]}/{last_hp[1]} HP]")
         self.report.notes = "\n".join(notes_lines)
         return code
 

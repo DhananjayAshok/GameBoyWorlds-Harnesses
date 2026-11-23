@@ -144,7 +144,9 @@ def fought_and_fled_battles_in_digest(digest: str) -> Tuple[int, int]:
     chunks = re.split(r"\n-\s+while\s+doing\s+\"", text_sec)
     fought, fled = 0, 0
     for ch in chunks[1:]:
-        body = ch.split("\":", 1)[1] if "\":" in ch else ch
+        obj, body = ch.split("\":", 1) if "\":" in ch else ("", ch)
+        if obj.strip().lower().startswith("clear the dialogue"):
+            continue
         if not BATTLE_CHUNK_PATTERN.search(body):
             continue
         if "got away safely" in body.lower() and not USED_MOVE_PATTERN.search(body):
@@ -456,7 +458,12 @@ class PokemonStrategist:
         if self._healing_bag_empty:
             parts.append("bag was already checked and has no usable healing items")
         status = "; ".join(parts)
-        low_hp = (last_hp is not None and last_hp[0] * 2 <= last_hp[1]) or fought >= 3
+        if last_hp is not None and fought_after_hp <= 0:
+            low_hp = last_hp[0] * 2 <= last_hp[1]
+        elif last_hp is not None:
+            low_hp = (last_hp[0] * 2 <= last_hp[1]) or fought_after_hp >= 3
+        else:
+            low_hp = fought >= 3
         if low_hp:
             if self._healing_bag_empty:
                 warning = (
@@ -469,6 +476,8 @@ class PokemonStrategist:
                     "from the ITEM menu (or enter a nearby Pokemon Center to heal) before walking further along a "
                     "route/cave or engaging trainer battles."
                 )
+        elif last_hp is not None and fought_after_hp <= 0 and last_hp[0] >= last_hp[1]:
+            warning = " — active Pokemon is at full HP, though the party has fought battles since the last Pokemon Center visit."
         else:
             warning = " — party has taken battle attrition and has not healed at a Pokemon Center yet."
         return f"\nParty health status: {status}{warning}\n"
