@@ -12,7 +12,8 @@ if TYPE_CHECKING:
     from .model import GlobalMap
 
 
-def _movement(action, kwargs: Dict[str, Any], info: Dict[str, Any]) -> Tuple[Optional[str], int, Optional[int]]:
+def _movement(action, kwargs: Dict[str, Any], info: Dict[str, Any],
+              global_map: Optional[GlobalMap] = None) -> Tuple[Optional[str], int, Optional[int]]:
     from execution.game_api import LowLevelAction, LowLevelActions, MoveStepsAction
 
     if action is MoveStepsAction or (isinstance(action, type) and issubclass(action, MoveStepsAction)):
@@ -26,7 +27,22 @@ def _movement(action, kwargs: Dict[str, Any], info: Dict[str, Any]) -> Tuple[Opt
                   LowLevelActions.PRESS_ARROW_LEFT: "left", LowLevelActions.PRESS_ARROW_RIGHT: "right"}
         direction = arrows.get(kwargs.get("low_level_action"))
         if direction is not None:
-            return direction, 2, None
+            max_steps = 1
+            if global_map is not None and direction in ("down", "left"):
+                try:
+                    seg = global_map.current
+                    pos = global_map.pos
+                    if seg and pos is not None:
+                        dx, dy = (0, -1) if direction == "down" else (-1, 0)
+                        c = seg.get((pos[0] + dx, pos[1] + dy))
+                        if c is not None and (
+                            (direction == "down" and (c.kind == "ledge" or c.hashes in global_map.ledge_patterns))
+                            or (direction == "left" and (c.kind == "ledge_left" or c.hashes in global_map.left_ledge_patterns))
+                        ):
+                            max_steps = 2
+                except Exception:  # noqa: BLE001
+                    pass
+            return direction, max_steps, None
     return None, 0, None
 
 
@@ -85,7 +101,7 @@ class MappingEnvironment:
                     or after_state == AgentState.IN_BATTLE
                     or (not free and is_battle_screen(frame))
                 )
-                direction, max_steps, reported = _movement(action, kwargs, info)
+                direction, max_steps, reported = _movement(action, kwargs, info, self._map)
                 passed = core.get("transition_passed_frames")
                 faded = passed is not None and any(not has_structure(f) for f in passed)
                 identified = self._tiles.identify_tiles(frame) if free else {}

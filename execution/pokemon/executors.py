@@ -581,11 +581,13 @@ class GridMoveExecutor(PolicyExecutor):
             if before_place[0] != after_place[0]:
                 taken = 1
             else:
+                dx, dy = DIRECTIONS[direction]
                 step_dx = after_place[1][0] - before_place[1][0]
                 step_dy = after_place[1][1] - before_place[1][1]
-                if (step_dx, step_dy) != (0, 0):
-                    taken = max(1, abs(step_dx) + abs(step_dy))
-                    self._displacement = (self._displacement[0] + step_dx, self._displacement[1] + step_dy)
+                along = step_dx * dx + step_dy * dy
+                if along > 0:
+                    taken = 1
+                    self._displacement = (self._displacement[0] + dx, self._displacement[1] + dy)
         self._steps_taken += taken
         self._last_step_taken += taken
         state = self._get_state()["pokemon_core"]["agent_state"]

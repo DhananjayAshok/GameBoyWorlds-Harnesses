@@ -208,12 +208,20 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
     diff, s = best_by_k[k_best]
     if diff > threshold or k_best < 0:
         return None
-    tied = [k for k, (d, _) in best_by_k.items() if d <= diff + AMBIGUITY_MARGIN and k >= 0]
-    if len(tied) > 1:
-        if reported is None or reported not in tied:
-            return None
+    if reported is not None and reported in best_by_k and best_by_k[reported][0] <= threshold:
         k_best = reported
-        s = best_by_k[k_best][1]
+        diff, s = best_by_k[k_best]
+    else:
+        tied = [k for k, (d, _) in best_by_k.items() if d <= diff + AMBIGUITY_MARGIN and k >= 0]
+        if len(tied) > 1:
+            if reported is not None and reported in tied:
+                k_best = reported
+                s = best_by_k[k_best][1]
+            elif reported is None and max_steps == 1 and 0 in tied:
+                k_best = 0
+                s = best_by_k[0][1]
+            else:
+                return None
     along_after = s + (residual[0] * ux + residual[1] * uy) - GRID_SKIP * k_best
     new_residual = (residual[0], residual[1])
     if ux:

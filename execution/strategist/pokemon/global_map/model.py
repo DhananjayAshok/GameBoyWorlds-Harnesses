@@ -525,10 +525,13 @@ class GlobalMap(StrategistArtifact):
                 self.blocked_cells.append(set())
             seg_blocked = self.blocked_cells[self.segment]
             is_uniform_piece = int(pixels.min()) == int(pixels.max())
-            if (x, y) == (0, 0):
+            if (x, y) == (0, 0) or self.visits[self.segment].get(g, 0) > 0:
                 seg_blocked.discard(g)
             elif g in seg_blocked and kind == WALKABLE and not bool(set(tags) & DOOR_TAGS):
-                kind = BLOCKED
+                if can_learn_walkable and None not in hashes and hashes in self.walk_patterns:
+                    seg_blocked.discard(g)
+                else:
+                    kind = BLOCKED
             old = seg.get(g)
             if old is None:
                 if (
@@ -622,8 +625,15 @@ class GlobalMap(StrategistArtifact):
                         if c_mid is None or c_mid.kind not in (BLOCKED, LEDGE, LEDGE_LEFT):
                             self.visits[self.segment][mid] += 1
             self.pos, self.residual = pos, residual
-            self.pending, self.lost = None, 0
-            if not structural or delta != (0, 0):
+            placed_steps = abs(delta[0]) + abs(delta[1])
+            if structural and direction in DIRECTIONS and reported is not None and placed_steps < reported:
+                rem_reported = reported - placed_steps
+                rem_max = max(rem_reported + 1, max_steps - placed_steps)
+                self.pending = (direction, rem_max, rem_reported)
+            else:
+                self.pending = None
+            self.lost = 0
+            if not structural:
                 self.anchor = _screen(frame)
             if not structural:
                 self.in_battle = False
@@ -647,6 +657,24 @@ class GlobalMap(StrategistArtifact):
             return "blank"
         if found is not None:
             prev_segment = self.segment
+            if (
+                found == (self.segment, self.pos)
+                and not self.faded
+                and direction in DIRECTIONS
+                and reported is not None
+                and reported > 0
+            ):
+                dx, dy = DIRECTIONS[direction]
+                seg = self.segments[self.segment]
+                adv_pos = self.pos
+                for _ in range(reported):
+                    nxt = (adv_pos[0] + dx, adv_pos[1] + dy)
+                    c_nxt = seg.get(nxt)
+                    if c_nxt is not None and c_nxt.kind in (BLOCKED, LEDGE, LEDGE_LEFT):
+                        break
+                    adv_pos = nxt
+                    self.visits[self.segment][adv_pos] += 1
+                found = (self.segment, adv_pos)
             if found != (self.segment, self.pos):
                 self._link(*found)
             self.segment, self.pos = found
