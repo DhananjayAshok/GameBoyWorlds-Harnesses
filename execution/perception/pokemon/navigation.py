@@ -719,37 +719,10 @@ def filter_open_lane_edge_cells(
     if inward_clear:
         cells_list = inward_clear
 
-    def _is_ledge_roofed(cell: Cell) -> bool:
-        if direction in ("left", "right"):
-            x, y0 = cell
-            if y0 >= 0:
-                return False
-            for y in range(y0 + 1, 1):
-                k = kinds.get((x, y), BLOCKED)
-                if k == LEDGE:
-                    return True
-                if k != WALKABLE:
-                    return False
-            return False
-        if direction == "down":
-            x0, y = cell
-            if x0 >= 0:
-                return False
-            for x in range(x0 + 1, 1):
-                k = kinds.get((x, y), BLOCKED)
-                if k == LEDGE_LEFT:
-                    return True
-                if k != WALKABLE:
-                    return False
-            return False
-        return False
-
     hazard_cells = set(trainer_los_cells(kinds, people)) if people else set()
     non_jump_cells: List[Cell] = []
-    unroofed_non_jump_cells: List[Cell] = []
     los_free_non_jump_cells: List[Cell] = []
     los_free_inward_non_jump_cells: List[Cell] = []
-    los_free_unroofed_non_jump_cells: List[Cell] = []
     los_free_any_cells: List[Cell] = []
     for c in cells_list:
         path = shortest_path(kinds, (0, 0), [c], people=people)
@@ -758,24 +731,15 @@ def filter_open_lane_edge_cells(
         has_jump = any(m == "jump" for _, m, _ in path)
         has_los = bool(hazard_cells) and any(step_cell in hazard_cells for _, _, step_cell in path)
         inward_los = bool(hazard_cells) and ((c[0] - dx, c[1] - dy) in hazard_cells)
-        roofed = _is_ledge_roofed(c)
         if not has_jump:
             non_jump_cells.append(c)
-            if not roofed:
-                unroofed_non_jump_cells.append(c)
             if not has_los:
                 los_free_non_jump_cells.append(c)
                 if not inward_los:
                     los_free_inward_non_jump_cells.append(c)
-                    if not roofed:
-                        los_free_unroofed_non_jump_cells.append(c)
         if not has_los:
             los_free_any_cells.append(c)
 
-    if los_free_unroofed_non_jump_cells:
-        return los_free_unroofed_non_jump_cells
-    if unroofed_non_jump_cells:
-        return unroofed_non_jump_cells
     if los_free_inward_non_jump_cells:
         return los_free_inward_non_jump_cells
     if los_free_non_jump_cells:
