@@ -399,6 +399,38 @@ def is_battle_screen(frame: np.ndarray) -> bool:
     return True
 
 
+def is_evolution_screen(frame: np.ndarray) -> bool:
+    """Return True if the screen shows a full-screen evolution stage above a non-empty bottom dialogue box."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    if (has_battle_menu_box(img)
+            or has_menu_cursor(img)
+            or has_top_dialogue_box(img)
+            or has_modal_preview_box(img)):
+        return False
+    box_inner = img[BOTTOM_BOX_INNER_TOP:BOTTOM_BOX_INNER_BOTTOM, BOTTOM_BOX_INNER_LEFT:112]
+    if int((box_inner < DARK_INK).sum()) < 20:
+        return False
+    left_margin = img[:94, 8:44]
+    right_margin = img[:94, 116:152]
+    lower_strip = img[76:94, 8:152]
+    if (int((left_margin < LIGHT_BACKGROUND).sum()) == 0
+            and int((right_margin < LIGHT_BACKGROUND).sum()) == 0
+            and int((lower_strip < LIGHT_BACKGROUND).sum()) == 0):
+        return True
+    if (float((left_margin < 40).mean()) >= 0.90
+            and float((right_margin < 40).mean()) >= 0.90
+            and float((lower_strip < 40).mean()) >= 0.90
+            and int((img[16:76, 48:112] >= 80).sum()) >= 50):
+        return True
+    return False
+
+
 def is_move_selection_screen(frame: np.ndarray) -> bool:
     """Return True when the 4-move selection menu and TYPE/PP overlay box are open in battle."""
     img = _grey_frame(frame)

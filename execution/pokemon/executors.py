@@ -14,7 +14,8 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_em
                                                  is_battle_decision_screen,
                                                  is_battle_defeat_text, is_battle_menu_crop,
                                                  is_battle_screen, is_cutscene_frame_changing,
-                                                 is_empty_battle_bag_menu, is_move_selection_screen,
+                                                 is_empty_battle_bag_menu, is_evolution_screen,
+                                                 is_move_selection_screen,
                                                  is_same_battle_frame)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
@@ -1218,8 +1219,10 @@ BATTLE_OUT_OF_STEPS = -4
 
 BATTLE_EXIT_SETTLE_WAIT = 4
 MAX_TURN_PROGRESS_STEPS = 30
+MAX_BATTLE_DIALOGUE_STEPS = 90
 MAX_IDLE_PROGRESS_STEPS = 6
 MAX_IDLE_INTRO_STEPS = 6
+MAX_IDLE_BATTLE_DIALOGUE_STEPS = 30
 MAX_STAT_DISMISS_STEPS = 4
 BATTLE_OPTIONS = ("fight", "bag", "pokemon", "run", "progress")
 MENU_PRESSES = ("up", "down", "left", "right", "confirm", "back")
@@ -1388,7 +1391,10 @@ Press: <one of up, down, left, right, confirm, back>
         stat_dismisses = 0
         consecutive_dismisses = 0
         idle_steps = 0
-        for _ in range(MAX_TURN_PROGRESS_STEPS):
+        turn_steps = 0
+        dialogue_steps = 0
+        dialogue_idle_steps = 0
+        while turn_steps < MAX_TURN_PROGRESS_STEPS and dialogue_steps < MAX_BATTLE_DIALOGUE_STEPS:
             if self._last_terminated or self._last_truncated:
                 break
             state = self._agent_state()
@@ -1396,6 +1402,23 @@ Press: <one of up, down, left, right, confirm, back>
             if state == AgentState.FREE_ROAM:
                 if self._confirm_battle_exit(records):
                     break
+                turn_steps += 1
+                continue
+            if state == AgentState.IN_DIALOGUE or (not has_menu_cursor(frame) and is_evolution_screen(frame)):
+                if is_battle_decision_screen(frame):
+                    break
+                extra = self._take_action(LowLevelAction, low_level_action=LowLevelActions.PRESS_BUTTON_A)
+                records.append(extra)
+                progress_presses += 1
+                dialogue_steps += 1
+                consecutive_dismisses = 0
+                idle_steps = 0
+                if is_same_battle_frame(extra.frame_before, extra.frame_after):
+                    dialogue_idle_steps += 1
+                    if dialogue_idle_steps >= MAX_IDLE_BATTLE_DIALOGUE_STEPS:
+                        break
+                else:
+                    dialogue_idle_steps = 0
                 continue
             if state == AgentState.IN_MENU:
                 if has_menu_cursor(frame):
@@ -1405,6 +1428,7 @@ Press: <one of up, down, left, right, confirm, back>
                     break
                 extra = self._take_action(MenuAction, menu_action="confirm")
                 records.append(extra)
+                turn_steps += 1
                 if in_battle_intro:
                     progress_presses += 1
                     consecutive_dismisses = 0
@@ -1420,19 +1444,11 @@ Press: <one of up, down, left, right, confirm, back>
                 else:
                     idle_steps = 0
                 continue
-            if state == AgentState.IN_DIALOGUE:
-                extra = self._take_action(PassDialogueAction)
-                records.append(extra)
-                progress_presses += 1
-                consecutive_dismisses = 0
-                idle_steps = 0
-                if extra.action_success == -1 and self._agent_state() == AgentState.IN_DIALOGUE:
-                    break
-                continue
             if is_battle_decision_screen(frame):
                 break
             extra = self._take_action(BattleMenuAction, option="progress")
             records.append(extra)
+            turn_steps += 1
             if self._last_terminated or self._last_truncated:
                 break
             progress_presses += 1
@@ -1600,7 +1616,9 @@ Press: <one of up, down, left, right, confirm, back>
                         continue
                 return self._record_outcome(AgentState.FREE_ROAM)
 
-            if state == AgentState.IN_DIALOGUE:
+            if state == AgentState.IN_DIALOGUE or (
+                    not is_battle_decision_screen(self._current_frame())
+                    and is_evolution_screen(self._current_frame())):
                 self._ensure_scripted("advance battle dialogue")
                 turn_records: List[EnvironmentStepRecord] = []
                 presses, dismisses = self._advance_until_decision(turn_records)
@@ -1616,7 +1634,10 @@ Press: <one of up, down, left, right, confirm, back>
                     self.history.append(entry)
                 if self._exited_to_free_roam:
                     return self._record_outcome(AgentState.FREE_ROAM)
-                if self._agent_state() == AgentState.IN_DIALOGUE and not presses:
+                dialogue_progressed = any(
+                    not is_same_battle_frame(r.frame_before, r.frame_after) for r in turn_records
+                )
+                if self._agent_state() == AgentState.IN_DIALOGUE and (not presses or not dialogue_progressed):
                     return self._record_outcome(AgentState.IN_DIALOGUE)
                 continue
 
@@ -1763,7 +1784,12 @@ Press: <one of up, down, left, right, confirm, back>
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
                     turn_records.append(back_rec)
-                record = self._take_action(BattleMenuAction, option=option)
+                if option == "progress" and (
+                        self._agent_state() == AgentState.IN_DIALOGUE
+                        or is_evolution_screen(self._current_frame())):
+                    record = self._take_action(LowLevelAction, low_level_action=LowLevelActions.PRESS_BUTTON_A)
+                else:
+                    record = self._take_action(BattleMenuAction, option=option)
                 if self._last_terminated:
                     return self._fail(BATTLE_TERMINATED, "terminated")
                 if self._last_truncated:
@@ -2129,6 +2155,28 @@ class _DialogueSettlingExecutor(PolicyExecutor):
                     return True
                 if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
                     self._settle_after_step()
+                    return True
+            return progressed
+        if button != "b" and is_evolution_screen(self._current_frame()):
+            progressed = False
+            idle_evo = 0
+            for _ in range(MAX_BATTLE_DIALOGUE_STEPS):
+                before_evo = self._current_frame()
+                btn_record = self._take_action_string("button(a)")
+                if btn_record is None:
+                    return progressed
+                drop_prefix_crops(captured_dialogue_crops([btn_record]), self.dialogue_crops)
+                if not is_same_battle_frame(before_evo, self._current_frame()):
+                    progressed = True
+                    idle_evo = 0
+                else:
+                    idle_evo += 1
+                if self._last_terminated or self._last_truncated:
+                    return True
+                state = self._settle_after_step()
+                if self._last_terminated or self._last_truncated or state != AgentState.IN_DIALOGUE:
+                    return True
+                if not is_evolution_screen(self._current_frame()) or idle_evo >= MAX_IDLE_BATTLE_DIALOGUE_STEPS:
                     return True
             return progressed
         record = self._take_action(PassDialogueAction)
