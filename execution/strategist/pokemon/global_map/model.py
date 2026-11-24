@@ -650,6 +650,11 @@ class GlobalMap(StrategistArtifact):
             # an NPC on a cell, or a tile not yet recognised, never overwrites what the cell was known to be
             if kind in (OCCUPIED, UNKNOWN) and old.kind not in (OCCUPIED, UNKNOWN):
                 continue
+            if is_door(old) and not bool(set(tags) & DOOR_TAGS) and any(
+                self.resolve(a, pa) == (self.segment, g) or self.resolve(b, pb) == (self.segment, g)
+                for _, a, pa, b, pb in self.warps
+            ):
+                continue
             if (x, y) == (0, 0) and old.kind != OCCUPIED:
                 if can_learn_walkable and old.kind == BLOCKED:
                     self._learn_walkable(old)
@@ -1309,7 +1314,7 @@ class GlobalMap(StrategistArtifact):
     def _warp_anchored_overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
         src_seg = self.segments[source] if 0 <= source < len(self.segments) else {}
         dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
-        if not src_seg or not dst_seg or self._has_min_observations(source):
+        if not src_seg or not dst_seg or self.info(source).name is not None:
             return None
         for _, a, pa, b, pb in self.warps:
             ra, rpa = self.resolve(a, pa)
@@ -1349,8 +1354,23 @@ class GlobalMap(StrategistArtifact):
                         core_shared += 1
                         if matched:
                             core_matches += 1
+                needed_shared = min(
+                    CONSOLIDATE_MIN_CELLS,
+                    max(
+                        10,
+                        int(
+                            0.6
+                            * sum(
+                                1
+                                for c in src_seg.values()
+                                if c.kind != OCCUPIED
+                                and not (c.pixels is not None and int(c.pixels.min()) == int(c.pixels.max()))
+                            )
+                        ),
+                    ),
+                )
                 if (
-                    shared >= CONSOLIDATE_MIN_CELLS
+                    shared >= needed_shared
                     and matches >= RELOCALISE_WARP_MIN_FRACTION * shared
                     and core_shared > 0
                     and core_matches >= RELOCALISE_MIN_FRACTION * core_shared
@@ -1530,28 +1550,43 @@ class GlobalMap(StrategistArtifact):
                 (self._screen_agreement(seg, local, o, blank_local, local_pixels), o)
                 for o in cand_offsets
             )[::-1]
-            close = [(o, overlap) for (m, overlap), o in ranked if m >= RELOCALISE_CLOSE_CALL * ranked[0][0][0]]
+            best_m, best_ov = ranked[0][0]
+            best_frac = best_m / max(1, best_ov)
+            close = [
+                (o, overlap, m)
+                for (m, overlap), o in ranked
+                if m >= RELOCALISE_CLOSE_CALL * best_m
+                or (
+                    seg_warps
+                    and overlap > 0
+                    and any(max(abs(o[0] - wp[0]), abs(o[1] - wp[1])) <= DOOR_REACH for wp in seg_warps)
+                    and m / overlap >= RELOCALISE_CLOSE_CALL * best_frac
+                )
+            ]
             if len(close) > 1 and seg_warps:
-                warp_close = [
-                    (o, overlap) for o, overlap in close
-                    if any(max(abs(o[0] - wp[0]), abs(o[1] - wp[1])) <= DOOR_REACH for wp in seg_warps)
-                ]
-                if len(warp_close) == 1:
-                    w_off, w_ov = warp_close[0]
-                    cm, cov = self._screen_agreement(seg, core_local, w_off, core_blank, local_pixels)
+                warp_scored = []
+                for o, overlap, m in close:
+                    if not any(max(abs(o[0] - wp[0]), abs(o[1] - wp[1])) <= DOOR_REACH for wp in seg_warps):
+                        continue
+                    cm, cov = self._screen_agreement(seg, core_local, o, core_blank, local_pixels)
                     if cov > 0 and cm >= RELOCALISE_MIN_FRACTION * cov:
-                        close = warp_close
+                        min_dist = min(abs(o[0] - wp[0]) + abs(o[1] - wp[1]) for wp in seg_warps)
+                        on_door = int(o in seg and is_door(seg[o]))
+                        warp_scored.append(((on_door, -min_dist, cm / cov, m / max(1, overlap), m), o, overlap, m))
+                if warp_scored:
+                    warp_scored.sort(reverse=True)
+                    _, w_off, w_ov, w_m = warp_scored[0]
+                    close = [(w_off, w_ov, w_m)]
             if len(close) > 1:
                 distinctive = sorted(
-                    ((self._distinctive_matches(seg, index, local, o, block_index), o, overlap)
-                     for o, overlap in close),
+                    ((self._distinctive_matches(seg, index, local, o, block_index), o, overlap, m)
+                     for o, overlap, m in close),
                     reverse=True,
                 )
                 if distinctive[0][0] - distinctive[1][0] < DISTINCTIVE_LEAD:
                     continue
-                close = [(distinctive[0][1], distinctive[0][2])]
-            offset, overlap = close[0]
-            n = self._screen_agreement(seg, local, offset, blank_local, local_pixels)[0]
+                close = [(distinctive[0][1], distinctive[0][2], distinctive[0][3])]
+            offset, overlap, n = close[0]
             # a small room shows few content cells: ask for most of them rather than the fixed minimum
             needed = min(RELOCALISE_MIN_CELLS, max(10, int(0.6 * len(local))))
             min_fraction = RELOCALISE_MIN_FRACTION
@@ -1967,8 +2002,27 @@ class GlobalMap(StrategistArtifact):
             rb, rpb = self.resolve(b, pb)
             if ra == rb:
                 continue
-            labels[(ra, self._door_at(ra, rpa))] = rb
-            labels[(rb, self._door_at(rb, rpb))] = ra
+            da, db = self._door_at(ra, rpa), self._door_at(rb, rpb)
+            seg_a = self.segments[ra] if 0 <= ra < len(self.segments) else {}
+            seg_b = self.segments[rb] if 0 <= rb < len(self.segments) else {}
+            if da == rpa and da in seg_a and not is_door(seg_a[da]):
+                same_a = [
+                    p for (s, p), dst in labels.items()
+                    if s == ra and dst == rb and p in seg_a and is_door(seg_a[p])
+                    and max(abs(p[0] - da[0]), abs(p[1] - da[1])) <= DOOR_SNAP_REACH
+                ]
+                if len(same_a) == 1:
+                    da = same_a[0]
+            if db == rpb and db in seg_b and not is_door(seg_b[db]):
+                same_b = [
+                    p for (s, p), dst in labels.items()
+                    if s == rb and dst == ra and p in seg_b and is_door(seg_b[p])
+                    and max(abs(p[0] - db[0]), abs(p[1] - db[1])) <= DOOR_SNAP_REACH
+                ]
+                if len(same_b) == 1:
+                    db = same_b[0]
+            labels[(ra, da)] = rb
+            labels[(rb, db)] = ra
         for i in range(len(self.trail) - 1):
             _, s1, p1 = self.trail[i]
             _, s2, p2 = self.trail[i + 1]
