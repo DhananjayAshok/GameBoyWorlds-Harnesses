@@ -1116,6 +1116,7 @@ class PokemonStrategist:
             **self._supervisor_kwargs,
         )
         env.marker = lambda: (len(supervisor.report.narrative), len(supervisor.report.event_log))
+        supervisor._on_event_logged = record_so_far
         result = supervisor.evaluate()
         report = result["report"]
         record.supervisor_report = report

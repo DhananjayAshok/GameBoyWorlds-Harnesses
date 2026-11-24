@@ -169,10 +169,10 @@ def render_with_people(gmap: GlobalMap, segment: Optional[int] = None, people: I
     return canvas
 
 
-def people_glyph(c: Optional[MapCell]) -> str:
+def people_glyph(c: Optional[MapCell], visited: bool = False) -> str:
     if c is not None and c.kind == OCCUPIED:
         return "#" if "obstacle" in set(c.tags) else "o"
-    return glyph(c)
+    return glyph(c, visited=visited)
 
 
 def people_marks(gmap: GlobalMap, people: Iterable[Any]) -> Tuple[List[Any], Dict[Cell, str]]:
@@ -188,11 +188,15 @@ def people_window(gmap: GlobalMap, grid: Dict[Cell, str], rx: int = 12, ry: int 
     from execution.strategist.pokemon.global_map.text import window_bounds
 
     seg, (px, py) = gmap.current, gmap.pos
+    visits = gmap.visits[gmap.segment] if 0 <= gmap.segment < len(gmap.visits) else {}
     x0, x1, y0, y1 = window_bounds(gmap, rx, ry)
     rows = []
     for y in range(y1, y0 - 1, -1):
-        rows.append("".join("@" if (x, y) == (px, py) else grid.get((x, y)) or people_glyph(seg.get((x, y)))
-                            for x in range(x0, x1 + 1)))
+        rows.append("".join(
+            "@" if (x, y) == (px, py)
+            else grid.get((x, y)) or people_glyph(seg.get((x, y)), visited=visits.get((x, y), 0) > 0)
+            for x in range(x0, x1 + 1)
+        ))
     return "\n".join(rows)
 
 

@@ -73,6 +73,9 @@ class Supervisor(ABC):
     def _vlm_call(self, stage: str, **kwargs: Any) -> Any:
         result, records = self._vlm_infer(stage, **kwargs)
         self.report.event_log.extend(records)
+        hook = getattr(self, "_on_event_logged", None)
+        if callable(hook):
+            hook()
         return result
 
     def _vlm_infer(self, stage: str, **kwargs: Any) -> tuple:

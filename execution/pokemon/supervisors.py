@@ -643,6 +643,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
             )
             self.last_executor = executor
             self.report.event_log.append(executor.report)
+            hook = getattr(self, "_on_event_logged", None)
+            if callable(hook):
+                hook()
             return self.process_executor_return(executor.report)
         finally:
             self._current_tag = None
@@ -1184,6 +1187,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         post_warp_banner_ticks: int = 6,
     ) -> None:
         cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+        env_settled = getattr(self._env, "_last_settled_step", None)
+        if env_settled is not None and (self._last_settled_step is None or env_settled > self._last_settled_step):
+            self._last_settled_step = env_settled
         if cur_step is not None and cur_step == self._last_settled_step and self._agent_state() == AgentState.FREE_ROAM:
             before = self._current_frame()
             if not (has_bottom_dialogue_box(before)
@@ -1230,6 +1236,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._settle_menu_state(max_cutscene_ticks=max_cutscene_ticks, post_motion_ticks=post_motion_ticks)
         if self._agent_state() == AgentState.FREE_ROAM and not self._env_done():
             self._last_settled_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+            if self._last_settled_step is not None:
+                try:
+                    self._env._last_settled_step = self._last_settled_step
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _settle_menu_state(self, ticks: int = 1, max_cutscene_ticks: int = 24, post_motion_ticks: int = 4) -> None:
         waited = 0

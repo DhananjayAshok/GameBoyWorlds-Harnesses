@@ -703,6 +703,13 @@ class GridMoveExecutor(PolicyExecutor):
                 post_motion_remaining -= 1
         if state == AgentState.IN_MENU:
             state = self._settle_menu_state()
+        if state == AgentState.FREE_ROAM and not (self._last_terminated or self._last_truncated):
+            cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+            if cur_step is not None:
+                try:
+                    self._env._last_settled_step = cur_step
+                except Exception:  # noqa: BLE001
+                    pass
         return state
 
     def _settle_menu_state(self):

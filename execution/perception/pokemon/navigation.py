@@ -977,6 +977,214 @@ def warp_cells(
     return warps
 
 
+def _straight_offscreen_depth(
+    seg: Dict[Cell, Any],
+    start: Cell,
+    direction: str,
+    max_depth: int = LOOKAHEAD_STEPS,
+) -> int:
+    dx, dy = DIRECTIONS[direction]
+    cur = start
+    depth = 0
+    while depth < max_depth:
+        nxt = (cur[0] + dx, cur[1] + dy)
+        nc = seg.get(nxt)
+        if nc is None or getattr(nc, "kind", None) == "unknown":
+            return max_depth
+        nkind = getattr(nc, "kind", None)
+        if "entrance" in getattr(nc, "tags", ()) or "staircase" in getattr(nc, "tags", ()):
+            return max_depth
+        if nkind == WALKABLE:
+            cur = nxt
+            depth += 1
+        elif (nkind == LEDGE and direction == "down") or (nkind == LEDGE_LEFT and direction == "left"):
+            landing = (nxt[0] + dx, nxt[1] + dy)
+            lc = seg.get(landing)
+            if lc is None or getattr(lc, "kind", None) == "unknown":
+                return max_depth
+            if getattr(lc, "kind", None) != WALKABLE:
+                break
+            cur = landing
+            depth += 2
+        else:
+            break
+    return min(depth, max_depth)
+
+
+def run_pocket_bounds(
+    global_map: Optional[Any],
+    direction: str,
+    run_cells: List[Cell],
+) -> Optional[Tuple[set, set]]:
+    if global_map is None or not getattr(global_map, "current", None) or getattr(global_map, "pos", None) is None or not run_cells:
+        return None
+    try:
+        _, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+        seg = global_map.current
+    except Exception:  # noqa: BLE001
+        return None
+    gx_min, gx_max = px + min(X_RANGE), px + max(X_RANGE)
+    gy_min, gy_max = py + min(Y_RANGE), py + max(Y_RANGE)
+
+    def _is_door_cell(c: Any) -> bool:
+        return bool(set(getattr(c, "tags", ())) & (WARP_TAGS | {"elevator"}))
+
+    def in_screen(g: Cell) -> bool:
+        return gx_min <= g[0] <= gx_max and gy_min <= g[1] <= gy_max
+
+    def in_half_plane(g: Cell) -> bool:
+        if direction == "up":
+            return g[1] >= gy_max
+        if direction == "down":
+            return g[1] <= gy_min
+        if direction == "left":
+            return g[0] <= gx_min
+        return g[0] >= gx_max
+
+    def strictly_beyond(g: Cell) -> bool:
+        if direction == "up":
+            return g[1] > gy_max
+        if direction == "down":
+            return g[1] < gy_min
+        if direction == "left":
+            return g[0] < gx_min
+        return g[0] > gx_max
+
+    seeds = []
+    for lx, ly in run_cells:
+        eg = (px + lx, py + ly)
+        c = seg.get(eg)
+        if c is None or getattr(c, "kind", None) == "unknown" or _is_door_cell(c):
+            return None
+        if getattr(c, "kind", None) == WALKABLE:
+            seeds.append(eg)
+    if not seeds:
+        return None
+
+    visited = set(seeds)
+    queue = deque(seeds)
+    beyond_cells = set()
+    half_plane_open = False
+
+    while queue:
+        cur = queue.popleft()
+        if strictly_beyond(cur):
+            beyond_cells.add(cur)
+        c = seg.get(cur)
+        if c is not None and _is_door_cell(c):
+            half_plane_open = True
+            break
+        for _, (nx_d, ny_d) in DIRECTIONS.items():
+            nxt = (cur[0] + nx_d, cur[1] + ny_d)
+            if in_screen(nxt):
+                if nxt not in seeds:
+                    continue
+            if not in_half_plane(nxt):
+                nc = seg.get(nxt)
+                if nc is None or getattr(nc, "kind", None) in (WALKABLE, "unknown") or _is_door_cell(nc):
+                    half_plane_open = True
+                    break
+                continue
+            nc = seg.get(nxt)
+            if nc is None or getattr(nc, "kind", None) == "unknown" or _is_door_cell(nc):
+                half_plane_open = True
+                break
+            if getattr(nc, "kind", None) == WALKABLE and nxt not in visited:
+                visited.add(nxt)
+                queue.append(nxt)
+                if len(visited) > 60:
+                    half_plane_open = True
+                    break
+        if half_plane_open:
+            break
+    if not half_plane_open:
+        return visited, beyond_cells
+
+    for min_offset in (1, 2):
+        def in_forward_offset(g: Cell, off: int = min_offset) -> bool:
+            if direction == "up":
+                return g[1] >= py + off
+            if direction == "down":
+                return g[1] <= py - off
+            if direction == "left":
+                return g[0] <= px - off
+            return g[0] >= px + off
+
+        visited2 = set(seeds)
+        queue2 = deque(seeds)
+        beyond2 = set()
+        open2 = False
+        while queue2:
+            cur = queue2.popleft()
+            if strictly_beyond(cur):
+                beyond2.add(cur)
+            c = seg.get(cur)
+            if c is not None and _is_door_cell(c):
+                open2 = True
+                break
+            for _, (nx_d, ny_d) in DIRECTIONS.items():
+                nxt = (cur[0] + nx_d, cur[1] + ny_d)
+                if not in_forward_offset(nxt):
+                    continue
+                nc = seg.get(nxt)
+                if nc is None or getattr(nc, "kind", None) == "unknown" or _is_door_cell(nc):
+                    open2 = True
+                    break
+                if getattr(nc, "kind", None) == WALKABLE and nxt not in visited2:
+                    visited2.add(nxt)
+                    queue2.append(nxt)
+                    if len(visited2) > 25:
+                        open2 = True
+                        break
+            if open2:
+                break
+        if not open2:
+            return visited2, beyond2
+    return None
+
+
+def edge_pocket_note(
+    global_map: Optional[Any],
+    direction: str,
+    local_edge_cells: List[Cell],
+) -> Optional[str]:
+    if global_map is None or not getattr(global_map, "current", None) or getattr(global_map, "pos", None) is None or not local_edge_cells:
+        return None
+    try:
+        _, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+    except Exception:  # noqa: BLE001
+        return None
+    runs = edge_runs(local_edge_cells, direction)
+    closed_runs = []
+    open_runs = []
+    visited_all: set = set()
+    beyond_all: set = set()
+    for r in runs:
+        bounds = run_pocket_bounds(global_map, direction, r)
+        if bounds is not None:
+            closed_runs.append(r)
+            visited_all |= bounds[0]
+            beyond_all |= bounds[1]
+        else:
+            open_runs.append(r)
+    if not closed_runs:
+        return None
+    xs = [c[0] - px for c in visited_all]
+    ys = [c[1] - py for c in visited_all]
+    if not open_runs:
+        return (
+            f" [mapped closed dead-end pocket beyond {direction} edge: "
+            f"{len(beyond_all)} off-screen walkable tile(s), relative x in [{min(xs)}, {max(xs)}], "
+            f"y in [{min(ys)}, {max(ys)}], no unexplored tiles or doors]"
+        )
+    closed_cells = [c for r in closed_runs for c in r]
+    closed_str = ", ".join(f"({x}, {y})" for x, y in closed_cells)
+    return (
+        f" [dead-end alcove at {closed_str}: leads into a mapped closed pocket "
+        f"(relative x in [{min(xs)}, {max(xs)}], y in [{min(ys)}, {max(ys)}], no unexplored tiles or doors)]"
+    )
+
+
 def filter_open_lane_edge_cells(
     cells: Iterable[Cell],
     direction: str,
@@ -998,6 +1206,15 @@ def filter_open_lane_edge_cells(
         except Exception:  # noqa: BLE001
             seg = None
 
+    if global_map is not None:
+        open_run_cells = [
+            c for r in edge_runs(cells_list, direction)
+            if run_pocket_bounds(global_map, direction, r) is None
+            for c in r
+        ]
+        if open_run_cells:
+            cells_list = open_run_cells
+
     non_warp = [
         c for c in cells_list
         if not _is_warp_edge_cell(c, seg=seg, px=px, py=py, identified=identified)
@@ -1018,6 +1235,17 @@ def filter_open_lane_edge_cells(
             max_d = max(depths.values(), default=0)
             if max_d > 0:
                 cells_list = [c for c in cells_list if depths[c] == max_d]
+        straight_depths = {
+            c: _straight_offscreen_depth(seg, (px + c[0], py + c[1]), direction, LOOKAHEAD_STEPS)
+            for c in cells_list
+        }
+        straight_deep = [c for c in cells_list if straight_depths[c] >= LOOKAHEAD_STEPS]
+        if straight_deep:
+            cells_list = straight_deep
+        else:
+            max_sd = max(straight_depths.values(), default=0)
+            if max_sd > 0:
+                cells_list = [c for c in cells_list if straight_depths[c] == max_sd]
 
     inward_clear = [
         c for c in cells_list
@@ -1189,6 +1417,9 @@ def verbalize_edges(
                 runs_text = format_path_runs(compress_path(lat_path or path))
                 listed += f" (shortest path to {target}: {runs_text})"
             listed += edge_hazard_annotations(cells, kinds, people=people, direction=direction)
+            note = edge_pocket_note(global_map, direction, cells)
+            if note:
+                listed += note
         else:
             listed = "none"
         lines.append(f"- {direction} edge: {listed}")

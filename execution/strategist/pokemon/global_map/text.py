@@ -11,12 +11,13 @@ if TYPE_CHECKING:
     from .model import Cell, GlobalMap, MapCell
 
 
-LEGEND = ('@ you   . walkable   # blocked   = ledge (jump down only)   < ledge (jump left only)   D door/stairs   '
-          'i item ball   " tall grass   ~ water   n person   % not yet recognised   ? never seen')
+LEGEND = ('@ you   : walked (visited floor)   . unvisited walkable   # blocked   = ledge (jump down only)   '
+          '< ledge (jump left only)   D door/stairs   i item ball   " tall grass   ~ water   n person   '
+          '% not yet recognised   ? never seen')
 SECTORS = ("east", "north-east", "north", "north-west", "west", "south-west", "south", "south-east")
 
 
-def glyph(c: Optional[MapCell]) -> str:
+def glyph(c: Optional[MapCell], visited: bool = False) -> str:
     if c is None:
         return "?"
     tags = set(c.tags)
@@ -30,7 +31,9 @@ def glyph(c: Optional[MapCell]) -> str:
         return "~"
     if c.kind == WALKABLE and "tall grass" in tags:
         return '"'
-    return {WALKABLE: ".", BLOCKED: "#", LEDGE: "=", LEDGE_LEFT: "<", UNKNOWN: "%"}.get(c.kind, "?")
+    if c.kind == WALKABLE:
+        return ":" if visited else "."
+    return {BLOCKED: "#", LEDGE: "=", LEDGE_LEFT: "<", UNKNOWN: "%"}.get(c.kind, "?")
 
 
 MAX_WINDOW_SPAN = 61
@@ -63,11 +66,15 @@ def window_bounds(gmap: GlobalMap, rx: int = 12, ry: int = 7) -> Tuple[int, int,
 
 def ascii_window(gmap: GlobalMap, rx: int = 12, ry: int = 7) -> str:
     seg, (px, py) = gmap.current, gmap.pos
+    visits = gmap.visits[gmap.segment] if 0 <= gmap.segment < len(gmap.visits) else {}
     x0, x1, y0, y1 = window_bounds(gmap, rx, ry)
     rows = []
     for y in range(y1, y0 - 1, -1):
-        rows.append("".join("@" if (x, y) == (px, py) else glyph(seg.get((x, y)))
-                            for x in range(x0, x1 + 1)))
+        rows.append("".join(
+            "@" if (x, y) == (px, py)
+            else glyph(seg.get((x, y)), visited=visits.get((x, y), 0) > 0)
+            for x in range(x0, x1 + 1)
+        ))
     return "\n".join(rows)
 
 
@@ -172,9 +179,16 @@ def segment_ascii(gmap: GlobalMap, segment: int, mark: Optional[Cell] = None) ->
     seg, bounds = gmap.segments[segment], segment_bounds(gmap, segment)
     if bounds is None:
         return "(empty)"
+    visits = gmap.visits[segment] if 0 <= segment < len(gmap.visits) else {}
     x0, x1, y0, y1 = bounds
-    return "\n".join("".join("X" if (x, y) == mark else glyph(seg.get((x, y))) for x in range(x0, x1 + 1))
-                     for y in range(y1, y0 - 1, -1))
+    return "\n".join(
+        "".join(
+            "X" if (x, y) == mark
+            else glyph(seg.get((x, y)), visited=visits.get((x, y), 0) > 0)
+            for x in range(x0, x1 + 1)
+        )
+        for y in range(y1, y0 - 1, -1)
+    )
 
 
 def _door_text(gmap: GlobalMap, segment: int) -> str:

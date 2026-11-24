@@ -2560,6 +2560,38 @@ class GlobalMap(StrategistArtifact):
                         for w in cave_visited_walk
                     ):
                         continue
+                if visits.get(g, 0) == 0:
+                    enclosed_corner = False
+                    if dx != 0:
+                        for oy in (-1, 1):
+                            c_orth = seg.get((g[0], g[1] + oy))
+                            c_diag = seg.get((u[0], g[1] - oy))
+                            c_diag2 = seg.get((u[0], g[1] - 2 * oy))
+                            if (
+                                c_orth is not None
+                                and c_orth.kind == BLOCKED
+                                and c_diag is not None
+                                and c_diag.kind == BLOCKED
+                                and (c_diag2 is None or c_diag2.kind == BLOCKED)
+                            ):
+                                enclosed_corner = True
+                                break
+                    elif dy != 0:
+                        for ox in (-1, 1):
+                            c_orth = seg.get((g[0] + ox, g[1]))
+                            c_diag = seg.get((g[0] - ox, u[1]))
+                            c_diag2 = seg.get((g[0] - 2 * ox, u[1]))
+                            if (
+                                c_orth is not None
+                                and c_orth.kind == BLOCKED
+                                and c_diag is not None
+                                and c_diag.kind == BLOCKED
+                                and (c_diag2 is None or c_diag2.kind == BLOCKED)
+                            ):
+                                enclosed_corner = True
+                                break
+                    if enclosed_corner:
+                        continue
                 has_open_unmapped = True
                 break
             if has_open_unmapped:
