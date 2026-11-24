@@ -68,6 +68,33 @@ def complete_sprite(mask: np.ndarray) -> bool:
     return bool(rows[0] <= 3 and rows[-1] >= 12 and cols[-1] - cols[0] + 1 >= 8 and mask.sum() >= 30)
 
 
+def character_window_score(window: Optional[np.ndarray], level: int) -> int:
+    if window is None:
+        return 0
+    w = _screen(window)
+    if w.shape != (GRID_SKIP, GRID_SKIP):
+        return 0
+    mask = black_mask(w, level)
+    black = int(mask.sum())
+    if black < 50 or not complete_sprite(mask):
+        return 0
+    v_per = float((w[:8, :] == w[8:, :]).mean())
+    h_per = float((w[:, :8] == w[:, 8:]).mean())
+    if v_per >= 0.72 or h_per >= 0.80:
+        return 0
+    light_level = max(int(w.max()) - 15, 180)
+    int_white = int((w[2:14, 2:14] >= light_level).sum())
+    int_black = int(mask[2:14, 2:14].sum())
+    top_black = int(mask[:8, 2:14].sum())
+    bot_black = int(mask[8:, 2:14].sum())
+    if int_white < 12 or int_black < 32 or top_black < 12 or bot_black < 12:
+        return 0
+    if float((mask == mask[:, ::-1]).mean()) < 0.56:
+        return 0
+    sym_core = int((mask[2:14, :] == mask[2:14, ::-1]).sum())
+    return int_black + min(int_white, 48) + sym_core // 4
+
+
 def sprite_like(frame: np.ndarray, cell: Cell, y_offset: int = 4) -> bool:
     # A person leaves the bottom y_offset rows of the square clear, or has a head above it with clear ground on top.
     screen = _screen(frame)
@@ -81,7 +108,10 @@ def sprite_like(frame: np.ndarray, cell: Cell, y_offset: int = 4) -> bool:
         return False
     head = (screen[top:y0, columns] <= level).any()
     clear_above = not (screen[top - 2:top, columns] <= level).any()
-    return bool(head and clear_above)
+    if head and clear_above:
+        return True
+    window = sprite_window(screen, cell, (0, 0), y_offset)
+    return character_window_score(window, level) > 0
 
 
 def tag_counts(identified: Dict[Tuple[int, int, str], Any], cell: Cell) -> Dict[str, int]:
@@ -125,8 +155,13 @@ def full_window_ok(identified: Dict[Tuple[int, int, str], Any], cell: Cell) -> b
     counts = tag_counts(identified, cell)
     if counts.get("npc", 0) == 4:
         return True
-    walkable = counts.get("ground", 0) + counts.get("ground decoration", 0) + counts.get("tall grass", 0)
+    walkable = (counts.get("ground", 0) + counts.get("ground decoration", 0)
+                + counts.get("tall grass", 0) + counts.get("unknown", 0))
     if counts.get("npc", 0) >= 3 and walkable >= 1:
+        return True
+    tl = identified.get((cell[0], cell[1], "top_left"))
+    tr = identified.get((cell[0], cell[1], "top_right"))
+    if counts.get("npc", 0) >= 3 and tl is not None and tr is not None and tl.tag == "npc" and tr.tag == "npc":
         return True
     return counts.get("npc", 0) == 2 and counts.get("tall grass", 0) == 2 and _has_top_half_npc_in_grass(identified, cell)
 

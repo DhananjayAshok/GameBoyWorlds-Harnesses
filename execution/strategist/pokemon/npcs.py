@@ -21,6 +21,7 @@ from utils import log_info, log_warn
 
 Cell = Tuple[int, int]
 FACINGS = ("down", "up", "left", "right")
+OPPOSITE_FACING = {"up": "down", "down": "up", "left": "right", "right": "left"}
 KINDS = ("person", "trainer", "pokemon", "object", "unknown")
 
 PLACED_STATUS = {"start", "moved", "stayed", "relocalised", "new_segment"}
@@ -211,7 +212,7 @@ class NPCRegistry(StrategistArtifact):
 
     _TRANSIENT = ("_gmap", "_episode", "_tracks", "_last_people", "_last_people_at", "_stack", "_stack_ref",
                   "_look_merges", "_weak", "_facing", "_open", "_frame", "_free_frame", "_free_identified",
-                  "_live", "_a_step", "_a_facing", "_resume", "_last_closed")
+                  "_free_pos", "_live", "_a_step", "_a_facing", "_resume", "_last_closed")
 
     def __init__(self, game: str, run_name: str) -> None:
         self.game = game
@@ -251,6 +252,7 @@ class NPCRegistry(StrategistArtifact):
         self._frame: Optional[np.ndarray] = None
         self._free_frame: Optional[np.ndarray] = None
         self._free_identified: Dict[Any, Any] = {}
+        self._free_pos: Optional[Tuple[int, Cell]] = None
         self._live: Optional[Callable[[str], Callable[..., Any]]] = None
         self._a_step: Optional[int] = None
         self._a_facing: Optional[str] = None
@@ -348,10 +350,13 @@ class NPCRegistry(StrategistArtifact):
         self._resume, self.interrupted = self.interrupted, None
 
     def on_opening_screen(self, frame: np.ndarray, identified: Dict[Any, Any], free: bool) -> None:
+        if self._gmap is not None:
+            self.consolidate()
         if free and self._gmap is not None:
             self._process(frame, identified, "start", 0)
             self._free_frame = frame
             self._free_identified = dict(identified or {})
+            self._free_pos = (self._gmap.segment, self._gmap.pos)
 
     def on_env_step(self, ev: StepEvent) -> None:
         if self._gmap is None:
@@ -369,6 +374,7 @@ class NPCRegistry(StrategistArtifact):
         self._process(ev.frame, ev.identified, ev.status, ev.max_steps)
         self._free_frame = ev.frame
         self._free_identified = dict(ev.identified or {})
+        self._free_pos = (self._gmap.segment, self._gmap.pos)
 
     def _view_stack(self) -> Tuple[np.ndarray, List[Tuple[str, int]]]:
         if self._stack is None:
@@ -402,8 +408,9 @@ class NPCRegistry(StrategistArtifact):
             mask = S.black_mask(window, level)
             if int(mask.sum()) < MIN_TAGGED_BLACK:
                 continue
-            found.append(dict(cell=cell, offset=(0, 0), window=window, mask=mask,
-                              full=S.full_window_ok(identified, cell) and S.complete_sprite(mask)))
+            full = S.full_window_ok(identified, cell) and S.complete_sprite(mask)
+            weak = not full and int(mask.sum()) >= WEAK_BLACK
+            found.append(dict(cell=cell, offset=(0, 0), window=window, mask=mask, full=full, weak=weak))
         for cell in S.find_npc_cells(identified, WEAK_QUARTERS):
             if cell in cells:
                 continue
@@ -912,14 +919,36 @@ class NPCRegistry(StrategistArtifact):
         self._open = conv.id
         self.stats["conversations_continued"] += 1
 
+    def _free_frame_at_here(self) -> bool:
+        g = self._gmap
+        if g is None or self._free_frame is None:
+            return False
+        if self._free_pos is None:
+            return True
+        return g.resolve(*self._free_pos) == g.resolve(g.segment, g.pos)
+
+    def _player_facing(self, frame: Optional[np.ndarray]) -> Optional[str]:
+        if frame is None:
+            return None
+        y_off = self._p["y_offset"]
+        window = S.sprite_window(frame, (0, 0), (0, 0), y_off)
+        if window is None:
+            return None
+        mask = S.black_mask(window, S.black_level(frame))
+        return self._infer_view_facing(View(window, mask, None, None, (0, 0)))
+
     def _cell_tags(self, target: Cell, ev: Optional[StepEvent] = None) -> Set[str]:
         g = self._gmap
-        square = (g.pos[0] + target[0], g.pos[1] + target[1])
+        rseg, rpos = g.resolve(g.segment, g.pos)
+        square = (rpos[0] + target[0], rpos[1] + target[1])
         tags: Set[str] = set()
-        cell = g.segments[g.segment].get(square)
+        cell = (g.segments[rseg] if 0 <= rseg < len(g.segments) else {}).get(square)
         if cell is not None and cell.tags:
             tags.update(cell.tags)
-        for identified in ((ev.identified if ev is not None else None), self._free_identified):
+        id_sources = [ev.identified if ev is not None else None]
+        if self._free_frame_at_here():
+            id_sources.append(self._free_identified)
+        for identified in id_sources:
             if not identified:
                 continue
             tags.update(tile.tag for (x, y, _), tile in identified.items() if (x, y) == target)
@@ -930,20 +959,260 @@ class NPCRegistry(StrategistArtifact):
         square = (g.pos[0] + target[0], g.pos[1] + target[1])
         return square if (self._cell_tags(target, ev) & SIGN_TAGS) else None
 
+    def _merge_look_and_npc(self, keep: NPC, drop: NPC) -> NPC:
+        keep, drop = self.get(keep.id), self.get(drop.id)
+        if keep.id == drop.id or frozenset((keep.id, drop.id)) in self.covisible:
+            return keep
+        if drop.created < keep.created:
+            keep, drop = drop, keep
+        keep_look, drop_look = self.look_of(keep), self.look_of(drop)
+        if keep_look.id != drop_look.id:
+            drop_shared = any(n.id not in (keep.id, drop.id) and self.look_of(n).id == drop_look.id
+                              for n in self.live_npcs())
+            keep_shared = any(n.id not in (keep.id, drop.id) and self.look_of(n).id == keep_look.id
+                              for n in self.live_npcs())
+            if not drop_shared:
+                self.merge_looks(keep_look.id, drop_look.id)
+            elif not keep_shared:
+                self.merge_looks(drop_look.id, keep_look.id)
+        if keep.kind == "unknown" and drop.kind != "unknown":
+            keep.kind = drop.kind
+        if not keep.description and drop.description:
+            keep.description = drop.description
+        self.merge_npcs(keep, drop)
+        return keep
+
+    def _attach_view_and_sighting(self, npc: NPC, cell: Cell, window: np.ndarray, mask: np.ndarray,
+                                  frame: Optional[np.ndarray], segment: int, square: Cell,
+                                  episode: int, step: int) -> None:
+        g = self._gmap
+        look = self.look_of(npc)
+        p = self._p
+        view_index = 0
+        if npc.hidden and S.complete_sprite(mask) and look.views and look.views[0].partial:
+            look.views[0] = View(window.copy(), mask.copy(), None, None, (episode, step))
+            npc.hidden = None
+            self._stack = None
+        else:
+            dists = [(S.mask_distance(mask, v.key)[0], i) for i, v in enumerate(look.views) if not v.partial]
+            if dists and min(dists)[0] <= p["auto"]:
+                view_index = min(dists)[1]
+                look.views[view_index].n_seen += 1
+            elif S.complete_sprite(mask):
+                last_v = npc.sightings[-1].view if npc.sightings else 0
+                look.views.append(View(window.copy(), mask.copy(), None, None, (episode, step)))
+                look.links.append((min(last_v, len(look.views) - 1), len(look.views) - 1, "same_square"))
+                view_index = len(look.views) - 1
+                self._stack = None
+                self.stats["views_added"] += 1
+        if npc.context is None and frame is not None:
+            npc.context, npc.context_cell = np.array(frame, copy=True), cell
+        target_place = g.resolve(segment, square)
+        if not any(s.map_step == step and self.place(g, s) == target_place for s in npc.sightings):
+            views = self.look_of(npc).views
+            flipped = bool(view_index < len(views) and S.mask_distance(mask, views[view_index].key)[1])
+            npc.sightings.append(Sighting(episode, step, segment, square, view_index, (0, 0), -1, flipped))
+            self.stats["sightings"] += 1
+
+    def _snap_ray_sightings(self, npc: NPC, frame: Optional[np.ndarray], segment: int, player_pos: Cell,
+                            adj_cell: Cell, max_step: Optional[int] = None) -> NPC:
+        if abs(adj_cell[0]) + abs(adj_cell[1]) != 1 or self._gmap is None:
+            return npc
+        g = self._gmap
+        rseg, rpos = g.resolve(segment, player_pos)
+        target_raw = (player_pos[0] + adj_cell[0], player_pos[1] + adj_cell[1])
+        _, rtarget = g.resolve(segment, target_raw)
+        y_off = self._p["y_offset"]
+        level = S.black_level(frame) if frame is not None else 0
+        empty_ray_squares: Set[Cell] = set()
+        for k in (2, 3, 4):
+            rcell = (k * adj_cell[0], k * adj_cell[1])
+            if frame is not None:
+                rw = S.sprite_window(frame, rcell, (0, 0), y_off)
+                if S.character_window_score(rw, level) > 0:
+                    continue
+            empty_ray_squares.add((rpos[0] + rcell[0], rpos[1] + rcell[1]))
+        if not empty_ray_squares:
+            return npc
+        allowed_places = empty_ray_squares | {rtarget}
+        for other in list(self.live_npcs()):
+            if other.id == npc.id or self.look_of(other).kind_hint == "object":
+                continue
+            if frozenset((npc.id, other.id)) in self.covisible:
+                continue
+            other_places = {self.place(g, s)[1] for s in other.sightings if self.place(g, s)[0] == rseg}
+            if other_places and other_places <= allowed_places:
+                if not other.conversations or not npc.conversations:
+                    npc = self._merge_look_and_npc(npc, other)
+        for s in npc.sightings:
+            s_seg, s_sq = self.place(g, s)
+            if s_seg == rseg and s_sq in empty_ray_squares and (max_step is None or s.map_step <= max_step):
+                s.segment, s.square = segment, target_raw
+        return npc
+
+    def _link_or_track_cell(self, cell: Cell, window: np.ndarray, mask: np.ndarray,
+                            frame: Optional[np.ndarray] = None, segment: Optional[int] = None,
+                            pos: Optional[Cell] = None, step: Optional[int] = None,
+                            episode: Optional[int] = None, snap_ray: bool = False) -> Tuple[Optional[str], str]:
+        g = self._gmap
+        if g is None:
+            return None, "none"
+        seg_raw = g.segment if segment is None else segment
+        pos_raw = g.pos if pos is None else pos
+        step_now = g.step if step is None else step
+        ep_now = self._episode if episode is None else episode
+        is_live = (segment is None and pos is None and step is None and episode is None)
+        square = (pos_raw[0] + cell[0], pos_raw[1] + cell[1])
+        rseg, resolved = g.resolve(seg_raw, square)
+        _, rpos = g.resolve(seg_raw, pos_raw)
+        y_off = self._p["y_offset"]
+        level = S.black_level(frame) if frame is not None else 0
+
+        at_target: List[NPC] = []
+        for n in self.live_npcs():
+            if self.look_of(n).kind_hint == "object":
+                continue
+            if any(self.place(g, s) == (rseg, resolved) for s in n.sightings):
+                at_target.append(n)
+        npc: Optional[NPC] = None
+        if at_target:
+            at_target.sort(key=lambda n: (not bool(n.conversations), n.created))
+            npc = at_target[0]
+            for dup in at_target[1:]:
+                if not dup.conversations or not npc.conversations:
+                    npc = self._merge_look_and_npc(npc, dup)
+        if npc is None and is_live:
+            hid = self._hidden_at(cell)
+            if hid is not None and hid in self.npcs:
+                npc = self.get(hid)
+        if npc is None and abs(cell[0]) + abs(cell[1]) == 1:
+            for k in (2, 3, 4):
+                rcell = (k * cell[0], k * cell[1])
+                if frame is not None:
+                    rw = S.sprite_window(frame, rcell, (0, 0), y_off)
+                    if S.character_window_score(rw, level) > 0:
+                        continue
+                rsq = (rpos[0] + rcell[0], rpos[1] + rcell[1])
+                ray_matches = [n for n in self.live_npcs()
+                               if self.look_of(n).kind_hint != "object"
+                               and self.last_seen(g, n) is not None
+                               and self.last_seen(g, n)[0] == rseg
+                               and self.last_seen(g, n)[1] == rsq]
+                if ray_matches:
+                    ray_matches.sort(key=lambda n: -self.last_seen(g, n)[2].map_step)
+                    npc = ray_matches[0]
+                    break
+        if npc is None:
+            near_matches = []
+            for n in self.live_npcs():
+                if self.look_of(n).kind_hint == "object":
+                    continue
+                seen = self.last_seen(g, n)
+                if seen is not None and seen[0] == rseg and _manhattan(seen[1], resolved) <= 1:
+                    old_cell = (seen[1][0] - rpos[0], seen[1][1] - rpos[1])
+                    if frame is not None and old_cell != cell:
+                        ow = S.sprite_window(frame, old_cell, (0, 0), y_off)
+                        if S.character_window_score(ow, level) > 0:
+                            continue
+                    near_matches.append((_manhattan(seen[1], resolved), -seen[2].map_step, n))
+            if near_matches:
+                near_matches.sort(key=lambda x: (x[0], x[1]))
+                npc = near_matches[0][2]
+        if npc is not None:
+            self._attach_view_and_sighting(npc, cell, window, mask, frame, seg_raw, square, ep_now, step_now)
+            if snap_ray:
+                npc = self._snap_ray_sightings(npc, frame, seg_raw, pos_raw, cell, max_step=step_now)
+            if is_live:
+                self._last_people[square] = npc.id
+                self._last_people_at = (g.segment, g.step)
+            return npc.id, "seen"
+
+        old_ep, old_frame = self._episode, self._frame
+        try:
+            self._episode = ep_now
+            if frame is not None:
+                self._frame = frame
+            det = dict(cell=cell, offset=(0, 0), window=window, mask=mask, full=True, square=square)
+            track = self._start_track(det, set(), seg_raw, step_now)
+        finally:
+            self._episode, self._frame = old_ep, old_frame
+        if track is not None:
+            npc = self.get(track.npc)
+            if snap_ray:
+                npc = self._snap_ray_sightings(npc, frame, seg_raw, pos_raw, cell, max_step=step_now)
+            if is_live:
+                self._last_people[square] = npc.id
+                self._last_people_at = (g.segment, g.step)
+            return npc.id, "seen"
+        return None, "none"
+
     def _across_counter_speaker(self, target: Cell, on_screen: Dict[Cell, str],
-                                ev: Optional[StepEvent] = None) -> Tuple[Optional[str], str, str]:
-        if self._cell_tags(target, ev) & {"sign", "item"}:
+                                ev: Optional[StepEvent] = None,
+                                frame_override: Optional[np.ndarray] = None,
+                                segment: Optional[int] = None, pos: Optional[Cell] = None,
+                                step: Optional[int] = None,
+                                episode: Optional[int] = None) -> Tuple[Optional[str], str, str]:
+        g = self._gmap
+        if g is None:
+            return None, "seen", "high"
+        seg_raw = g.segment if segment is None else segment
+        pos_raw = g.pos if pos is None else pos
+        is_live = (frame_override is None and segment is None and pos is None)
+        if is_live:
+            target_tags = self._cell_tags(target, ev)
+        else:
+            rseg, rpos = g.resolve(seg_raw, pos_raw)
+            mcell = (g.segments[rseg] if 0 <= rseg < len(g.segments) else {}).get((rpos[0] + target[0], rpos[1] + target[1]))
+            target_tags = set(mcell.tags) if (mcell is not None and mcell.tags) else set()
+        if target_tags & {"sign", "item"}:
             return None, "seen", "high"
         across = (2 * target[0], 2 * target[1])
-        speaker = on_screen.get(across)
-        if speaker is not None:
-            return speaker, "seen", "high"
-        speaker = self._remembered_at(across)
-        if speaker is not None:
-            return speaker, "remembered", "high"
-        speaker = self._hidden_at(across)
-        if speaker is not None:
-            return speaker, "hidden", "low"
+        if is_live:
+            speaker = on_screen.get(across)
+            if speaker is not None:
+                return speaker, "seen", "high"
+            speaker = self._remembered_at(across)
+            if speaker is not None:
+                return speaker, "remembered", "high"
+            speaker = self._hidden_at(across)
+            if speaker is not None:
+                return speaker, "hidden", "low"
+        else:
+            rseg, rpos = g.resolve(seg_raw, pos_raw)
+            across_sq = (rpos[0] + across[0], rpos[1] + across[1])
+            for npc in self.live_npcs():
+                if self.look_of(npc).kind_hint == "object":
+                    continue
+                if any(self.place(g, s) == (rseg, across_sq) for s in npc.sightings):
+                    return npc.id, "seen", "high"
+        frames: List[np.ndarray] = []
+        if frame_override is not None:
+            frames.append(frame_override)
+        else:
+            if self._free_frame_at_here() and self._free_frame is not None:
+                frames.append(self._free_frame)
+            if ev is not None and ev.frame is not None:
+                frames.append(ev.frame)
+        y_off = self._p["y_offset"]
+        for frame in frames:
+            level = S.black_level(frame)
+            window = S.sprite_window(frame, across, (0, 0), y_off)
+            if window is None:
+                continue
+            mask = S.black_mask(window, level)
+            score = S.character_window_score(window, level)
+            if score <= 0:
+                best = self._best_view(mask)
+                if (best is not None and best[0] <= self._p["auto"]
+                        and self.looks[best[1]].kind_hint != "object"
+                        and S.complete_sprite(mask) and int(mask.sum()) >= 50):
+                    score = int(mask.sum())
+            if score > 0:
+                speaker, how = self._link_or_track_cell(
+                    across, window, mask, frame=frame, segment=segment, pos=pos, step=step,
+                    episode=episode, snap_ray=False)
+                if speaker is not None:
+                    return speaker, how, "high"
         return None, "seen", "high"
 
     def _emote_cell(self, frame: Optional[np.ndarray]) -> Optional[Cell]:
@@ -984,60 +1253,132 @@ class NPCRegistry(StrategistArtifact):
                             return (cx, cy)
         return None
 
-    def _adjacent_sprite_person(self, facing: Optional[str],
-                                ev: Optional[StepEvent] = None) -> Tuple[Optional[str], str, str]:
-        frame = self._free_frame if self._free_frame is not None else (ev.frame if ev is not None else None)
-        if frame is None or self._gmap is None:
-            return None, "none", "low"
+    def _adjacent_sprite_candidates(self, facing: Optional[str], ev: Optional[StepEvent] = None,
+                                    frame_override: Optional[np.ndarray] = None,
+                                    segment: Optional[int] = None,
+                                    pos: Optional[Cell] = None) -> List[Dict[str, Any]]:
         g = self._gmap
+        if g is None:
+            return []
+        seg_raw = g.segment if segment is None else segment
+        pos_raw = g.pos if pos is None else pos
+        rseg, rpos = g.resolve(seg_raw, pos_raw)
+        is_live = (frame_override is None and segment is None and pos is None)
+        frame_sources: List[Tuple[np.ndarray, Dict[Any, Any]]] = []
+        if frame_override is not None:
+            frame_sources.append((frame_override, {}))
+        else:
+            if self._free_frame_at_here() and self._free_frame is not None:
+                frame_sources.append((self._free_frame, self._free_identified or {}))
+            if ev is not None and ev.frame is not None:
+                frame_sources.append((ev.frame, ev.identified or {}))
+            if ev is not None and ev.info:
+                passed = (ev.info.get("core") or {}).get("transition_passed_frames") or []
+                if passed and passed[-1] is not None:
+                    frame_sources.append((passed[-1], {}))
+        if not frame_sources:
+            return []
         y_off = self._p["y_offset"]
-        level = S.black_level(frame)
         allowed_tags = {"npc", "ground", "ground decoration", "tall grass", "unknown"}
-        candidates: List[Tuple[int, int, Cell, np.ndarray, np.ndarray]] = []
-        for d, cell in DIRECTIONS.items():
-            tags = self._cell_tags(cell, ev)
-            if tags and not (tags <= allowed_tags):
-                continue
-            if not S.sprite_like(frame, cell, y_off):
-                continue
-            window = S.sprite_window(frame, cell, (0, 0), y_off)
-            if window is None:
-                continue
-            mask = S.black_mask(window, level)
-            black = int(mask.sum())
-            if black < 50 or not S.complete_sprite(mask):
-                continue
-            has_npc_tag = 1 if "npc" in tags else 0
-            is_facing = 1 if (facing is not None and DIRECTIONS.get(facing) == cell) else 0
-            candidates.append((has_npc_tag, is_facing, cell, window, mask))
-        if len(candidates) != 1:
+        by_dir: Dict[str, Dict[str, Any]] = {}
+        for frame, identified in frame_sources:
+            level = S.black_level(frame)
+            for d, cell in DIRECTIONS.items():
+                tsq = (rpos[0] + cell[0], rpos[1] + cell[1])
+                mcell = (g.segments[rseg] if 0 <= rseg < len(g.segments) else {}).get(tsq)
+                map_tags = set(mcell.tags) if (mcell is not None and mcell.tags) else set()
+                q_counts = S.tag_counts(identified, cell) if identified else {}
+                tags = set(map_tags) | set(q_counts.keys())
+                if ("sign" in tags or "item" in tags) and "npc" not in tags:
+                    continue
+                if q_counts:
+                    allowed_q = sum(q_counts.get(t, 0) for t in allowed_tags)
+                    if q_counts.get("npc", 0) == 0 and allowed_q < 3:
+                        continue
+                elif map_tags and "npc" not in map_tags and not (map_tags <= allowed_tags):
+                    continue
+                if not S.sprite_like(frame, cell, y_off):
+                    continue
+                window = S.sprite_window(frame, cell, (0, 0), y_off)
+                if window is None:
+                    continue
+                mask = S.black_mask(window, level)
+                score = S.character_window_score(window, level)
+                if score <= 0:
+                    best = self._best_view(mask)
+                    if (best is not None and best[0] <= self._p["auto"]
+                            and self.looks[best[1]].kind_hint != "object"
+                            and S.complete_sprite(mask) and int(mask.sum()) >= 50):
+                        score = int(mask.sum())
+                if score <= 0:
+                    continue
+                inferred_f = self._infer_view_facing(View(window, mask, None, None, (0, 0)))
+                towards = 1 if inferred_f == OPPOSITE_FACING[d] else 0
+                has_npc_tag = 1 if ("npc" in tags or (is_live and cell in self.on_screen(g))) else 0
+                is_facing = 1 if (facing is not None and DIRECTIONS.get(facing) == cell) else 0
+                walked_up = 0
+                ray_npc: Optional[NPC] = None
+                for n in self.live_npcs():
+                    if self.look_of(n).kind_hint == "object":
+                        continue
+                    seen = self.last_seen(g, n)
+                    if seen is not None and seen[0] == rseg and seen[1] == tsq:
+                        ray_npc = n
+                        break
+                if ray_npc is None:
+                    for k in (2, 3, 4):
+                        rcell = (k * cell[0], k * cell[1])
+                        rw = S.sprite_window(frame, rcell, (0, 0), y_off)
+                        if S.character_window_score(rw, level) > 0:
+                            continue
+                        rsq = (rpos[0] + rcell[0], rpos[1] + rcell[1])
+                        for n in self.live_npcs():
+                            if self.look_of(n).kind_hint == "object":
+                                continue
+                            seen = self.last_seen(g, n)
+                            if seen is not None and seen[0] == rseg and seen[1] == rsq:
+                                ray_npc = n
+                                walked_up = 1
+                                break
+                        if ray_npc is not None:
+                            break
+                untalked = 1 if (ray_npc is None or not self._talks_in(g, ray_npc, rseg)) else 0
+                rank = (towards, walked_up, untalked, has_npc_tag, is_facing, score)
+                prev = by_dir.get(d)
+                if prev is None or rank > prev["rank"]:
+                    by_dir[d] = dict(d=d, cell=cell, frame=frame, window=window, mask=mask,
+                                     score=score, towards=towards, walked_up=walked_up,
+                                     untalked=untalked, rank=rank)
+        return sorted(by_dir.values(), key=lambda c: c["rank"], reverse=True)
+
+    def _adjacent_sprite_person(self, facing: Optional[str],
+                                ev: Optional[StepEvent] = None,
+                                frame_override: Optional[np.ndarray] = None,
+                                segment: Optional[int] = None, pos: Optional[Cell] = None,
+                                step: Optional[int] = None,
+                                episode: Optional[int] = None,
+                                snap_ray: bool = True) -> Tuple[Optional[str], str, str]:
+        candidates = self._adjacent_sprite_candidates(
+            facing, ev=ev, frame_override=frame_override, segment=segment, pos=pos)
+        if not candidates:
             return None, "none", "low"
-        _, _, cell, window, mask = candidates[0]
-        rem = self._remembered_at(cell)
-        if rem is not None:
-            return rem, "remembered", "low"
-        hid = self._hidden_at(cell)
-        if hid is not None:
-            return hid, "hidden", "low"
-        square = (g.pos[0] + cell[0], g.pos[1] + cell[1])
-        seg, resolved = g.resolve(g.segment, square)
-        for npc in self.live_npcs():
-            seen = self.last_seen(g, npc)
-            if seen is not None and seen[0] == seg and _manhattan(seen[1], resolved) <= 1:
-                return npc.id, "remembered", "low"
-        det = dict(cell=cell, offset=(0, 0), window=window, mask=mask, full=True, square=square)
-        track = self._start_track(det, set(), g.segment, g.step)
-        if track is not None:
-            return track.npc, "seen", "low"
-        return None, "none", "low"
+        top = candidates[0]
+        speaker, how = self._link_or_track_cell(
+            top["cell"], top["window"], top["mask"], frame=top["frame"],
+            segment=segment, pos=pos, step=step, episode=episode, snap_ray=snap_ray)
+        if speaker is None:
+            return None, "none", "low"
+        conf = "high" if (len(candidates) == 1 or top["towards"]) else "low"
+        return speaker, how, conf
 
     def _open_conversation(self, ev: StepEvent, a_press: bool) -> None:
         g = self._gmap
         speaker: Optional[str] = None
         extra_speakers: List[str] = []
         sign_square: Optional[Cell] = None
-        facing = self._a_facing or self._facing
-        on_screen = self.on_screen(g)
+        frame_here = self._free_frame if self._free_frame_at_here() else (ev.frame if ev is not None else None)
+        facing = self._a_facing or self._facing or self._player_facing(frame_here)
+        on_screen = self.on_screen(g) if self._free_frame_at_here() else {}
         neighbour_cells = [(c, n) for c, n in on_screen.items() if abs(c[0]) + abs(c[1]) == 1]
         neighbours = [n for _, n in neighbour_cells]
         how, confidence = "seen", "high"
@@ -1052,51 +1393,89 @@ class NPCRegistry(StrategistArtifact):
                 speaker = self._hidden_at(target)
                 if speaker is not None:
                     how, confidence = "hidden", "low"
+            if speaker is None and not (self._cell_tags(target, ev) & SIGN_TAGS) and frame_here is not None:
+                y_off = self._p["y_offset"]
+                level = S.black_level(frame_here)
+                w_target = S.sprite_window(frame_here, target, (0, 0), y_off)
+                if S.character_window_score(w_target, level) > 0:
+                    m_target = S.black_mask(w_target, level)
+                    speaker, how = self._link_or_track_cell(target, w_target, m_target, frame=frame_here, snap_ray=False)
             if speaker is None:
                 speaker, how, confidence = self._across_counter_speaker(target, on_screen, ev)
             if speaker is None:
                 sign_square = self._sign_at(target, ev)
         elif not a_press:
-            emote_cell = self._emote_cell(self._free_frame if self._free_frame is not None else ev.frame)
-            if emote_cell is not None and emote_cell != (0, 0):
-                speaker = on_screen.get(emote_cell) or self._remembered_at(emote_cell)
-                if speaker is not None:
-                    how = "seen" if emote_cell in on_screen else "remembered"
-            if speaker is None and len(set(neighbours)) == 1:
-                speaker = neighbours[0]
-        if speaker is None and sign_square is None and not a_press:
-            if len(set(neighbours)) > 1:
-                seg = g.resolve(g.segment, g.pos)[0]
-                distinct = list(dict.fromkeys(neighbours))
-                untalked = [nid for nid in distinct if not self._talks_in(g, self.get(nid), seg)]
-                ordered = untalked + [nid for nid in distinct if nid not in untalked]
-                speaker, extra_speakers = ordered[0], ordered[1:]
-                how, confidence = "seen", "low"
-            else:
-                # Only check adjacent distance-1 cells (never arbitrary NPCs up to 5 tiles away).
-                adj_rem = []
-                if facing is not None and self._remembered_at(DIRECTIONS[facing]) is not None:
-                    adj_rem.append(self._remembered_at(DIRECTIONS[facing]))
-                for d_cell in DIRECTIONS.values():
-                    r_id = self._remembered_at(d_cell)
-                    if r_id is not None and r_id not in adj_rem:
-                        adj_rem.append(r_id)
-                if len(adj_rem) == 1:
-                    speaker, how, confidence = adj_rem[0], "remembered", "low"
-                elif len(adj_rem) > 1:
+            emote_frames: List[np.ndarray] = []
+            if self._free_frame_at_here() and self._free_frame is not None:
+                emote_frames.append(self._free_frame)
+            if ev is not None and ev.frame is not None:
+                emote_frames.append(ev.frame)
+            if ev is not None and ev.info and self._free_frame_at_here():
+                for pf in (ev.info.get("core") or {}).get("transition_passed_frames") or []:
+                    if pf is not None:
+                        emote_frames.append(pf)
+            for ef in emote_frames:
+                emote_cell = self._emote_cell(ef)
+                if emote_cell is not None and emote_cell != (0, 0):
+                    speaker = on_screen.get(emote_cell) or self._remembered_at(emote_cell)
+                    if speaker is not None:
+                        how = "seen" if emote_cell in on_screen else "remembered"
+                        if (emote_cell[0] == 0 or emote_cell[1] == 0) and (abs(emote_cell[0]) + abs(emote_cell[1]) in (2, 3, 4)):
+                            step_dir = (int(np.sign(emote_cell[0])), int(np.sign(emote_cell[1])))
+                            npc_obj = self._snap_ray_sightings(self.get(speaker), frame_here, g.segment, g.pos, step_dir, max_step=g.step)
+                            speaker, how = npc_obj.id, "seen"
+                        break
+            if speaker is None:
+                sprite_cands = self._adjacent_sprite_candidates(facing, ev=ev)
+                if sprite_cands:
+                    linked: List[str] = []
+                    for cand in sprite_cands:
+                        cid_npc, _ = self._link_or_track_cell(
+                            cand["cell"], cand["window"], cand["mask"], frame=cand["frame"], snap_ray=True)
+                        if cid_npc is not None and cid_npc not in linked:
+                            linked.append(cid_npc)
+                    for nid in neighbours:
+                        resolved_nid = self.get(nid).id
+                        if resolved_nid not in linked:
+                            linked.append(resolved_nid)
+                    if len(linked) == 1:
+                        speaker, how, confidence = linked[0], "seen", "high"
+                    elif len(linked) > 1:
+                        speaker, extra_speakers = linked[0], linked[1:]
+                        how = "seen"
+                        confidence = "high" if sprite_cands[0]["towards"] else "low"
+                elif len(set(neighbours)) == 1:
+                    speaker = neighbours[0]
+                elif len(set(neighbours)) > 1:
                     seg = g.resolve(g.segment, g.pos)[0]
-                    untalked = [nid for nid in adj_rem if not self._talks_in(g, self.get(nid), seg)]
-                    ordered = untalked + [nid for nid in adj_rem if nid not in untalked]
+                    distinct = list(dict.fromkeys(neighbours))
+                    untalked = [nid for nid in distinct if not self._talks_in(g, self.get(nid), seg)]
+                    ordered = untalked + [nid for nid in distinct if nid not in untalked]
                     speaker, extra_speakers = ordered[0], ordered[1:]
-                    how, confidence = "remembered", "low"
-                else:
-                    speaker, how, confidence = self._adjacent_sprite_person(facing, ev)
+                    how, confidence = "seen", "low"
+        if speaker is None and sign_square is None and not a_press:
+            # Fallback to remembered adjacent distance-1 cells when no sprite was visible on the frame.
+            adj_rem = []
+            if facing is not None and self._remembered_at(DIRECTIONS[facing]) is not None:
+                adj_rem.append(self._remembered_at(DIRECTIONS[facing]))
+            for d_cell in DIRECTIONS.values():
+                r_id = self._remembered_at(d_cell)
+                if r_id is not None and r_id not in adj_rem:
+                    adj_rem.append(r_id)
+            if len(adj_rem) == 1:
+                speaker, how, confidence = adj_rem[0], "remembered", "low"
+            elif len(adj_rem) > 1:
+                seg = g.resolve(g.segment, g.pos)[0]
+                untalked = [nid for nid in adj_rem if not self._talks_in(g, self.get(nid), seg)]
+                ordered = untalked + [nid for nid in adj_rem if nid not in untalked]
+                speaker, extra_speakers = ordered[0], ordered[1:]
+                how, confidence = "remembered", "low"
         if speaker is not None:
             # Memory of someone seen on several squares is weak, and gone once they roamed.
             squares = self.squares_in(g, self.get(speaker), g.resolve(g.segment, g.pos)[0])
             if _spread(squares) > 1 and how != "seen":
                 speaker = None
-            elif len(squares) > 1:
+            elif len(squares) > 1 and how != "seen":
                 confidence = "low"
         if speaker is None and sign_square is None:
             how = "none"
@@ -1123,7 +1502,9 @@ class NPCRegistry(StrategistArtifact):
             sign.episode = self._episode
         else:
             self.unattributed.append(conv.id)
-        if self._free_frame is not None:
+        if frame_here is not None:
+            conv.context = np.array(frame_here, copy=True)
+        elif self._free_frame is not None:
             conv.context = np.array(self._free_frame, copy=True)
         self.conversations[conv.id] = conv
         self._open = conv.id
@@ -1368,6 +1749,111 @@ class NPCRegistry(StrategistArtifact):
         self._stack = None
         self.stats["looks_merged"] += 1
 
+    def _reconcile_conversations(self) -> None:
+        gmap = self._gmap
+        if gmap is None:
+            return
+        convs = sorted(self.conversations.values(), key=lambda c: c.map_step_start)
+        for conv in convs:
+            if conv.trigger == "battle_start":
+                continue
+            rseg, rsq = gmap.resolve(conv.segment, conv.square)
+            end_step = conv.map_step_end if conv.map_step_end is not None else conv.map_step_start
+            if conv.trigger == "npc_started":
+                followed_by_battle = any(
+                    other.id != conv.id and other.episode == conv.episode
+                    and (other.trigger == "battle_start" or other.led_to == "battle")
+                    and 0 <= other.map_step_start - end_step <= MAX_PRE_BATTLE_WAIT_STEPS
+                    and gmap.resolve(other.segment, other.square) == (rseg, rsq)
+                    for other in convs
+                )
+                if followed_by_battle:
+                    if not conv.text.strip() and not conv.crops and conv.npc is None and conv.sign is None:
+                        self._mark_battle_start(conv)
+                        continue
+                    if conv.led_to == "free_roam":
+                        conv.led_to = "battle"
+            if conv.npc in self.npcs:
+                npc = self.get(conv.npc)
+                conv.npc = npc.id
+                if conv.led_to == "battle" and npc.kind in ("unknown", "person"):
+                    npc.kind = "trainer"
+                if conv.trigger == "npc_started":
+                    seen = self.last_seen(gmap, npc)
+                    if seen is not None and seen[0] == rseg:
+                        dx, dy = seen[1][0] - rsq[0], seen[1][1] - rsq[1]
+                        if abs(dx) + abs(dy) == 1:
+                            npc = self._snap_ray_sightings(
+                                npc, conv.context, conv.segment, conv.square, (dx, dy),
+                                max_step=end_step)
+                            conv.npc = npc.id
+                continue
+            if conv.context is None:
+                continue
+            speaker: Optional[str] = None
+            how, conf = "seen", "high"
+            if conv.trigger == "a_press":
+                if conv.sign is not None:
+                    sign = self.signs.get(conv.sign)
+                    if sign is not None:
+                        s_seg, s_sq = gmap.resolve(sign.segment, sign.square)
+                        target = (s_sq[0] - rsq[0], s_sq[1] - rsq[1])
+                        mcell = (gmap.segments[rseg] if 0 <= rseg < len(gmap.segments) else {}).get(s_sq)
+                        mtags = set(mcell.tags) if (mcell is not None and mcell.tags) else set()
+                        if s_seg == rseg and abs(target[0]) + abs(target[1]) == 1 and not (mtags & {"sign", "item"}):
+                            speaker, how, conf = self._across_counter_speaker(
+                                target, {}, frame_override=conv.context,
+                                segment=conv.segment, pos=conv.square,
+                                step=conv.map_step_start, episode=conv.episode)
+                            if speaker is not None:
+                                while conv.id in sign.conversations:
+                                    sign.conversations.remove(conv.id)
+                                if not sign.conversations:
+                                    self.signs.pop(sign.id, None)
+                                conv.sign = None
+                else:
+                    facing = self._player_facing(conv.context)
+                    if facing in DIRECTIONS:
+                        target = DIRECTIONS[facing]
+                        mcell = (gmap.segments[rseg] if 0 <= rseg < len(gmap.segments) else {}).get((rsq[0] + target[0], rsq[1] + target[1]))
+                        mtags = set(mcell.tags) if (mcell is not None and mcell.tags) else set()
+                        if not (mtags & SIGN_TAGS):
+                            y_off = self._p["y_offset"]
+                            lv = S.black_level(conv.context)
+                            w_t = S.sprite_window(conv.context, target, (0, 0), y_off)
+                            if S.character_window_score(w_t, lv) > 0:
+                                m_t = S.black_mask(w_t, lv)
+                                speaker, how = self._link_or_track_cell(
+                                    target, w_t, m_t, frame=conv.context,
+                                    segment=conv.segment, pos=conv.square,
+                                    step=conv.map_step_start, episode=conv.episode, snap_ray=False)
+                        if speaker is None:
+                            speaker, how, conf = self._across_counter_speaker(
+                                target, {}, frame_override=conv.context,
+                                segment=conv.segment, pos=conv.square,
+                                step=conv.map_step_start, episode=conv.episode)
+            elif conv.trigger == "npc_started" and conv.sign is None:
+                speaker, how, conf = self._adjacent_sprite_person(
+                    None, frame_override=conv.context, segment=conv.segment, pos=conv.square,
+                    step=conv.map_step_start, episode=conv.episode, snap_ray=True)
+            if speaker is not None and speaker in self.npcs:
+                npc = self.get(speaker)
+                had_interactions = npc_model._interacted_with(self, npc)
+                conv.npc, conv.how, conv.confidence = npc.id, how, conf
+                if conv.id not in npc.conversations:
+                    npc.conversations.append(conv.id)
+                if conv.id in self.unattributed:
+                    self.unattributed.remove(conv.id)
+                seen = self.last_seen(gmap, npc)
+                conv.target = seen[1] if seen else conv.target
+                if conv.led_to == "battle" and npc.kind in ("unknown", "person"):
+                    npc.kind = "trainer"
+                elif npc.kind == "unknown" and npc_model.is_routine_service_text(conv.text):
+                    npc.kind = "person"
+                if not had_interactions and (self._episode == 0 or conv.episode < self._episode
+                                             or npc_model.is_routine_conversation(self, conv)):
+                    npc.needs = None
+
     def consolidate(self) -> None:
         gmap = self._gmap
         for a, b in sorted(self._look_merges):
@@ -1375,6 +1861,8 @@ class NPCRegistry(StrategistArtifact):
             if a != b and a in self.looks and b in self.looks:
                 self.merge_looks(a, b)
         self._look_merges = set()
+        if gmap is not None:
+            self._reconcile_conversations()
         people = sorted(self.live_npcs(), key=lambda n: n.created)
         for i, older in enumerate(people):
             if older.merged_into is not None:
@@ -1451,7 +1939,12 @@ class NPCRegistry(StrategistArtifact):
             return "left"
         if r_light > l_light:
             return "right"
-        return None
+        light_face = int((px[5:10, 4:12] >= 180).sum())
+        cheeks = int((px[6:9, 5:7] >= 180).sum() + (px[6:9, 9:11] >= 180).sum())
+        eye_features = int((px[5:9, 5:11] < 180).sum())
+        if light_face >= 14 and cheeks >= 6 and eye_features >= 2:
+            return "down"
+        return "up"
 
     @staticmethod
     def sighting_facing(look: Look, sighting: Sighting) -> Optional[str]:
