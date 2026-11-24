@@ -84,6 +84,8 @@ def character_window_score(window: Optional[np.ndarray], level: int) -> int:
         return 0
     light_level = max(int(w.max()) - 15, 180)
     int_white = int((w[2:14, 2:14] >= light_level).sum())
+    if int_white < 12:
+        int_white = int((w[2:14, 2:14] >= 168).sum())
     int_black = int(mask[2:14, 2:14].sum())
     top_black = int(mask[:8, 2:14].sum())
     bot_black = int(mask[8:, 2:14].sum())

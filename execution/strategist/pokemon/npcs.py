@@ -820,7 +820,7 @@ class NPCRegistry(StrategistArtifact):
         return new
 
     def _conversation_step(self, ev: StepEvent) -> None:
-        from execution.game_api import AgentState
+        from execution.game_api import AgentState, MenuAction, OpenMenuAction
 
         state = ev.info.get("pokemon_core", {}).get("agent_state") if ev.info else None
         if self._resume is not None:
@@ -849,8 +849,12 @@ class NPCRegistry(StrategistArtifact):
 
         crops = self._step_crops(ev)
         in_battle = state == AgentState.IN_BATTLE or bool(getattr(self._gmap, "in_battle", False) and not ev.free)
+        is_menu_action = (
+            ev.action in (OpenMenuAction, MenuAction)
+            or (isinstance(ev.action, type) and issubclass(ev.action, (OpenMenuAction, MenuAction)))
+        )
         # Text opens a conversation: either entering IN_DIALOGUE from free roam, or a single-step dialogue with crops.
-        if self._open is None and ev.was_free and not in_battle and (
+        if self._open is None and ev.was_free and not in_battle and not is_menu_action and (
                 state == AgentState.IN_DIALOGUE
                 or (crops and state in (AgentState.FREE_ROAM, AgentState.IN_MENU))):
             if not pressed and self._try_reopen_pre_battle(ev):
@@ -1216,11 +1220,11 @@ class NPCRegistry(StrategistArtifact):
         return None, "seen", "high"
 
     def _emote_cell(self, frame: Optional[np.ndarray]) -> Optional[Cell]:
-        from execution.perception.pokemon.battle import DARK_INK, LIGHT_BACKGROUND, _grey_frame
+        from execution.perception.pokemon.battle import DARK_INK, LIGHT_BACKGROUND
 
         if frame is None:
             return None
-        img = _grey_frame(frame)
+        img = S._screen(frame)
         h, w = img.shape[:2]
         if h < 120 or w < 160:
             return None
@@ -1273,8 +1277,8 @@ class NPCRegistry(StrategistArtifact):
             if ev is not None and ev.frame is not None:
                 frame_sources.append((ev.frame, ev.identified or {}))
             if ev is not None and ev.info:
-                passed = (ev.info.get("core") or {}).get("transition_passed_frames") or []
-                if passed and passed[-1] is not None:
+                passed = (ev.info.get("core") or {}).get("transition_passed_frames")
+                if passed is not None and len(passed) and passed[-1] is not None:
                     frame_sources.append((passed[-1], {}))
         if not frame_sources:
             return []
@@ -1411,18 +1415,23 @@ class NPCRegistry(StrategistArtifact):
             if ev is not None and ev.frame is not None:
                 emote_frames.append(ev.frame)
             if ev is not None and ev.info and self._free_frame_at_here():
-                for pf in (ev.info.get("core") or {}).get("transition_passed_frames") or []:
-                    if pf is not None:
-                        emote_frames.append(pf)
+                passed = (ev.info.get("core") or {}).get("transition_passed_frames")
+                if passed is not None and len(passed):
+                    for pf in passed:
+                        if pf is not None:
+                            emote_frames.append(pf)
             for ef in emote_frames:
                 emote_cell = self._emote_cell(ef)
                 if emote_cell is not None and emote_cell != (0, 0):
                     speaker = on_screen.get(emote_cell) or self._remembered_at(emote_cell)
+                    if speaker is not None and self.look_of(self.get(speaker)).kind_hint == "object":
+                        speaker = None
                     if speaker is not None:
                         how = "seen" if emote_cell in on_screen else "remembered"
-                        if (emote_cell[0] == 0 or emote_cell[1] == 0) and (abs(emote_cell[0]) + abs(emote_cell[1]) in (2, 3, 4)):
+                        if (emote_cell[0] == 0 or emote_cell[1] == 0) and (abs(emote_cell[0]) + abs(emote_cell[1]) in (1, 2, 3, 4)):
                             step_dir = (int(np.sign(emote_cell[0])), int(np.sign(emote_cell[1])))
-                            npc_obj = self._snap_ray_sightings(self.get(speaker), frame_here, g.segment, g.pos, step_dir, max_step=g.step)
+                            snap_frame = ev.frame if (ev is not None and ev.frame is not None) else frame_here
+                            npc_obj = self._snap_ray_sightings(self.get(speaker), snap_frame, g.segment, g.pos, step_dir, max_step=g.step)
                             speaker, how = npc_obj.id, "seen"
                         break
             if speaker is None:
@@ -1919,8 +1928,8 @@ class NPCRegistry(StrategistArtifact):
 
     @staticmethod
     def _infer_view_facing(view: View) -> Optional[str]:
-        m = np.asarray(view.key, dtype=bool)
-        px = np.asarray(view.pixels)
+        m = np.asarray(S._screen(view.key), dtype=bool)
+        px = np.asarray(S._screen(view.pixels))
         if m.shape != (16, 16) or px.shape != (16, 16) or not m.any():
             return None
         m12 = m[4:, :]
