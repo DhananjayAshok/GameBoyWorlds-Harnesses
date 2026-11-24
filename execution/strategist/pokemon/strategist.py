@@ -1055,7 +1055,8 @@ class PokemonStrategist:
                 return
             unsuccessful_for = 0
         else:
-            if subtree.root.source == "defeat" and not self._explore_now:
+            if (subtree.root.achievable_without_subgoals is not None
+                    or subtree.root.source in ("subgoal_creation", "defeat")) and not self._explore_now:
                 if subtree.root.achievable_without_subgoals is None:
                     self.goals.edit(path, achievable_without_subgoals=n, episode_number=n)
                 return

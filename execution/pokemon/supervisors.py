@@ -893,10 +893,99 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return "quit", reason or "No new plan was given.", []
         return "replan", None, subgoals
 
+    def _unfinished_corridor_traversal_note(
+        self,
+        local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
+    ) -> Optional[str]:
+        remaining_calls = max(0, self._max_steps - self._calls)
+        if remaining_calls < 4:
+            return None
+        if self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue():
+            return None
+        gmap = self._global_map()
+        place = self._current_map_place()
+        if gmap is None or place is None or self._start_place is None:
+            return None
+        cur_seg, cur_pos = place
+        s_seg, s_pos = gmap.resolve(self._start_place[0], self._start_place[1])
+        if cur_seg != s_seg:
+            return None
+        move_legs = sum(
+            1 for rep in self.report.executor_reports
+            if rep.executor_name in ("OffScreenMoveExecutor", "OnScreenMoveExecutor")
+        )
+        if move_legs == 0 or move_legs >= 3:
+            return None
+        net_steps = abs(cur_pos[0] - s_pos[0]) + abs(cur_pos[1] - s_pos[1])
+        if net_steps >= 15:
+            return None
+        task_text = (self._task or "") + " " + (self._guidance or "")
+        if re.search(r"\b(?:heal|potion|menu|poke\s*mart|pokemon\s*center|talk|speak|interact|pick\s+up|collect)\b",
+                     self._task or "", re.IGNORECASE):
+            return None
+        dir_map = {
+            "north": "up", "up": "up",
+            "south": "down", "down": "down",
+            "west": "left", "left": "left",
+            "east": "right", "right": "right",
+        }
+        task_dirs = []
+        for m in re.finditer(r"\b(north|south|east|west|up|down|left|right)\b", self._task or "", re.IGNORECASE):
+            d = dir_map[m.group(1).lower()]
+            if d not in task_dirs:
+                task_dirs.append(d)
+        if not task_dirs:
+            return None
+        if local_kinds is not None:
+            for d in DIRECTIONS:
+                for (lx, ly), kind in local_kinds.items():
+                    if abs(lx) + abs(ly) <= 6 and kind == "item":
+                        return None
+        targets, _ = frontier_targets(gmap, local_kinds)
+        doors_here = gmap.reachable_door_list()
+        unentered_doors = [d for d in doors_here if d["leads_to"] is None]
+        if not targets and not unentered_doors:
+            return None
+        if local_kinds is not None:
+            for (lx, ly), info in (self._identified or {}).items():
+                tags = info if isinstance(info, (set, list, tuple)) else getattr(info, "tags", ())
+                if any(t in ("door", "staircase", "entrance", "exit") for t in (tags or ())):
+                    if (lx, ly) != (0, 0) and abs(lx) + abs(ly) <= 6:
+                        return None
+        open_task_dirs = []
+        if local_kinds is not None:
+            for d in task_dirs:
+                cells = edge_cells(local_kinds, d)
+                if not cells:
+                    continue
+                runs = edge_runs(cells, d)
+                if any(self._run_pocket_bounds(d, r) is None for r in runs):
+                    open_task_dirs.append(d)
+        if not open_task_dirs:
+            return None
+        if targets:
+            nearest = targets[0]
+            dist = nearest.get("path_steps") if nearest.get("path_steps") is not None else nearest.get("steps")
+            if dist is not None and dist <= 6 and nearest.get("on_screen"):
+                return None
+            route_info = (
+                f"nearest unexplored edge is at ({nearest['dx']}, {nearest['dy']}), {nearest['steps']} steps {nearest['sector']}"
+                + (f" (mapped route, {nearest['path_steps']} moves: {nearest['path_moves']})" if nearest.get("path_moves") else "")
+            )
+        else:
+            route_info = f"{len(unentered_doors)} unentered door(s)/stairs remain in this area"
+        return (
+            f"only {move_legs} movement leg(s) ({net_steps} net steps from {s_pos} to {cur_pos}) completed so far "
+            f"with {remaining_calls} action calls remaining in this episode's budget, while the {', '.join(open_task_dirs)} "
+            f"corridor edge continues open and {route_info} — continue advancing along the corridor/route in this episode"
+        )
+
     def _task_check(self, frame, *, can_continue: bool = True) -> Tuple[bool, str]:
         remaining_calls = max(0, self._max_steps - self._calls)
         local_kinds = self._current_local_kinds()
         unfinished_note = self._unfinished_room_exploration_note(self._task, local_kinds) if can_continue else None
+        if unfinished_note is None and can_continue:
+            unfinished_note = self._unfinished_corridor_traversal_note(local_kinds)
         if can_continue and remaining_calls > 0:
             extra = f" ({unfinished_note}.)" if unfinished_note else ""
             continuation_note = (
