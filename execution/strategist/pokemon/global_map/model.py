@@ -2340,6 +2340,22 @@ class GlobalMap(StrategistArtifact):
         )
         has_void = bool(void_cols)
         visits = self.visits[si] if si < len(self.visits) else Counter()
+        cave_void_cells = (
+            [
+                g
+                for g, mc in seg.items()
+                if mc.pixels is not None
+                and int(mc.pixels.max()) <= BLACK_LEVEL
+                and int(mc.pixels.min()) == int(mc.pixels.max())
+            ]
+            if info.kind == CAVE
+            else []
+        )
+        cave_visited_walk = (
+            [g for g, mc in seg.items() if mc.kind == WALKABLE and visits.get(g, 0) > 0]
+            if cave_void_cells
+            else []
+        )
         out = []
         for g, c in seg.items():
             if c.kind != WALKABLE or (reach and g not in reach):
@@ -2353,6 +2369,23 @@ class GlobalMap(StrategistArtifact):
                     if dx != 0 and (g[0] in void_cols or u[0] in void_cols):
                         continue
                     if dy != 0 and (g[1] in void_rows or u[1] in void_rows):
+                        continue
+                if cave_void_cells and visits.get(g, 0) == 0:
+                    f_void = sum(
+                        1
+                        for v in cave_void_cells
+                        if (dx > 0 and v[0] >= u[0])
+                        or (dx < 0 and v[0] <= u[0])
+                        or (dy > 0 and v[1] >= u[1])
+                        or (dy < 0 and v[1] <= u[1])
+                    )
+                    if f_void >= 4 and not any(
+                        (dx > 0 and w[0] >= g[0])
+                        or (dx < 0 and w[0] <= g[0])
+                        or (dy > 0 and w[1] >= g[1])
+                        or (dy < 0 and w[1] <= g[1])
+                        for w in cave_visited_walk
+                    ):
                         continue
                 has_open_unmapped = True
                 break

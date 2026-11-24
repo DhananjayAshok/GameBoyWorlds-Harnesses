@@ -53,6 +53,12 @@ def explore_text(gmap: GlobalMap) -> str:
             )
         else:
             lines.append(f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''}.")
+        targets, mass = frontier_targets(gmap)
+        if targets:
+            for t in targets:
+                route_note = f" (mapped route, {t['path_steps']} moves: {t['path_moves']})" if t.get("path_moves") else ""
+                lines.append(f"  - nearest unexplored edge {t['sector']} at ({t['dx']}, {t['dy']}), {t['steps']} steps{route_note}")
+            lines.append("  - most unexplored edge lies: " + ", ".join(f"{s} ({n} squares)" for s, n in mass.most_common(3)) + ".")
     if unentered:
         lines.append(f"- {here}, where you are: {unentered} door(s) or stairs not entered yet.")
     for door in doors:
@@ -102,7 +108,7 @@ def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
     targets, mass = frontier_targets(gmap, local_kinds)
     here = gmap.info(gmap.segment)
     lines = [f"You are in the area you named {gmap.place_label()}: {here.description}"] if here.name else []
-    if here.explored is not None:
+    if here.explored is not None and not targets:
         lines.append("You have fully explored this area: no edge of its map is left unexplored.")
     lines += [
         "MAP OF EVERYTHING YOU HAVE SEEN IN THIS AREA (north is up, one character per step):",

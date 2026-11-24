@@ -33,12 +33,41 @@ def glyph(c: Optional[MapCell]) -> str:
     return {WALKABLE: ".", BLOCKED: "#", LEDGE: "=", LEDGE_LEFT: "<", UNKNOWN: "%"}.get(c.kind, "?")
 
 
+MAX_WINDOW_SPAN = 61
+
+
+def window_bounds(gmap: GlobalMap, rx: int = 12, ry: int = 7) -> Tuple[int, int, int, int]:
+    px, py = gmap.pos
+    bounds = segment_bounds(gmap, gmap.segment)
+    if bounds is None:
+        return px - rx, px + rx, py - ry, py + ry
+    bx0, bx1, by0, by1 = bounds
+    bx0, bx1 = min(bx0, px - 1), max(bx1, px + 1)
+    by0, by1 = min(by0, py - 1), max(by1, py + 1)
+    max_w = max(2 * rx + 1, MAX_WINDOW_SPAN)
+    max_h = max(2 * ry + 1, MAX_WINDOW_SPAN)
+    if bx1 - bx0 + 1 <= max_w:
+        x0, x1 = bx0, bx1
+    else:
+        half_w = max_w // 2
+        x0 = max(bx0, min(px - half_w, bx1 - max_w + 1))
+        x1 = x0 + max_w - 1
+    if by1 - by0 + 1 <= max_h:
+        y0, y1 = by0, by1
+    else:
+        half_h = max_h // 2
+        y0 = max(by0, min(py - half_h, by1 - max_h + 1))
+        y1 = y0 + max_h - 1
+    return x0, x1, y0, y1
+
+
 def ascii_window(gmap: GlobalMap, rx: int = 12, ry: int = 7) -> str:
     seg, (px, py) = gmap.current, gmap.pos
+    x0, x1, y0, y1 = window_bounds(gmap, rx, ry)
     rows = []
-    for y in range(py + ry, py - ry - 1, -1):
+    for y in range(y1, y0 - 1, -1):
         rows.append("".join("@" if (x, y) == (px, py) else glyph(seg.get((x, y)))
-                            for x in range(px - rx, px + rx + 1)))
+                            for x in range(x0, x1 + 1)))
     return "\n".join(rows)
 
 
@@ -160,6 +189,10 @@ def route_lines(gmap: GlobalMap) -> List[str]:
     lines = []
     for r in gmap.routes:
         plan = plan_route(gmap, r["targets"])
+        if plan is not None and plan.get("hops"):
+            first_to = plan["hops"][0]["to"]
+            if gmap.branch_exploration(gmap.segment, first_to)["exhausted"]:
+                continue
         lines.append(f"Route you looked up to \"{r['request']}\":\n" + render_plan(gmap, r["targets"], plan))
     return lines
 
@@ -341,7 +374,7 @@ def _leads_to_description(gmap: GlobalMap, leads_to: int) -> str:
                 f"(dead-end branch, fully explored — no unentered doors or unexplored exits)"
             )
         return f"leads to {label} (dead-end branch, fully explored — no unentered doors or unexplored exits)"
-    if gmap.info(leads_to).explored is not None:
+    if gmap.info(leads_to).explored is not None and not gmap.frontier(leads_to):
         return f"leads to {label}, fully explored"
     return f"leads to {label}"
 

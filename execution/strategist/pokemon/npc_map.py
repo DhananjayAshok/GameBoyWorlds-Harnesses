@@ -185,11 +185,14 @@ def people_marks(gmap: GlobalMap, people: Iterable[Any]) -> Tuple[List[Any], Dic
 
 
 def people_window(gmap: GlobalMap, grid: Dict[Cell, str], rx: int = 12, ry: int = 7) -> str:
+    from execution.strategist.pokemon.global_map.text import window_bounds
+
     seg, (px, py) = gmap.current, gmap.pos
+    x0, x1, y0, y1 = window_bounds(gmap, rx, ry)
     rows = []
-    for y in range(py + ry, py - ry - 1, -1):
+    for y in range(y1, y0 - 1, -1):
         rows.append("".join("@" if (x, y) == (px, py) else grid.get((x, y)) or people_glyph(seg.get((x, y)))
-                            for x in range(px - rx, px + rx + 1)))
+                            for x in range(x0, x1 + 1)))
     return "\n".join(rows)
 
 
