@@ -110,6 +110,28 @@ def has_battle_menu_box(frame: np.ndarray) -> bool:
     return False
 
 
+def is_battle_command_menu(frame: np.ndarray) -> bool:
+    """Return True when the 2x2 battle command menu (FIGHT / PKMN / ITEM|PACK / RUN) is open in the bottom box."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 8 * TILE_SIZE:9 * TILE_SIZE])
+               for ty in range(13, 17)):
+        return False
+    gutter = img[BOTTOM_BOX_INNER_TOP:BOTTOM_BOX_INNER_BOTTOM, TILE_SIZE:8 * TILE_SIZE]
+    if gutter.size == 0 or float((gutter >= DIALOGUE_BOX_WHITE).mean()) < 0.85:
+        return False
+    return any(
+        is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+        for ty in range(13, 17)
+        for tx in range(9, 19)
+    )
+
+
 def is_battle_decision_screen(frame: np.ndarray) -> bool:
     """Return True when the battle screen displays a command menu, move list, or cursor choice box."""
     return has_battle_menu_box(frame) or has_menu_cursor(frame)

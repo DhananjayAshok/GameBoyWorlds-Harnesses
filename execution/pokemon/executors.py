@@ -12,7 +12,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  has_emote_bubble, has_menu_cursor, has_modal_preview_box,
                                                  has_player_pokemon_fainted_text, has_quantity_selector_box,
                                                  has_top_dialogue_box,
-                                                 is_battle_decision_screen,
+                                                 is_battle_command_menu, is_battle_decision_screen,
                                                  is_battle_defeat_text, is_battle_menu_crop,
                                                  is_battle_screen, is_blank_or_fade_frame,
                                                  is_cutscene_frame_changing,
@@ -1577,9 +1577,9 @@ BATTLE_ACTION_FAILED = -3
 BATTLE_OUT_OF_STEPS = -4
 
 BATTLE_EXIT_SETTLE_WAIT = 4
-MAX_TURN_PROGRESS_STEPS = 45
+MAX_TURN_PROGRESS_STEPS = 135
 MAX_BATTLE_DIALOGUE_STEPS = 90
-MAX_IDLE_PROGRESS_STEPS = 6
+MAX_IDLE_PROGRESS_STEPS = 18
 MAX_IDLE_INTRO_STEPS = 12
 MAX_IDLE_BATTLE_DIALOGUE_STEPS = 30
 MAX_STAT_DISMISS_STEPS = 4
@@ -1657,6 +1657,9 @@ Move: <1, 2, 3 or 4>
 The image is the current screen.
 [HISTORY]
 Choose the single button press that best moves towards completing this menu or choice box so the battle can continue (or press back to cancel and return to the battle menu if nothing is needed here).
+If a move-learning prompt asks whether to delete/forget an older move to make room for a new move:
+- To learn the new move: select YES (press confirm when the cursor is on YES), then move the cursor to the weakest or least useful move in the move list and press confirm to forget it.
+- To skip learning the new move: select NO (press back) on deleting an older move, and then when asked whether to stop/abandon learning the move, select YES (press confirm while the cursor is on YES). Never press back or select NO on both prompts, as that repeats the move-learning question in an endless loop.
 
 The presses you can make:
 - up, down, left, right: move the cursor
@@ -1691,17 +1694,47 @@ Press: <one of up, down, left, right, confirm, back>
     def _current_frame(self) -> np.ndarray:
         return self._get_state()["core"]["current_frame"]
 
+    MENU_LOW_LEVEL_ACTIONS = {
+        "up": LowLevelActions.PRESS_ARROW_UP,
+        "down": LowLevelActions.PRESS_ARROW_DOWN,
+        "left": LowLevelActions.PRESS_ARROW_LEFT,
+        "right": LowLevelActions.PRESS_ARROW_RIGHT,
+        "confirm": LowLevelActions.PRESS_BUTTON_A,
+        "back": LowLevelActions.PRESS_BUTTON_B,
+    }
+
     def _has_battle_menu_cursor(self, frame: np.ndarray) -> bool:
         if is_pack_item_list_screen(frame):
             return bool(self._in_bag_menu or not self._saw_battle_state)
         return has_menu_cursor(frame)
 
+    def _is_in_battle_choice_menu(self, frame: np.ndarray) -> bool:
+        return (
+            self._has_battle_menu_cursor(frame)
+            and not is_battle_command_menu(frame)
+            and not is_move_selection_screen(frame)
+        )
+
+    def _take_battle_menu_press(self, press: str) -> EnvironmentStepRecord:
+        if self._agent_state() == AgentState.IN_MENU:
+            record = self._take_action(MenuAction, menu_action=press)
+            if (
+                record.action_success == -1
+                and not record.frame_changed
+                and self._agent_state() != AgentState.IN_MENU
+            ):
+                return self._take_action(
+                    LowLevelAction, low_level_action=self.MENU_LOW_LEVEL_ACTIONS[press]
+                )
+            return record
+        return self._take_action(
+            LowLevelAction, low_level_action=self.MENU_LOW_LEVEL_ACTIONS[press]
+        )
+
     def _non_battle_menu_outcome(self, frame: np.ndarray) -> Optional[AgentState]:
         if effective_agent_state(AgentState.IN_MENU, frame) == AgentState.IN_DIALOGUE:
             return AgentState.IN_DIALOGUE
         if is_overworld_pack_menu(frame) or is_start_menu_screen(frame):
-            return AgentState.IN_MENU
-        if has_menu_cursor(frame) and not has_bottom_dialogue_box(frame) and not is_party_menu_screen(frame):
             return AgentState.IN_MENU
         if not self._saw_battle_state and (
             is_party_menu_screen(frame) or is_pack_screen(frame) or has_menu_cursor(frame)
@@ -1830,7 +1863,7 @@ Press: <one of up, down, left, right, confirm, back>
                 continue
             if is_battle_decision_screen(frame):
                 break
-            extra = self._take_action(BattleMenuAction, option="progress")
+            extra = self._take_action(LowLevelAction, low_level_action=LowLevelActions.PRESS_BUTTON_B)
             records.append(extra)
             turn_steps += 1
             if self._last_terminated or self._last_truncated:
@@ -2031,9 +2064,10 @@ Press: <one of up, down, left, right, confirm, back>
                         continue
                 return self._record_outcome(AgentState.FREE_ROAM)
 
-            if state == AgentState.IN_DIALOGUE or (
-                    not is_battle_decision_screen(self._current_frame())
-                    and is_evolution_screen(self._current_frame())):
+            frame = self._current_frame()
+            if (state == AgentState.IN_DIALOGUE and not self._has_battle_menu_cursor(frame)) or (
+                    not is_battle_decision_screen(frame)
+                    and is_evolution_screen(frame)):
                 self._ensure_scripted("advance battle dialogue")
                 turn_records: List[EnvironmentStepRecord] = []
                 presses, dismisses = self._advance_until_decision(turn_records)
@@ -2052,13 +2086,16 @@ Press: <one of up, down, left, right, confirm, back>
                 dialogue_progressed = any(
                     not is_same_battle_frame(r.frame_before, r.frame_after) for r in turn_records
                 )
-                if self._agent_state() == AgentState.IN_DIALOGUE and (not presses or not dialogue_progressed):
+                if (
+                    self._agent_state() == AgentState.IN_DIALOGUE
+                    and not self._has_battle_menu_cursor(self._current_frame())
+                    and (not presses or not dialogue_progressed)
+                ):
                     return self._record_outcome(AgentState.IN_DIALOGUE)
                 continue
 
-            if state == AgentState.IN_MENU:
-                frame = self._current_frame()
-                menu_exit = self._non_battle_menu_outcome(frame)
+            if state == AgentState.IN_MENU or self._is_in_battle_choice_menu(frame):
+                menu_exit = self._non_battle_menu_outcome(frame) if state == AgentState.IN_MENU else None
                 if menu_exit is not None:
                     return self._record_outcome(menu_exit)
                 if not self._has_battle_menu_cursor(frame):
@@ -2101,7 +2138,7 @@ Press: <one of up, down, left, right, confirm, back>
 
                 if is_empty_battle_bag_menu(frame):
                     self._ensure_scripted("close empty battle bag menu")
-                    record = self._take_action(MenuAction, menu_action="back")
+                    record = self._take_battle_menu_press("back")
                     if self._last_terminated:
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
@@ -2126,7 +2163,7 @@ Press: <one of up, down, left, right, confirm, back>
                         return self._fail(BATTLE_UNREADABLE, "action_unreadable", output)
                     continue
                 consecutive_invalid = 0
-                record = self._take_action(MenuAction, menu_action=press)
+                record = self._take_battle_menu_press(press)
                 if self._last_terminated:
                     return self._fail(BATTLE_TERMINATED, "terminated")
                 if self._last_truncated:
@@ -2139,17 +2176,19 @@ Press: <one of up, down, left, right, confirm, back>
                 else:
                     consecutive_failures = 0
                 presses, dismisses = 0, 0
-                if self._agent_state() != AgentState.IN_MENU or (
-                    press == "confirm"
-                    and is_party_menu_screen(self._current_frame())
-                    and not has_menu_cursor(self._current_frame())
+                if (
+                    self._agent_state() != AgentState.IN_MENU
+                    or not self._has_battle_menu_cursor(self._current_frame())
                 ):
                     presses, dismisses = self._advance_until_decision(turn_records)
                     if self._last_terminated:
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
-                    if self._in_bag_menu and self._agent_state() != AgentState.IN_MENU:
+                    if self._in_bag_menu and (
+                        self._agent_state() != AgentState.IN_MENU
+                        or is_battle_command_menu(self._current_frame())
+                    ):
                         self._in_bag_menu = False
                         if (presses == 0
                                 and self._agent_state() == AgentState.IN_BATTLE
@@ -2232,6 +2271,8 @@ Press: <one of up, down, left, right, confirm, back>
                         self._agent_state() == AgentState.IN_DIALOGUE
                         or is_evolution_screen(self._current_frame())):
                     record = self._take_action(LowLevelAction, low_level_action=LowLevelActions.PRESS_BUTTON_A)
+                elif option == "progress":
+                    record = self._take_action(LowLevelAction, low_level_action=LowLevelActions.PRESS_BUTTON_B)
                 else:
                     record = self._take_action(BattleMenuAction, option=option)
                 if self._last_terminated:
