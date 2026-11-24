@@ -627,6 +627,36 @@ class GridMoveExecutor(PolicyExecutor):
                 post_motion_remaining = MOVE_POST_MOTION_WAIT
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
+        if state == AgentState.IN_MENU:
+            state = self._settle_menu_state()
+        return state
+
+    def _settle_menu_state(self):
+        state = self._get_state()["pokemon_core"]["agent_state"]
+        waited = 0
+        post_motion_remaining = 0
+        while (state == AgentState.IN_MENU
+               and not (self._last_terminated or self._last_truncated)
+               and waited < MOVE_MAX_CUTSCENE_WAIT):
+            frame = self._get_state()["core"]["current_frame"]
+            if has_menu_cursor(frame) or is_battle_screen(frame) or has_top_dialogue_box(frame):
+                break
+            if waited >= MENU_SETTLE_WAIT and post_motion_remaining <= 0:
+                if waited >= MOVE_SETTLE_WAIT:
+                    break
+            wait_record = self._take_action(WaitAction)
+            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
+            waited += 1
+            state = self._get_state()["pokemon_core"]["agent_state"]
+            if state != AgentState.IN_MENU or self._last_terminated or self._last_truncated:
+                break
+            after = wait_record.frame_after
+            if has_menu_cursor(after) or is_battle_screen(after) or has_top_dialogue_box(after):
+                break
+            if is_cutscene_frame_changing(wait_record.frame_before, after):
+                post_motion_remaining = MOVE_POST_MOTION_WAIT
+            elif post_motion_remaining > 0:
+                post_motion_remaining -= 1
         return state
 
     def _check_post_settle_interruption(self, state: AgentState, context: str) -> Optional[int]:

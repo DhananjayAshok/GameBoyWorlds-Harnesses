@@ -57,6 +57,11 @@ def is_cursor_tile(raw_tile: np.ndarray) -> bool:
     for k in range(len(nz_rows) // 2):
         if abs(row_sums[nz_rows[k]] - row_sums[nz_rows[-1 - k]]) > 1:
             return False
+    left_col = nz_cols[0]
+    for r in nz_rows:
+        cols = [c for c in range(TILE_SIZE) if dark[r, c]]
+        if cols[0] != left_col or cols[-1] - cols[0] + 1 != len(cols):
+            return False
     return True
 
 

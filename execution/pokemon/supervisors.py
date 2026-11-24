@@ -7,7 +7,8 @@ from execution.game_api import AgentState, WaitAction
 from execution.executors import Executor
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_emote_bubble,
                                                  has_menu_cursor, has_modal_preview_box,
-                                                 has_top_dialogue_box, is_cutscene_frame_changing)
+                                                 has_top_dialogue_box, is_battle_screen,
+                                                 is_cutscene_frame_changing)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      cell_kinds, compress_path, edge_cells, edge_runs,
                                                      format_path_runs, parse_edge_direction, shortest_path,
@@ -970,6 +971,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         for step_idx in range(self.MAX_INTERRUPTION_CHAIN):
             if self._env_done() or self._battles_lost() or self._total_calls >= self._max_total_calls:
                 break
+            if self._agent_state() == AgentState.IN_MENU:
+                self._settle_menu_state()
             frame = self._current_frame()
             state = self._effective_state(frame)
             if state == AgentState.FREE_ROAM and combined is not None:
@@ -1050,8 +1053,33 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 post_motion_remaining = post_motion_ticks
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
+        if self._agent_state() == AgentState.IN_MENU and not self._env_done():
+            self._settle_menu_state(max_cutscene_ticks=max_cutscene_ticks, post_motion_ticks=post_motion_ticks)
         if self._agent_state() == AgentState.FREE_ROAM and not self._env_done():
             self._last_settled_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+
+    def _settle_menu_state(self, ticks: int = 1, max_cutscene_ticks: int = 24, post_motion_ticks: int = 4) -> None:
+        waited = 0
+        post_motion_remaining = 0
+        while (self._agent_state() == AgentState.IN_MENU
+               and not self._env_done()
+               and waited < max_cutscene_ticks):
+            before = self._current_frame()
+            if has_menu_cursor(before) or is_battle_screen(before) or has_top_dialogue_box(before):
+                break
+            if waited >= ticks and post_motion_remaining <= 0:
+                break
+            self._env.step_high_level_action(WaitAction)
+            waited += 1
+            if self._agent_state() != AgentState.IN_MENU or self._env_done():
+                break
+            after = self._current_frame()
+            if has_menu_cursor(after) or is_battle_screen(after) or has_top_dialogue_box(after):
+                break
+            if is_cutscene_frame_changing(before, after):
+                post_motion_remaining = post_motion_ticks
+            elif post_motion_remaining > 0:
+                post_motion_remaining -= 1
 
     @staticmethod
     def _dialogue_snippet(handled: Dict[str, Any], limit: int = 160) -> str:
