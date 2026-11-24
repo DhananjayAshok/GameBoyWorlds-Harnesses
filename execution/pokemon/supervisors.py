@@ -460,9 +460,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             lines.append("Blocked movement directions recorded in this area during this episode (do NOT repeat these from the same coordinate):")
             lines.extend(blocked_lines)
         lines += door_lines(gmap, local_kinds)
+        frontier_count = len(gmap.frontier())
         targets, _ = frontier_targets(gmap, local_kinds)
         if targets:
-            lines.append("Nearest unexplored map edges in this area (x = steps right, y = steps up from the player):")
+            lines.append(
+                f"Nearest unexplored map edges in this area ({frontier_count} reachable unexplored edge square(s) "
+                f"remaining in this area; x = steps right, y = steps up from the player):"
+            )
             for t in targets[:6]:
                 where = "on screen, reachable" if t["on_screen"] else "off screen"
                 if t.get("path_moves"):
@@ -472,6 +476,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 else:
                     route_note = where
                 lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({route_note})")
+        elif frontier_count == 0:
+            lines.append("All reachable map edges in this area have been explored (0 unexplored edge squares remaining).")
         hp_block = self._party_hp_block()
         if hp_block:
             lines.insert(1 if lines else 0, hp_block)
@@ -545,19 +551,62 @@ class PokemonPlayThroughSupervisor(Supervisor):
         entries = "\n".join(f"- {entry}" for entry in self.report.narrative)
         return PLAYTHROUGH_LOG_BLOCK.replace("[LOG]", entries)
 
-    def _fill_prompt(self, prompt: str) -> str:
+    def _current_local_kinds(self) -> Optional[Dict[Tuple[int, int], str]]:
+        if self._effective_state() == AgentState.FREE_ROAM and self._identified:
+            return cell_kinds(
+                self._identified,
+                getattr(self._env, "ledge_patterns", None),
+                getattr(self._env, "walk_patterns", None),
+                self._people_now(),
+                getattr(self._env, "left_ledge_patterns", None),
+                getattr(self._env, "blocked_cells", None),
+            )
+        return None
+
+    def _unfinished_room_exploration_note(
+        self,
+        text: str,
+        local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
+    ) -> Optional[str]:
+        if max(0, self._max_steps - self._calls) < 2:
+            return None
+        if self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue():
+            return None
+        gmap = self._global_map()
+        place = self._current_map_place()
+        if gmap is None or place is None:
+            return None
+        if not re.search(r"\bexplore\b", text or "", re.IGNORECASE):
+            return None
+        frontier_cells = gmap.frontier()
+        if not (1 <= len(frontier_cells) <= 16):
+            return None
+        targets, _ = frontier_targets(gmap, local_kinds)
+        if not targets:
+            return None
+        nearest = targets[0]
+        dist = nearest.get("path_steps") if nearest.get("path_steps") is not None else nearest.get("steps")
+        if dist is None or dist > 15:
+            return None
+        route_str = f"; mapped route ({nearest['path_steps']} moves): {nearest['path_moves']}" if nearest.get("path_moves") else ""
+        return (
+            f"{len(frontier_cells)} reachable unexplored edge square(s) still remain in this room "
+            f"(nearest at ({nearest['dx']}, {nearest['dy']}), {nearest['steps']} steps {nearest['sector']}{route_str}) "
+            f"— walk to reveal the remaining unexplored edge squares before finishing"
+        )
+
+    def _fill_prompt(
+        self,
+        prompt: str,
+        local_kinds_override: Optional[Dict[Tuple[int, int], str]] = None,
+    ) -> str:
         if self._screen_tiles is None:
             log_error("Supervisor prompt built before the screen was perceived.", self._parameters)
         guidance_block = PLAYTHROUGH_GUIDANCE_BLOCK.replace("[GUIDANCE]", self._guidance) if self._guidance else ""
         plan = "\n".join(f"{n + 1}. {subgoal}" for n, subgoal in enumerate(self.plan))
         raw_state = self._effective_state()
         state = raw_state.name.lower().replace("_", " ")
-        local_kinds = None
-        if raw_state == AgentState.FREE_ROAM and self._identified:
-            local_kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
-                                     getattr(self._env, "walk_patterns", None), self._people_now(),
-                                     getattr(self._env, "left_ledge_patterns", None),
-                                     getattr(self._env, "blocked_cells", None))
+        local_kinds = local_kinds_override if local_kinds_override is not None else self._current_local_kinds()
         return (prompt.replace("[GAME]", self._game)
                 .replace("[TASK]", self._task)
                 .replace("[GUIDANCE_BLOCK]", guidance_block)
@@ -765,6 +814,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         before = report.initial_state["core"]["current_frame"]
         after = report.final_state["core"]["current_frame"]
         after_state = self._effective_state(after, raw_state=report.final_state["pokemon_core"]["agent_state"])
+        after_kinds = None
         if after_state == AgentState.FREE_ROAM:
             self._tile_recognizer.record_tiles(after, self._episode_number)
             gmap = self._global_map()
@@ -803,7 +853,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         request_with_context = request
         if decision_reasoning:
             request_with_context = f"{request}\nWhy you chose that action: {decision_reasoning}"
-        prompt = (self._fill_prompt(PLAYTHROUGH_JUDGE_PROMPT)
+        prompt = (self._fill_prompt(PLAYTHROUGH_JUDGE_PROMPT, local_kinds_override=after_kinds)
                   .replace("[SUBGOAL_NUMBER]", str(subgoal_index + 1))
                   .replace("[SUBGOAL]", subgoal)
                   .replace("[REMAINING_SUBGOALS_BLOCK]", remaining_block)
@@ -823,6 +873,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
             complete = True
             replan_needed = False
         reached_index = (reached - 1) if (complete and reached is not None) else subgoal_index
+        if complete and reached_index >= len(self.plan) - 1:
+            unfinished_note = self._unfinished_room_exploration_note(subgoal, after_kinds)
+            if unfinished_note:
+                complete = False
+                replan_needed = False
+                summary = f"{summary} [Note: {unfinished_note}.]"
         return complete, summary, reached_index, replan_needed
 
     def _reconsider(self, subgoal: str, attempts: List[str], frame) -> Tuple[str, Optional[str], List[str]]:
@@ -839,10 +895,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _task_check(self, frame, *, can_continue: bool = True) -> Tuple[bool, str]:
         remaining_calls = max(0, self._max_steps - self._calls)
+        local_kinds = self._current_local_kinds()
+        unfinished_note = self._unfinished_room_exploration_note(self._task, local_kinds) if can_continue else None
         if can_continue and remaining_calls > 0:
+            extra = f" ({unfinished_note}.)" if unfinished_note else ""
             continuation_note = (
                 f"\nNote: A continuation replan is available ({remaining_calls} action call(s) remaining in this episode's budget) "
-                f"if the task needs further movement steps."
+                f"if the task needs further movement steps.{extra}"
             )
         else:
             continuation_note = (
@@ -853,7 +912,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
         prompt = self._fill_prompt(PLAYTHROUGH_TASK_CHECK_PROMPT).replace("[CONTINUATION_NOTE]", continuation_note)
         output = self._vlm_call("task_check", texts=prompt, images=[frame])
         summary = (parse_key_value(output, "Summary") or "").strip()
-        return bool(parse_yes_no(output, "Task complete")), summary
+        complete = bool(parse_yes_no(output, "Task complete"))
+        if complete and unfinished_note:
+            complete = False
+            summary = f"{summary} ({unfinished_note}.)"
+        return complete, summary
 
     def _clarify_target(self, target: str, candidates: Optional[str], frame) -> Optional[str]:
         prompt = (self._fill_prompt(PLAYTHROUGH_CLARIFY_TARGET_PROMPT)

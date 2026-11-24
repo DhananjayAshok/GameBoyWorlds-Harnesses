@@ -1487,6 +1487,18 @@ Location: <(x, y) or Not Found>
                         identified=live_identified2, global_map=getattr(self._env, "_map", None)
                     ):
                         self._record_empirical_block(direction)
+                    if scrolled_to_edge:
+                        state = self._settle_free_roam()
+                        if self._last_terminated:
+                            return self._fail(MOVE_TERMINATED, "terminated")
+                        if self._last_truncated:
+                            return self._fail(MOVE_TRUNCATED, "truncated")
+                        interrupted = self._check_post_settle_interruption(state, f"at {target} on the {direction} edge")
+                        if interrupted is not None:
+                            return interrupted
+                        self.report.termination_reason = "left_screen"
+                        self.report.notes = f"Walked to {target} at the {direction} edge (further movement {direction} blocked at {target})"
+                        return MOVE_OK
                     return self._fail(MOVE_BLOCKED, "move_blocked", f"Blocked at {target} moving {direction}")
             else:
                 if scrolled_to_edge:

@@ -41,10 +41,18 @@ def explore_elsewhere(gmap: GlobalMap) -> List[Dict[str, Any]]:
 def explore_text(gmap: GlobalMap) -> str:
     here, lines = gmap.area_label(gmap.segment), []
     edge = len(gmap.frontier())
-    if edge:
-        lines.append(f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''}.")
     doors = gmap.reachable_door_list()
     unentered = sum(door["leads_to"] is None for door in doors)
+    if edge:
+        if unentered == 0 and len(doors) <= 1 and edge <= 16:
+            lines.append(
+                f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''} "
+                f"(no unentered doors/stairs in this room — finish revealing these remaining {edge} edge "
+                f"square{'s' if edge != 1 else ''} before leaving through the exit door/stairs so this branch "
+                f"is marked as a fully explored dead-end branch with 0 unexplored edges)."
+            )
+        else:
+            lines.append(f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''}.")
     if unentered:
         lines.append(f"- {here}, where you are: {unentered} door(s) or stairs not entered yet.")
     for door in doors:
@@ -121,6 +129,18 @@ def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
             lines.append(f"- ({t['dx']}, {t['dy']}): {t['steps']} steps {t['sector']} ({route_note})")
         lines.append("Most unexplored edge lies: " +
                      ", ".join(f"{s} ({n} squares)" for s, n in mass.most_common(3)) + ".")
+        doors_here = gmap.reachable_door_list()
+        unentered_here = sum(d["leads_to"] is None for d in doors_here)
+        edge_here = len(gmap.frontier())
+        nearest_dist = targets[0].get("path_steps") if targets[0].get("path_steps") is not None else targets[0].get("steps")
+        if unentered_here == 0 and len(doors_here) <= 1 and 1 <= edge_here <= 16 and nearest_dist is not None and nearest_dist <= 15:
+            lines.append(
+                f"Important: Only {edge_here} reachable unexplored edge square{'s' if edge_here != 1 else ''} remain in this room "
+                f"(nearest at ({targets[0]['dx']}, {targets[0]['dy']}), {targets[0]['steps']} steps {targets[0]['sector']}) "
+                f"and there are no other unentered doors or stairs here. Before leaving this room through the exit door/stairs, "
+                f"finish revealing those remaining unexplored edge squares (or reveal them first and then take the exit door/stairs) "
+                f"so this room reaches 0 unexplored edge squares and is permanently marked as a fully explored dead-end branch."
+            )
     else:
         lines.append("Every reachable edge of this area has been explored; the way on is a door, "
                      "stairs or a path you have not tried.")
