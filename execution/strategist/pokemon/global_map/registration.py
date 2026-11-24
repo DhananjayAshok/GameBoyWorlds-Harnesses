@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 
+from execution.perception.pokemon.battle import BANNER_TOP, has_bottom_location_banner
 from execution.perception.pokemon.grid import GRID_SKIP, LEFT_COL, TOP_ROW
 
 if TYPE_CHECKING:
@@ -144,14 +145,17 @@ def structure_diff(before_edges: np.ndarray, after_edges: np.ndarray, sx: int, s
 def register(before: np.ndarray, after: np.ndarray, direction: Optional[str], max_steps: int,
              reported: Optional[int] = None, residual: Cell = (0, 0)
              ) -> Optional[Tuple[Cell, Cell, bool]]:
+    a, b = _screen(before), _screen(after)
+    if has_bottom_location_banner(a) or has_bottom_location_banner(b):
+        a, b = a[:BANNER_TOP], b[:BANNER_TOP]
     # pixel matching first; edge matching is the fallback that survives palette changes
     for structural in (False, True):
-        placed = _register(before, after, direction, max_steps, reported, residual, structural=structural)
+        placed = _register(a, b, direction, max_steps, reported, residual, structural=structural)
         if placed is not None:
             ux, uy = SCREEN_UNIT.get(direction, (0, 0))
             return (ux * placed[0], -uy * placed[0]), placed[1], structural
         if not structural and direction not in SCREEN_UNIT:
-            scripted = _register_scripted(before, after, residual)
+            scripted = _register_scripted(a, b, residual)
             if scripted is not None:
                 return scripted[0], scripted[1], False
     return None

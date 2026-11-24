@@ -8,8 +8,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 
 from execution.artifact import StrategistArtifact, update
-from execution.perception.matching import cell_key, split_quarters
-from execution.perception.pokemon.battle import has_bottom_dialogue_box, has_modal_preview_box, is_battle_screen
+from execution.perception.matching import cell_key, shade_bank, shade_candidates, split_quarters
+from execution.perception.pokemon.battle import (
+    BANNER_TOP,
+    has_bottom_dialogue_box,
+    has_bottom_location_banner,
+    has_modal_preview_box,
+    is_battle_screen,
+)
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import (LEDGE_LEFT, LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
@@ -61,7 +67,7 @@ DISTINCTIVE_MAX_COPIES = 2
 # Two ends of door links this close (in squares, either way) count as the same door.
 DOOR_REACH = 1
 # A non-door warp endpoint snaps to a unique nearby door component within this radius.
-DOOR_SNAP_REACH = 3
+DOOR_SNAP_REACH = 4
 # Re-localisation onto a known warp destination accepts this overall fraction when the core around the door matches.
 RELOCALISE_WARP_MIN_FRACTION = 0.6
 RELOCALISE_WARP_CORE_RADIUS = 2
@@ -91,7 +97,67 @@ RENAME_GROWTH_PIXELS = 2 * 90 * 16 * 16
 
 def is_door(c: "MapCell") -> bool:
     tags = set(c.tags)
-    return bool(tags & DOOR_TAGS) and "obstacle" not in tags
+    if not (tags & DOOR_TAGS) or "obstacle" in tags:
+        return False
+    if tags == {"staircase"} and c.pixels is not None and c.pixels.size == GRID_SKIP * GRID_SKIP:
+        p = np.squeeze(c.pixels)
+        if int((p <= BLACK_LEVEL).sum()) >= 110 and float((p == p[:, ::-1]).mean()) < 0.45 and float((p == p[::-1, :]).mean()) < 0.45:
+            return False
+    return True
+
+
+def _quarter_rank_signature(pixels: Optional[np.ndarray]) -> Optional[Tuple[bytes, ...]]:
+    if pixels is None or pixels.size != GRID_SKIP * GRID_SKIP:
+        return None
+    p = np.squeeze(pixels)
+    if int(p.min()) == int(p.max()):
+        return None
+    sigs = []
+    for q in QUARTERS:
+        qp = split_quarters(p)[q].reshape(-1)
+        u, idx = np.unique(qp, return_inverse=True)
+        if len(u) == 1:
+            sigs.append(b"D" if int(u[0]) <= BLACK_LEVEL else b"L")
+        else:
+            sigs.append(bytes([len(u)]) + idx.astype(np.uint8).tobytes())
+    return tuple(sigs)
+
+
+def _quarter_recolour_matches(
+    h1: Optional[str], h2: Optional[str], p1: Optional[np.ndarray], p2: Optional[np.ndarray]
+) -> bool:
+    if h1 is not None and h1 == h2:
+        return True
+    if p1 is None or p2 is None:
+        return False
+    a, b = np.asarray(p1).reshape(-1), np.asarray(p2).reshape(-1)
+    u1, idx1 = np.unique(a, return_inverse=True)
+    u2, idx2 = np.unique(b, return_inverse=True)
+    if len(u1) == 1 and len(u2) == 1:
+        return (int(u1[0]) <= BLACK_LEVEL) == (int(u2[0]) <= BLACK_LEVEL)
+    if len(u1) < 2 or len(u2) < 2:
+        return False
+    if len(u1) == len(u2) and np.array_equal(idx1, idx2):
+        return True
+    bank = shade_bank([p2])
+    return len(shade_candidates(bank, p1, min_shades=2, ordered=True)) > 0
+
+
+def _cells_match(
+    hashes1: Tuple[Optional[str], ...],
+    pixels1: Optional[np.ndarray],
+    cell2: "MapCell",
+) -> bool:
+    if cell2.hashes == hashes1:
+        return True
+    if pixels1 is None or cell2.pixels is None:
+        return False
+    q1 = split_quarters(pixels1)
+    q2 = split_quarters(cell2.pixels)
+    return all(
+        _quarter_recolour_matches(hashes1[i], cell2.hashes[i], q1[q], q2[q])
+        for i, q in enumerate(QUARTERS)
+    )
 
 
 def classify(tags: Iterable[str]) -> str:
@@ -456,7 +522,7 @@ class GlobalMap(StrategistArtifact):
             info = self.info(si)
             reach = self.reachable_cells(si)
             unentered = sum(1 for d in self.reachable_door_list(si, reach) if d["leads_to"] is None)
-            done = bool(reach) and not self.frontier(si) and unentered == 0
+            done = bool(reach) and not self.frontier(si, reachable=reach) and unentered == 0
             if done and info.explored is None:
                 info.explored = episode
                 self.stats["segments_explored"] += 1
@@ -1158,12 +1224,21 @@ class GlobalMap(StrategistArtifact):
 
         seg_src, seg_dst = self.segments[source], self.segments[target]
         src, dst = content(seg_src), content(seg_dst)
-        index: Dict[Tuple[Optional[str], ...], List[Cell]] = defaultdict(list)
+        index: Dict[Tuple[Any, ...], List[Cell]] = defaultdict(list)
         for g, c in dst.items():
             index[c.hashes].append(g)
+            rank_sig = _quarter_rank_signature(c.pixels)
+            if rank_sig is not None:
+                index[rank_sig].append(g)
         block_index = self._block_index(dst)
         src_hashes = {g: c.hashes for g, c in src.items()}
         votes = self._collect_offset_votes(src_hashes, index, block_index)
+        src_rank = {g: s for g, c in src.items() if (s := _quarter_rank_signature(c.pixels)) is not None}
+        if src_rank:
+            rank_votes = self._collect_offset_votes(src_rank, index, {})
+            for off, cnt in rank_votes.items():
+                if cnt > votes[off]:
+                    votes[off] = cnt
         if not votes:
             return None
 
@@ -1179,7 +1254,7 @@ class GlobalMap(StrategistArtifact):
                 if u_src and u_dst:
                     continue
                 total += 1
-                if not u_src and not u_dst and c.hashes == c_dst.hashes:
+                if not u_src and not u_dst and _cells_match(c.hashes, c.pixels, c_dst):
                     matches += 1
             return matches, total
 
@@ -1201,6 +1276,15 @@ class GlobalMap(StrategistArtifact):
                      judge: Optional[Callable[[int, int, Dict[str, Any]], Optional[bool]]]) -> bool:
         if not self.names_differ(source, target):
             return True
+        if overlap.get("matches", 0) >= 60 and overlap.get("agreement", 0.0) >= 0.9:
+            def base_name(name: Optional[str]) -> Optional[str]:
+                if not name:
+                    return None
+                cleaned = re.sub(r"\([^)]*\)", " ", name.lower())
+                return " ".join(re.sub(r"[^\w\s]", " ", cleaned).split())
+            na, nb = base_name(self.info(source).name), base_name(self.info(target).name)
+            if na and nb and (na == nb or na in nb or nb in na):
+                return True
         key = (min(source, target), max(source, target))
         verdict = self.merge_verdicts.get(key)
         if verdict is not None and overlap["matches"] < MERGE_REJUDGE_GROWTH * verdict["matches"]:
@@ -1258,11 +1342,12 @@ class GlobalMap(StrategistArtifact):
                     ):
                         continue
                     shared += 1
-                    if c.hashes == cd.hashes:
+                    matched = _cells_match(c.hashes, c.pixels, cd)
+                    if matched:
                         matches += 1
                     if max(abs(x - src_entry[0]), abs(y - src_entry[1])) <= RELOCALISE_WARP_CORE_RADIUS:
                         core_shared += 1
-                        if c.hashes == cd.hashes:
+                        if matched:
                             core_matches += 1
                 if (
                     shared >= CONSOLIDATE_MIN_CELLS
@@ -1387,10 +1472,13 @@ class GlobalMap(StrategistArtifact):
                    allowed: Optional[Callable[[int, Cell], bool]] = None,
                    warp_targets: Optional[set] = None) -> Optional[Tuple[int, Cell]]:
         a = _screen(frame)
+        masked_cells = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
         local: Dict[Cell, Tuple[Optional[str], ...]] = {}
+        local_pixels: Dict[Cell, np.ndarray] = {}
+        local_ranks: Dict[Cell, Tuple[bytes, ...]] = {}
         blank_local: List[Cell] = []
         for (x, y), piece in _local_cells(a, shift):
-            if (x, y) == (0, 0):
+            if (x, y) == (0, 0) or (x, y) in masked_cells:
                 continue
             # blank cells match everywhere, so they do not vote
             if int(piece.min()) == int(piece.max()):
@@ -1398,6 +1486,10 @@ class GlobalMap(StrategistArtifact):
                 continue
             quarters = split_quarters(piece)
             local[(x, y)] = self._cell_hashes(quarters)
+            local_pixels[(x, y)] = piece
+            rank_sig = _quarter_rank_signature(piece)
+            if rank_sig is not None:
+                local_ranks[(x, y)] = rank_sig
         core_local = {
             k: v for k, v in local.items()
             if max(abs(k[0]), abs(k[1])) <= RELOCALISE_WARP_CORE_RADIUS
@@ -1410,18 +1502,35 @@ class GlobalMap(StrategistArtifact):
         for si, seg in enumerate(self.segments):
             if si == exclude or not seg:
                 continue
-            index: Dict[Tuple[Optional[str], ...], List[Cell]] = defaultdict(list)
+            index: Dict[Tuple[Any, ...], List[Cell]] = defaultdict(list)
             for g, c in seg.items():
                 if c.kind != OCCUPIED:
                     index[c.hashes].append(g)
+                    rank_sig = _quarter_rank_signature(c.pixels)
+                    if rank_sig is not None:
+                        index[rank_sig].append(g)
             block_index = self._block_index(seg)
             votes = self._collect_offset_votes(local, index, block_index)
+            if local_ranks:
+                rank_votes = self._collect_offset_votes(local_ranks, index, {})
+                for off, cnt in rank_votes.items():
+                    if cnt > votes[off]:
+                        votes[off] = cnt
+            seg_warps = [wp for w_si, wp in (warp_targets or ()) if w_si == si]
+            for wp in seg_warps:
+                if wp not in votes:
+                    votes[wp] = 1
             if not votes:
                 continue
-            ranked = sorted((self._screen_agreement(seg, local, o, blank_local), o)
-                            for o, _ in votes.most_common(RELOCALISE_CANDIDATES))[::-1]
+            cand_offsets = [o for o, _ in votes.most_common(RELOCALISE_CANDIDATES)]
+            for wp in seg_warps:
+                if wp not in cand_offsets:
+                    cand_offsets.append(wp)
+            ranked = sorted(
+                (self._screen_agreement(seg, local, o, blank_local, local_pixels), o)
+                for o in cand_offsets
+            )[::-1]
             close = [(o, overlap) for (m, overlap), o in ranked if m >= RELOCALISE_CLOSE_CALL * ranked[0][0][0]]
-            seg_warps = [wp for w_si, wp in (warp_targets or ()) if w_si == si]
             if len(close) > 1 and seg_warps:
                 warp_close = [
                     (o, overlap) for o, overlap in close
@@ -1429,7 +1538,7 @@ class GlobalMap(StrategistArtifact):
                 ]
                 if len(warp_close) == 1:
                     w_off, w_ov = warp_close[0]
-                    cm, cov = self._screen_agreement(seg, core_local, w_off, core_blank)
+                    cm, cov = self._screen_agreement(seg, core_local, w_off, core_blank, local_pixels)
                     if cov > 0 and cm >= RELOCALISE_MIN_FRACTION * cov:
                         close = warp_close
             if len(close) > 1:
@@ -1442,12 +1551,12 @@ class GlobalMap(StrategistArtifact):
                     continue
                 close = [(distinctive[0][1], distinctive[0][2])]
             offset, overlap = close[0]
-            n = self._screen_agreement(seg, local, offset, blank_local)[0]
+            n = self._screen_agreement(seg, local, offset, blank_local, local_pixels)[0]
             # a small room shows few content cells: ask for most of them rather than the fixed minimum
             needed = min(RELOCALISE_MIN_CELLS, max(10, int(0.6 * len(local))))
             min_fraction = RELOCALISE_MIN_FRACTION
             if seg_warps and any(max(abs(offset[0] - wp[0]), abs(offset[1] - wp[1])) <= DOOR_REACH for wp in seg_warps):
-                cm, cov = self._screen_agreement(seg, core_local, offset, core_blank)
+                cm, cov = self._screen_agreement(seg, core_local, offset, core_blank, local_pixels)
                 if cov > 0 and cm >= RELOCALISE_MIN_FRACTION * cov:
                     min_fraction = RELOCALISE_WARP_MIN_FRACTION
             if n >= needed and n >= min_fraction * overlap:
@@ -1462,9 +1571,13 @@ class GlobalMap(StrategistArtifact):
 
     @staticmethod
     def _screen_agreement(seg: Dict[Cell, MapCell], local: Dict[Cell, Tuple[Optional[str], ...]],
-                          offset: Cell, blank_local: Iterable[Cell] = ()) -> Tuple[int, int]:
-        placed = [(seg.get((offset[0] + x, offset[1] + y)), h) for (x, y), h in local.items()]
-        placed = [(c, h) for c, h in placed if c is not None and c.kind != OCCUPIED]
+                          offset: Cell, blank_local: Iterable[Cell] = (),
+                          local_pixels: Optional[Dict[Cell, np.ndarray]] = None) -> Tuple[int, int]:
+        placed = [
+            (seg.get((offset[0] + x, offset[1] + y)), h, (local_pixels or {}).get((x, y)))
+            for (x, y), h in local.items()
+        ]
+        placed = [(c, h, p) for c, h, p in placed if c is not None and c.kind != OCCUPIED]
         blank_disagreements = sum(
             1 for (x, y) in blank_local
             if (c := seg.get((offset[0] + x, offset[1] + y))) is not None
@@ -1472,7 +1585,7 @@ class GlobalMap(StrategistArtifact):
             and c.pixels is not None
             and int(c.pixels.min()) != int(c.pixels.max())
         )
-        return sum(1 for c, h in placed if c.hashes == h), len(placed) + blank_disagreements
+        return sum(1 for c, h, p in placed if _cells_match(h, p, c)), len(placed) + blank_disagreements
 
     @staticmethod
     def _distinctive_matches(seg: Dict[Cell, MapCell], index: Dict[Tuple[Optional[str], ...], List[Cell]],
@@ -1622,6 +1735,21 @@ class GlobalMap(StrategistArtifact):
             after_moves.append(m)
             before_warps.append((t, a, pa, b, pb))
 
+        def coupled_same(other1: int, q1: Cell, other2: int, q2: Cell) -> bool:
+            if other1 == other2:
+                return self._same_door(other1, q1, q2)
+            ov = self.overlap(other1, other2)
+            if (
+                ov is not None
+                and ov["matches"] >= CONSOLIDATE_MIN_CELLS
+                and ov["agreement"] >= CONSOLIDATE_MIN_AGREEMENT
+            ):
+                dq1 = self._door_at(other1, q1)
+                trans_q1 = (dq1[0] + ov["offset"][0], dq1[1] + ov["offset"][1])
+                if self._same_door(other2, trans_q1, q2):
+                    return True
+            return False
+
         before_conflicts, ends = 0, []
         for _, a, pa, b, pb in before_warps:
             if a == b:
@@ -1633,10 +1761,23 @@ class GlobalMap(StrategistArtifact):
                 s == s2
                 and self._same_door(s, p, p2)
                 and {other, other2} != {source, target}
-                and (other != other2 or not self._same_door(other, q, q2))
+                and not coupled_same(other, q, other2, q2)
                 for s2, p2, other2, q2 in ends[i + 1:]
             )
-        return self.door_conflicts(after, after_moves, self._same_door) > before_conflicts
+        after_conflicts, after_ends = 0, []
+        for _, a, pa, b, pb in after:
+            if a == b:
+                after_conflicts += 1
+                continue
+            after_ends += [(a, pa, b, pb), (b, pb, a, pa)]
+        for i, (s, p, other, q) in enumerate(after_ends):
+            after_conflicts += any(
+                s == s2
+                and self._same_door(s, p, p2)
+                and not coupled_same(other, q, other2, q2)
+                for s2, p2, other2, q2 in after_ends[i + 1:]
+            )
+        return after_conflicts > before_conflicts
 
     def arrival_breaks_doors(self, segment: int, pos: Cell) -> bool:
         if not self.faded:
@@ -1719,7 +1860,7 @@ class GlobalMap(StrategistArtifact):
             quarter_images: Dict[Cell, Dict[str, Optional[np.ndarray]]] = {}
             for g, c in seg.items():
                 tiles = [tile_lookup.get(h) for h in c.hashes]
-                if any(t is not None for t in tiles):
+                if all(t is not None for t in tiles) or ("unknown" in c.tags and any(t is not None for t in tiles)):
                     raw_qtags = {
                         q: (
                             normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None))
@@ -1828,6 +1969,17 @@ class GlobalMap(StrategistArtifact):
                 continue
             labels[(ra, self._door_at(ra, rpa))] = rb
             labels[(rb, self._door_at(rb, rpb))] = ra
+        for i in range(len(self.trail) - 1):
+            _, s1, p1 = self.trail[i]
+            _, s2, p2 = self.trail[i + 1]
+            rs1, rp1 = self.resolve(s1, p1)
+            rs2, rp2 = self.resolve(s2, p2)
+            if rs1 == rs2 and self.info(rs1).kind != OUTDOORS and abs(rp1[0] - rp2[0]) + abs(rp1[1] - rp2[1]) > MAX_STEP_FILL:
+                seg = self.segments[rs1] if 0 <= rs1 < len(self.segments) else {}
+                d1, d2 = self._door_at(rs1, rp1), self._door_at(rs1, rp2)
+                if d1 != d2 and d1 in seg and d2 in seg and is_door(seg[d1]) and is_door(seg[d2]):
+                    labels.setdefault((rs1, d1), rs1)
+                    labels.setdefault((rs1, d2), rs1)
         return labels
 
     def area_label(self, segment: int) -> str:
@@ -2047,8 +2199,6 @@ class GlobalMap(StrategistArtifact):
         door: Dict[str, Any],
         reachable: Optional[set] = None,
     ) -> bool:
-        from collections import deque
-
         if door.get("leads_to") is not None:
             return True
         seg = self.segments[segment] if 0 <= segment < len(self.segments) else {}
@@ -2060,31 +2210,6 @@ class GlobalMap(StrategistArtifact):
         for c in door["cells"]:
             if c in reach or any((c[0] + dx, c[1] + dy) in reach for dx, dy in DIRECTIONS.values()):
                 return True
-        xs = [g[0] for g in seg]
-        ys = [g[1] for g in seg]
-        x_min, x_max = min(xs) - 4, max(xs) + 4
-        y_min, y_max = min(ys) - 4, max(ys) + 4
-        targets = set(door["cells"]) | {
-            (c[0] + dx, c[1] + dy)
-            for c in door["cells"]
-            for dx, dy in DIRECTIONS.values()
-            if seg.get((c[0] + dx, c[1] + dy)) is None
-            or seg[(c[0] + dx, c[1] + dy)].kind in (WALKABLE, UNKNOWN, OCCUPIED)
-        }
-        visited = set(reach)
-        queue = deque(reach)
-        while queue:
-            cur = queue.popleft()
-            if cur in targets:
-                return True
-            for dx, dy in DIRECTIONS.values():
-                nxt = (cur[0] + dx, cur[1] + dy)
-                if nxt in visited or not (x_min <= nxt[0] <= x_max and y_min <= nxt[1] <= y_max):
-                    continue
-                mc = seg.get(nxt)
-                if mc is None or mc.kind in (WALKABLE, UNKNOWN, OCCUPIED) or is_door(mc):
-                    visited.add(nxt)
-                    queue.append(nxt)
         return False
 
     def reachable_door_list(
@@ -2135,10 +2260,34 @@ class GlobalMap(StrategistArtifact):
         if not seg:
             return []
         reach = self.reachable_cells(si) if reachable is None else reachable
+        void_cols = {
+            g[0]
+            for g, mc in seg.items()
+            if mc.pixels is not None and int(mc.pixels.max()) <= BLACK_LEVEL and int(mc.pixels.min()) == int(mc.pixels.max())
+        }
+        void_rows = {
+            g[1]
+            for g, mc in seg.items()
+            if mc.pixels is not None and int(mc.pixels.max()) <= BLACK_LEVEL and int(mc.pixels.min()) == int(mc.pixels.max())
+        }
+        has_void = bool(void_cols)
+        visits = self.visits[si] if si < len(self.visits) else Counter()
         out = []
         for g, c in seg.items():
             if c.kind != WALKABLE or (reach and g not in reach):
                 continue
-            if any((g[0] + dx, g[1] + dy) not in seg for dx, dy in DIRECTIONS.values()):
+            has_open_unmapped = False
+            for dx, dy in DIRECTIONS.values():
+                u = (g[0] + dx, g[1] + dy)
+                if u in seg:
+                    continue
+                if has_void and visits.get(g, 0) == 0:
+                    if dx != 0 and (g[0] in void_cols or u[0] in void_cols):
+                        continue
+                    if dy != 0 and (g[1] in void_rows or u[1] in void_rows):
+                        continue
+                has_open_unmapped = True
+                break
+            if has_open_unmapped:
                 out.append(g)
         return out

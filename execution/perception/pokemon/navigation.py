@@ -65,7 +65,7 @@ def is_top_overhang_floor_cell(
         return False
     bottom_tags = {cell_q["bottom_left"], cell_q["bottom_right"]}
     top_tags = {cell_q["top_left"], cell_q["top_right"]}
-    if not (bottom_tags <= WALKABLE_TAGS) or (top_tags <= WALKABLE_TAGS):
+    if not (bottom_tags <= WALKABLE_TAGS) or (top_tags <= WALKABLE_TAGS) or bool(bottom_tags & (WARP_TAGS | {"elevator"})):
         return False
     if not (top_tags <= WALKABLE_TAGS | FURNITURE_OVERHANG_TOP_TAGS):
         return False
