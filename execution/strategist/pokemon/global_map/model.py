@@ -272,16 +272,33 @@ class GlobalMap(StrategistArtifact):
 
     def _heal_visited_ground(self, si: int) -> int:
         seg = self.segments[si] if 0 <= si < len(self.segments) else None
-        if not seg or self.info(si).kind != OUTDOORS or si >= len(self.visits) or not self.visits[si]:
+        if not seg or si >= len(self.visits) or not self.visits[si]:
             return 0
         seg_blocked = self.blocked_cells[si] if si < len(self.blocked_cells) else set()
+        restored = 0
+        for g, cnt in self.visits[si].items():
+            if cnt <= 0:
+                continue
+            seg_blocked.discard(g)
+            c = seg.get(g)
+            if (
+                c is not None
+                and c.kind == BLOCKED
+                and not is_door(c)
+                and "ground" in c.tags
+                and not (set(c.tags) & {"sign", "interactable object", "pc", "water", "ledge", "right_ledge", "left_ledge"})
+            ):
+                c.kind = WALKABLE
+                c.tags = ("ground",)
+                restored += 1
+        if self.info(si).kind != OUTDOORS:
+            return restored
         seen_box = {
             (vx + lx, vy + ly)
             for (vx, vy) in self.visits[si]
             for lx in range(-4, 6)
             for ly in range(-4, 5)
         }
-        restored = 0
         for _ in range(2):
             added_pass = 0
             for g in sorted(seen_box):
@@ -535,7 +552,7 @@ class GlobalMap(StrategistArtifact):
         a = _screen(frame)
         px, py = self.pos
         added = 0
-        if has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
+        if shift != (0, 0) or has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
             self.visits[self.segment][self.pos] += 1
             self.trail.append((self.step, self.segment, self.pos))
             return 0
@@ -659,8 +676,16 @@ class GlobalMap(StrategistArtifact):
                 if can_learn_walkable and old.kind == BLOCKED:
                     self._learn_walkable(old)
                 continue
-            if (x, y) == (0, 1) and old.kind == WALKABLE and kind != OCCUPIED:
+            if (x, y) == (0, 1) and old.kind == WALKABLE and kind == WALKABLE:
                 # keep clean ground hashes/pixels at (0, 1) rather than overwriting with the player's cap overhang
+                continue
+            if (
+                old.kind == WALKABLE
+                and not is_door(old)
+                and self.visits[self.segment].get(g, 0) > 0
+                and kind == BLOCKED
+                and not bool(set(tags) & DOOR_TAGS)
+            ):
                 continue
             old.kind, old.tags, old.hashes, old.pixels = kind, tags, hashes, pixels
         self.visits[self.segment][self.pos] += 1
@@ -731,7 +756,16 @@ class GlobalMap(StrategistArtifact):
                         c_mid = self.segments[self.segment].get(mid)
                         if c_mid is None or c_mid.kind not in (BLOCKED, LEDGE, LEDGE_LEFT):
                             self.visits[self.segment][mid] += 1
+            was_off_grid = self.residual != (0, 0) or residual != (0, 0)
+            if residual != (0, 0) and not structural and grid_offset(frame) == (0, 0):
+                residual = (0, 0)
+                shift = (0, 0)
             self.pos, self.residual = pos, residual
+            if not structural and self.residual == (0, 0):
+                snapped = self._snap_within_segment(frame, identified, was_off_grid=was_off_grid)
+                if snapped is not None and snapped != self.pos:
+                    self.pos = snapped
+                    delta = (self.pos[0] - prev_pos[0], self.pos[1] - prev_pos[1])
             placed_steps = abs(delta[0]) + abs(delta[1])
             if structural and direction in DIRECTIONS and reported is not None and placed_steps < reported:
                 rem_reported = reported - placed_steps
@@ -872,6 +906,133 @@ class GlobalMap(StrategistArtifact):
                 and all(entry["segment"] != left for entry in self.naming_queue)):
             self.naming_queue.append({"segment": left, "exit": dep, "step": self.step, "marker": None,
                                       "reason": "door"})
+
+    def _snap_within_segment(
+        self,
+        frame: np.ndarray,
+        identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+        was_off_grid: bool = False,
+    ) -> Optional[Cell]:
+        if not (0 <= self.segment < len(self.segments)):
+            return None
+        seg = self.segments[self.segment]
+        if not seg or self.pos is None or has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
+            return None
+        a = _screen(frame)
+        masked_cells = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)}
+        local: Dict[Cell, Tuple[Optional[str], ...]] = {}
+        local_pixels: Dict[Cell, np.ndarray] = {}
+        blank_local: List[Cell] = []
+        for (x, y), piece in _local_cells(a, (0, 0)):
+            if (x, y) == (0, 0) or (x, y) in masked_cells:
+                continue
+            if int(piece.min()) == int(piece.max()):
+                blank_local.append((x, y))
+                continue
+            local[(x, y)] = self._cell_hashes(split_quarters(piece))
+            local_pixels[(x, y)] = piece
+        if len(local) < 20:
+            return None
+        live_kinds: Dict[Cell, str] = {}
+        if identified:
+            for (x, y), h in local.items():
+                qtags = {
+                    normalize_tabletop_tag(
+                        identified[(x, y, q)].tag,
+                        identified[(x, y, q)].description,
+                        getattr(identified[(x, y, q)], "image", None),
+                    )
+                    for q in QUARTERS
+                    if (x, y, q) in identified
+                }
+                if qtags:
+                    live_kinds[(x, y)] = self._classify(qtags, h)
+        visits = self.visits[self.segment] if self.segment < len(self.visits) else Counter()
+        px, py = self.pos
+        scores: Dict[Cell, Dict[str, Any]] = {}
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                if abs(dx) + abs(dy) > 2:
+                    continue
+                cand = (px + dx, py + dy)
+                if (dx, dy) != (0, 0) and self._blacks_out(frame, self.segment, cand, (0, 0)):
+                    continue
+                m, ov = self._screen_agreement(seg, local, cand, blank_local, local_pixels)
+                vis_match = vis_total = 0
+                lm_match = lm_mismatch = 0
+                vis_blk = vis_wlk = 0
+                for (lx, ly), h in local.items():
+                    g = (cand[0] + lx, cand[1] + ly)
+                    v = visits.get(g, 0)
+                    if v > 0 and (lx, ly) in live_kinds:
+                        lk = live_kinds[(lx, ly)]
+                        if lk == BLOCKED:
+                            vis_blk += 1
+                        elif lk == WALKABLE:
+                            vis_wlk += 1
+                    c = seg.get(g)
+                    if c is None or c.kind == OCCUPIED:
+                        continue
+                    matched = _cells_match(h, local_pixels.get((lx, ly)), c)
+                    if v > 0:
+                        vis_total += 1
+                        if matched:
+                            vis_match += 1
+                    if is_door(c) or "sign" in c.tags:
+                        if matched:
+                            lm_match += 1
+                        else:
+                            lm_mismatch += 1
+                scores[(dx, dy)] = {
+                    "pos": cand,
+                    "m": m,
+                    "ov": ov,
+                    "frac": m / ov if ov else 0.0,
+                    "vis_match": vis_match,
+                    "vis_total": vis_total,
+                    "lm_match": lm_match,
+                    "lm_mismatch": lm_mismatch,
+                    "vis_blk": vis_blk,
+                    "vis_wlk": vis_wlk,
+                }
+        s0 = scores.get((0, 0))
+        if s0 is None:
+            return None
+        cands = []
+        for d, sc in scores.items():
+            if d == (0, 0) or sc["ov"] < 20:
+                continue
+            dist = abs(d[0]) + abs(d[1])
+            qualifies = False
+            if sc["frac"] >= 0.85 and (
+                sc["frac"] - s0["frac"] >= 0.08
+                or (sc["lm_match"] > s0["lm_match"] and sc["lm_mismatch"] < s0["lm_mismatch"] and sc["frac"] - s0["frac"] >= 0.04)
+                or (sc["vis_total"] >= 4 and sc["vis_match"] == sc["vis_total"] and s0["vis_match"] < s0["vis_total"] and sc["frac"] - s0["frac"] >= 0.05)
+            ):
+                qualifies = True
+            elif (
+                was_off_grid
+                and dist == 1
+                and sc["frac"] - s0["frac"] >= 0.08
+                and sc["vis_total"] >= 3
+                and sc["vis_match"] == sc["vis_total"]
+                and s0["vis_match"] < s0["vis_total"]
+            ):
+                qualifies = True
+            elif (
+                dist == 1
+                and s0["vis_blk"] >= 3
+                and sc["vis_blk"] == 0
+                and sc["vis_wlk"] > s0["vis_wlk"]
+            ):
+                qualifies = True
+            if qualifies:
+                cands.append(((sc["frac"], -sc["vis_blk"], sc["vis_wlk"], sc["m"], -dist), sc["pos"]))
+        if not cands:
+            return None
+        cands.sort(reverse=True)
+        self.stats["within_segment_snaps"] += 1
+        return cands[0][1]
 
     def _blacks_out(self, frame: np.ndarray, segment: int, pos: Cell, shift: Cell = (0, 0)) -> bool:
         seg = self.segments[segment]
@@ -1946,6 +2107,18 @@ class GlobalMap(StrategistArtifact):
                         seg_blocked.discard(g)
                     elif new_kind == WALKABLE and not bool(set(new_tags) & DOOR_TAGS):
                         new_kind = BLOCKED
+                if (
+                    si < len(self.visits)
+                    and self.visits[si].get(g, 0) > 0
+                    and new_kind == BLOCKED
+                    and not is_door(c)
+                    and not bool(set(new_tags) & DOOR_TAGS)
+                    and (c.kind == WALKABLE or "ground" in c.tags or "ground" in new_tags)
+                    and not (set(new_tags) & {"sign", "interactable object", "pc", "water", "ledge", "right_ledge", "left_ledge"})
+                ):
+                    new_kind = WALKABLE
+                    if "obstacle" in new_tags:
+                        new_tags = tuple(t for t in new_tags if t != "obstacle") or ("ground",)
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1

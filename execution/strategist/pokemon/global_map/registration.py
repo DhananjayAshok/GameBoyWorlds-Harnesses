@@ -206,6 +206,8 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
         # s = 16 k + (residual_after - residual_before) along the axis, |residual| <= PX_SLACK
         along_before = residual[0] * ux + residual[1] * uy
         k = int(round((s + along_before) / GRID_SKIP))
+        if abs(s + along_before - GRID_SKIP * k) > PX_SLACK:
+            continue
         if k not in best_by_k or diff < best_by_k[k][0]:
             best_by_k[k] = (diff, s)
     if not best_by_k:
@@ -224,8 +226,11 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
                 k_best = reported
                 s = best_by_k[k_best][1]
             elif reported is None and max_steps == 1 and 0 in tied:
-                k_best = 0
-                s = best_by_k[0][1]
+                if best_by_k[0][0] <= diff + 0.002:
+                    k_best = 0
+                    s = best_by_k[0][1]
+                elif not set(tied) <= {0, 1}:
+                    return None
             else:
                 return None
     along_after = s + (residual[0] * ux + residual[1] * uy) - GRID_SKIP * k_best
