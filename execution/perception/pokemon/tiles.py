@@ -96,7 +96,7 @@ ITEM_BALL_DESC_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SPECKLED_GROUND_OBSTACLE_DESC_PATTERN = re.compile(
-    r"\b(?:rocky|cave|cliff|plateau|stone|ground|floor)\b",
+    r"\b(?:rocky|cave|cliff|plateau|stone|ground|floor|indoor|interior|wall|brick|mat|tile|tiled)\b",
     re.IGNORECASE,
 )
 ROCKY_PLATEAU_TOP_EDGE_DESC_PATTERN = re.compile(
@@ -129,14 +129,20 @@ def is_speckled_ground_quarter(
     if len(vals) < 3:
         return False
     min_s, max_s = int(arr.min()), int(arr.max())
-    if min_s < 60 or (max_s - min_s) > 64:
+    if min_s < 60 or (max_s - min_s) > 72:
         return False
     dom = float(counts.max()) / arr.size
-    if not (0.55 <= dom <= 0.85):
+    if not (0.50 <= dom <= 0.85):
         return False
     row_means = [float(arr[r, :].mean()) for r in range(8)]
     col_means = [float(arr[:, c].mean()) for c in range(8)]
-    return (max(row_means) - min(row_means)) <= 24.0 and (max(col_means) - min(col_means)) <= 24.0
+    row_span = max(row_means) - min(row_means)
+    col_span = max(col_means) - min(col_means)
+    if row_span <= 24.0 and col_span <= 24.0:
+        return True
+    if len(vals) == 3 and int(counts[0]) <= 10 and (int(counts[1]) + int(counts[2])) >= 54:
+        return row_span <= 42.0 and col_span <= 42.0
+    return False
 
 
 def is_rocky_plateau_top_edge_quarter(
