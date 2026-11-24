@@ -1472,10 +1472,10 @@ BATTLE_ACTION_FAILED = -3
 BATTLE_OUT_OF_STEPS = -4
 
 BATTLE_EXIT_SETTLE_WAIT = 4
-MAX_TURN_PROGRESS_STEPS = 30
+MAX_TURN_PROGRESS_STEPS = 45
 MAX_BATTLE_DIALOGUE_STEPS = 90
 MAX_IDLE_PROGRESS_STEPS = 6
-MAX_IDLE_INTRO_STEPS = 6
+MAX_IDLE_INTRO_STEPS = 12
 MAX_IDLE_BATTLE_DIALOGUE_STEPS = 30
 MAX_STAT_DISMISS_STEPS = 4
 BATTLE_OPTIONS = ("fight", "bag", "pokemon", "run", "progress")
@@ -1698,7 +1698,11 @@ Press: <one of up, down, left, right, confirm, back>
             if state == AgentState.IN_MENU:
                 if self._non_battle_menu_outcome(frame) is not None or self._has_battle_menu_cursor(frame):
                     break
-                in_battle_intro = is_battle_screen(frame) or is_party_menu_screen(frame)
+                in_battle_intro = (
+                    is_battle_screen(frame)
+                    or is_party_menu_screen(frame)
+                    or (has_bottom_dialogue_box(frame) and not self._has_battle_menu_cursor(frame))
+                )
                 if not in_battle_intro and consecutive_dismisses >= MAX_STAT_DISMISS_STEPS:
                     break
                 extra = self._take_action(MenuAction, menu_action="confirm")
@@ -1710,7 +1714,7 @@ Press: <one of up, down, left, right, confirm, back>
                 else:
                     stat_dismisses += 1
                     consecutive_dismisses += 1
-                if extra.action_success == -1 and self._agent_state() == AgentState.IN_MENU:
+                if not in_battle_intro and extra.action_success == -1 and self._agent_state() == AgentState.IN_MENU:
                     break
                 if is_same_battle_frame(extra.frame_before, extra.frame_after):
                     idle_steps += 1
@@ -1972,8 +1976,23 @@ Press: <one of up, down, left, right, confirm, back>
                         continue
                     frame = self._current_frame()
                     menu_exit = self._non_battle_menu_outcome(frame)
-                    if menu_exit is not None or (not self._saw_battle_state and not is_battle_screen(frame)):
+                    if menu_exit is not None or (
+                        not self._saw_battle_state
+                        and not is_battle_screen(frame)
+                        and not has_bottom_dialogue_box(frame)
+                    ):
                         return self._record_outcome(menu_exit or AgentState.IN_MENU)
+                    if not self._has_battle_menu_cursor(frame):
+                        progressed = any(
+                            not is_same_battle_frame(r.frame_before, r.frame_after) for r in turn_records
+                        )
+                        if not progressed:
+                            wait_rec = self._take_action(WaitAction)
+                            if self._last_terminated:
+                                return self._fail(BATTLE_TERMINATED, "terminated")
+                            if self._last_truncated:
+                                return self._fail(BATTLE_TRUNCATED, "truncated")
+                        continue
 
                 if is_empty_battle_bag_menu(frame):
                     self._ensure_scripted("close empty battle bag menu")
