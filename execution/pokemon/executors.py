@@ -329,15 +329,21 @@ class InteractionExecutor(PolicyExecutor):
             return 0
         after_place = self._current_map_place()
         taken = 0
+        dx, dy = DIRECTIONS[direction]
         if before_place is not None and after_place is not None:
             if before_place[0] != after_place[0]:
                 taken = 1
             else:
-                dx, dy = DIRECTIONS[direction]
                 step_dx = after_place[1][0] - before_place[1][0]
                 step_dy = after_place[1][1] - before_place[1][1]
                 if step_dx * dx + step_dy * dy > 0:
                     taken = 1
+        if taken == 0 and rec.frame_before is not None and rec.frame_after is not None:
+            from execution.strategist.pokemon.global_map.registration import register
+
+            placed = register(rec.frame_before, rec.frame_after, direction, 1)
+            if placed is not None and (placed[0][0] * dx + placed[0][1] * dy) > 0:
+                taken = 1
         return taken
 
     def _align_to_target(self, target_cell: Tuple[int, int], records: List[EnvironmentStepRecord]) -> Optional[str]:
@@ -765,17 +771,24 @@ class GridMoveExecutor(PolicyExecutor):
             return self._fail(MOVE_TRUNCATED, "truncated")
         after_place = self._current_map_place()
         taken = 0
+        dx, dy = DIRECTIONS[direction]
         if before_place is not None and after_place is not None:
             if before_place[0] != after_place[0]:
                 taken = 1
             else:
-                dx, dy = DIRECTIONS[direction]
                 step_dx = after_place[1][0] - before_place[1][0]
                 step_dy = after_place[1][1] - before_place[1][1]
                 along = step_dx * dx + step_dy * dy
                 if along > 0:
                     taken = 1
                     self._displacement = (self._displacement[0] + dx, self._displacement[1] + dy)
+        if taken == 0 and record.frame_before is not None and record.frame_after is not None:
+            from execution.strategist.pokemon.global_map.registration import register
+
+            placed = register(record.frame_before, record.frame_after, direction, 1)
+            if placed is not None and (placed[0][0] * dx + placed[0][1] * dy) > 0:
+                taken = 1
+                self._displacement = (self._displacement[0] + dx, self._displacement[1] + dy)
         self._steps_taken += taken
         self._last_step_taken += taken
         state = self._get_state()["pokemon_core"]["agent_state"]
@@ -814,7 +827,12 @@ class GridMoveExecutor(PolicyExecutor):
             self._steps_taken += taken
             self._last_step_taken += taken
             after_place = self._current_map_place()
-            if before_place is not None and after_place is not None and before_place[0] == after_place[0]:
+            if (
+                before_place is not None
+                and after_place is not None
+                and before_place[0] == after_place[0]
+                and (after_place[1] != before_place[1] or taken == 0)
+            ):
                 step_dx = after_place[1][0] - before_place[1][0]
                 step_dy = after_place[1][1] - before_place[1][1]
             else:
@@ -1448,7 +1466,7 @@ Location: <(x, y) or Not Found>
         target_run = next((r for r in initial_edge_runs if target in r), [target])
         self.target_cell = target
         initial_frame = self._get_state()["core"]["current_frame"]
-        code = self._walk({target: None}, prefer_lateral=not (abs(target[0]) >= 4 and abs(target[1]) == 4))
+        code = self._walk({target: None}, prefer_lateral=True)
         if code is not None:
             return code
         after_walk_frame = self._get_state()["core"]["current_frame"]

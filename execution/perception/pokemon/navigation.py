@@ -540,20 +540,21 @@ def shortest_path(
     dir_rank = {d: i for i, d in enumerate(direction_order)}
     avoid_set = (set(avoid_cells) - goal_set - {start}) if avoid_cells else set()
     los_set = set(trainer_los_cells(kinds, people)) if people else set()
-    best: Dict[Cell, Tuple[int, int, int, int]] = {start: (0, 0, 0, 0)}
-    previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
+    best: Dict[Tuple[Cell, Optional[str]], Tuple[int, int, int, int, int, int]] = {(start, None): (0, 0, 0, 0, 0, 0)}
+    previous: Dict[Tuple[Cell, Optional[str]], Optional[Tuple[Tuple[Cell, Optional[str]], str, str]]] = {(start, None): None}
     counter = 0
-    heap: List[Tuple[int, int, int, int, int, int, Cell]] = [(0, 0, 0, 0, 0, 0, start)]
+    heap: List[Tuple[int, int, int, int, int, int, int, Cell, Optional[str]]] = [(0, 0, 0, 0, 0, 0, 0, start, None)]
     while heap:
-        jumps, avoids, los_hits, steps, first_rank, _, cell = heapq.heappop(heap)
-        if (jumps, avoids, los_hits, steps) > best.get(cell, (jumps + 1, 0, 0, 0)):
+        jumps, avoids, los_hits, steps, turns, first_rank, _, cell, prev_dir = heapq.heappop(heap)
+        state = (cell, prev_dir)
+        if (jumps, avoids, los_hits, steps, turns, first_rank) > best.get(state, (jumps + 1, 0, 0, 0, 0, 0)):
             continue
         if cell in goal_set:
             path = []
-            cur = cell
+            cur = state
             while previous[cur] is not None:
                 parent, d, m = previous[cur]
-                path.append((d, m, cur))
+                path.append((d, m, cur[0]))
                 cur = parent
             return path[::-1]
         for direction, nxt in neighbours(cell, direction_order):
@@ -575,13 +576,15 @@ def shortest_path(
             n_avoids = avoids + step_avoid
             n_los = los_hits + (1 if landing in los_set else 0)
             n_steps = steps + 1
-            cost = (n_jumps, n_avoids, n_los, n_steps)
-            if cost < best.get(landing, (n_jumps + 1, 0, 0, 0)):
-                best[landing] = cost
-                previous[landing] = (cell, direction, move)
+            n_turns = turns + (1 if (prev_dir is not None and direction != prev_dir) else 0)
+            rank = dir_rank[direction] if cell == start else first_rank
+            cost = (n_jumps, n_avoids, n_los, n_steps, n_turns, rank)
+            next_state = (landing, direction)
+            if cost < best.get(next_state, (n_jumps + 1, 0, 0, 0, 0, 0)):
+                best[next_state] = cost
+                previous[next_state] = (state, direction, move)
                 counter += 1
-                rank = dir_rank[direction] if cell == start else first_rank
-                heapq.heappush(heap, (n_jumps, n_avoids, n_los, n_steps, rank, counter, landing))
+                heapq.heappush(heap, (n_jumps, n_avoids, n_los, n_steps, n_turns, rank, counter, landing, direction))
     return None
 
 
@@ -1179,7 +1182,7 @@ def verbalize_edges(
                     kinds,
                     (0, 0),
                     [target],
-                    prefer_lateral=not (abs(target[0]) >= 4 and abs(target[1]) == 4),
+                    prefer_lateral=True,
                     avoid_cells=warps,
                     people=people,
                 )

@@ -384,7 +384,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         kinds,
                         (0, 0),
                         [target],
-                        prefer_lateral=not (abs(target[0]) >= 4 and abs(target[1]) == 4),
+                        prefer_lateral=True,
                         avoid_cells=warps,
                         people=people,
                     )
