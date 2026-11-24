@@ -2260,16 +2260,30 @@ class GlobalMap(StrategistArtifact):
         if not seg:
             return []
         reach = self.reachable_cells(si) if reachable is None else reachable
-        void_cols = {
-            g[0]
-            for g, mc in seg.items()
-            if mc.pixels is not None and int(mc.pixels.max()) <= BLACK_LEVEL and int(mc.pixels.min()) == int(mc.pixels.max())
-        }
-        void_rows = {
-            g[1]
-            for g, mc in seg.items()
-            if mc.pixels is not None and int(mc.pixels.max()) <= BLACK_LEVEL and int(mc.pixels.min()) == int(mc.pixels.max())
-        }
+        info = self.info(si)
+        check_void = info.kind not in (OUTDOORS, CAVE)
+        void_cols = (
+            {
+                g[0]
+                for g, mc in seg.items()
+                if mc.pixels is not None
+                and int(mc.pixels.max()) <= BLACK_LEVEL
+                and int(mc.pixels.min()) == int(mc.pixels.max())
+            }
+            if check_void
+            else set()
+        )
+        void_rows = (
+            {
+                g[1]
+                for g, mc in seg.items()
+                if mc.pixels is not None
+                and int(mc.pixels.max()) <= BLACK_LEVEL
+                and int(mc.pixels.min()) == int(mc.pixels.max())
+            }
+            if check_void
+            else set()
+        )
         has_void = bool(void_cols)
         visits = self.visits[si] if si < len(self.visits) else Counter()
         out = []
