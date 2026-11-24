@@ -165,7 +165,9 @@ def has_bottom_dialogue_box(frame: np.ndarray) -> bool:
     return True
 
 
-def is_cutscene_frame_changing(earlier: np.ndarray, later: np.ndarray) -> bool:
+def is_cutscene_frame_changing(
+    earlier: np.ndarray, later: np.ndarray, ignore_player_box: bool = False
+) -> bool:
     """Return True if sprite movement, emote animation, or box transitions changed between frames."""
     if earlier is None or later is None or earlier.shape != later.shape:
         return False
@@ -175,6 +177,8 @@ def is_cutscene_frame_changing(earlier: np.ndarray, later: np.ndarray) -> bool:
     b = _grey_frame(later).astype(int)
     diff = np.abs(a - b) > CUTSCENE_DIFF_THRESHOLD
     diff[88:, 104:] = False
+    if ignore_player_box:
+        diff[56:80, 64:80] = False
     raw_sum = int(diff.sum())
     if raw_sum < CUTSCENE_DIFF_MIN_PIXELS:
         return False
@@ -189,9 +193,13 @@ def is_cutscene_frame_changing(earlier: np.ndarray, later: np.ndarray) -> bool:
             diff_l = np.ones_like(diff)
             diff_l[:, d:] = np.abs(b[:, d:] - a[:, :-d]) > CUTSCENE_DIFF_THRESHOLD
             diff_l[88:, 104:] = False
+            if ignore_player_box:
+                diff_l[56:80, 64:80] = False
             diff_r = np.ones_like(diff)
             diff_r[:, :-d] = np.abs(b[:, :-d] - a[:, d:]) > CUTSCENE_DIFF_THRESHOLD
             diff_r[88:, 104:] = False
+            if ignore_player_box:
+                diff_r[56:80, 64:80] = False
             tl = diff_l[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             tr = diff_r[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             t_min = np.minimum(t_min, np.minimum(tl, tr))
@@ -199,12 +207,33 @@ def is_cutscene_frame_changing(earlier: np.ndarray, later: np.ndarray) -> bool:
             diff_u = np.ones_like(diff)
             diff_u[d:, :] = np.abs(b[d:, :] - a[:-d, :]) > CUTSCENE_DIFF_THRESHOLD
             diff_u[88:, 104:] = False
+            if ignore_player_box:
+                diff_u[56:80, 64:80] = False
             diff_d = np.ones_like(diff)
             diff_d[:-d, :] = np.abs(b[:-d, :] - a[d:, :]) > CUTSCENE_DIFF_THRESHOLD
             diff_d[88:, 104:] = False
+            if ignore_player_box:
+                diff_d[56:80, 64:80] = False
             tu = diff_u[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             td = diff_d[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             t_min = np.minimum(t_min, np.minimum(tu, td))
+    a_tiles = a[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).swapaxes(1, 2)
+    b_tiles = b[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).swapaxes(1, 2)
+    pair_counts = {}
+    pair_keys = {}
+    for iy in range(ty):
+        for ix in range(tx):
+            if t_min[iy, ix] < CUTSCENE_TILE_MIN_PIXELS:
+                continue
+            bt = b_tiles[iy, ix]
+            if int(bt.min()) == int(bt.max()):
+                continue
+            key = (a_tiles[iy, ix].tobytes(), bt.tobytes())
+            pair_keys[(iy, ix)] = key
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+    for (iy, ix), key in pair_keys.items():
+        if pair_counts[key] >= 2:
+            t_min[iy, ix] = 0
     return int(t_min[t_min >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_DIFF_MIN_PIXELS
 
 

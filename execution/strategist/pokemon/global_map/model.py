@@ -331,6 +331,15 @@ class GlobalMap(StrategistArtifact):
         c = seg.get(target)
         if c is not None and (is_door(c) or c.kind in (LEDGE, LEDGE_LEFT)):
             return None
+        if (
+            c is not None
+            and c.hashes
+            and len(c.hashes) == 4
+            and len(set(c.hashes)) == 1
+            and c.hashes[0] is not None
+            and c.hashes in self.walk_patterns
+        ):
+            return None
         self.blocked_cells[self.segment].add(target)
         if c is not None and c.kind == WALKABLE:
             c.kind = BLOCKED
@@ -554,7 +563,7 @@ class GlobalMap(StrategistArtifact):
             if (x, y) == (0, 0) or self.visits[self.segment].get(g, 0) > 0:
                 seg_blocked.discard(g)
             elif g in seg_blocked and kind == WALKABLE and not bool(set(tags) & DOOR_TAGS):
-                if can_learn_walkable and None not in hashes and hashes in self.walk_patterns:
+                if (can_learn_walkable or len(set(hashes)) == 1) and None not in hashes and hashes in self.walk_patterns:
                     seg_blocked.discard(g)
                 else:
                     kind = BLOCKED
@@ -1747,8 +1756,20 @@ class GlobalMap(StrategistArtifact):
                 else:
                     new_tags = tuple(sorted(set(quarter_tags[g].values())))
                     new_kind = self._classify(new_tags, c.hashes)
-                if g in seg_blocked and new_kind == WALKABLE and not bool(set(new_tags) & DOOR_TAGS):
-                    new_kind = BLOCKED
+                if g in seg_blocked:
+                    if (
+                        (si < len(self.visits) and self.visits[si].get(g, 0) > 0)
+                        or (
+                            c.hashes
+                            and len(c.hashes) == 4
+                            and len(set(c.hashes)) == 1
+                            and c.hashes[0] is not None
+                            and c.hashes in self.walk_patterns
+                        )
+                    ):
+                        seg_blocked.discard(g)
+                    elif new_kind == WALKABLE and not bool(set(new_tags) & DOOR_TAGS):
+                        new_kind = BLOCKED
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1

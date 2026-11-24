@@ -2816,6 +2816,7 @@ Press: <one of a, b, start, up, down, left, right>
         self._zero_disp_at_place: Dict[Any, List[str]] = {}
         self._repeated_blocked_presses: int = 0
         self._no_displacement_directional_presses: int = 0
+        self._last_was_turn_at_place: bool = False
         self.termination = (termination or "").strip() or self.DEFAULT_TERMINATION
         super().__init__(env, task, max_steps, termination=self.termination, **kwargs)
 
@@ -2894,7 +2895,17 @@ Press: <one of a, b, start, up, down, left, right>
                 except Exception:  # noqa: BLE001
                     pass
 
+    @staticmethod
+    def _player_sprite_turned(frame_before: Optional[np.ndarray], frame_after: Optional[np.ndarray]) -> bool:
+        if frame_before is None or frame_after is None or frame_before.shape != frame_after.shape:
+            return False
+        a = (frame_before[:, :, 0] if frame_before.ndim == 3 else frame_before)[64:80, 64:80].astype(int)
+        b = (frame_after[:, :, 0] if frame_after.ndim == 3 else frame_after)[64:80, 64:80].astype(int)
+        return int((np.abs(a - b) > 40).sum()) >= 20
+
     def _step_press(self, press: str) -> bool:
+        from execution.strategist.pokemon.global_map.registration import register
+
         state = self._agent_state()
         if press in ("a", "b") and (state == AgentState.IN_DIALOGUE
                                     or (state == AgentState.IN_MENU and self._is_top_box_dialogue())):
@@ -2915,53 +2926,88 @@ Press: <one of a, b, start, up, down, left, right>
         if self._last_terminated or self._last_truncated:
             self.press_outcomes.append(press)
             return True
-        after_place = self._current_map_place() if before_place is not None else None
-        still_free = (
-            self._agent_state() == AgentState.FREE_ROAM
-            and not has_bottom_dialogue_box(self._current_frame())
-            and not self._is_top_box_dialogue()
-        )
-        outcome_label = press
-        if before_place is not None and after_place is not None and after_place != before_place:
-            self._repeated_blocked_presses = 0
-            self._no_displacement_directional_presses = 0
-            outcome_label = f"{press} (moved {before_place[1]} -> {after_place[1]})"
-        elif before_place is not None and still_free and after_place == before_place:
-            self._no_displacement_directional_presses += 1
-            zero_list = self._zero_disp_at_place.setdefault(before_place, [])
-            is_known_blocked = (
-                (self.presses and self.presses[-1] == press)
-                or was_facing == press
-                or press in zero_list
-            )
-            if press not in zero_list:
-                zero_list.append(press)
-            if is_known_blocked:
-                self._record_blocked_direction(before_place, press)
-                outcome_label = f"{press} (blocked at {before_place[1]}, 0 steps)"
-            else:
-                outcome_label = f"{press} (0 steps at {before_place[1]} — turned or blocked)"
-        self.press_outcomes.append(outcome_label)
+        scrolled_on_screen = False
+        if (
+            before_place is not None
+            and press in DIRECTIONS
+            and record.frame_before is not None
+            and record.frame_after is not None
+        ):
+            step_reg = register(record.frame_before, record.frame_after, press, 1)
+            scrolled_on_screen = step_reg is not None and step_reg[0] != (0, 0)
+        mid_place = self._current_map_place() if before_place is not None else None
+        displaced = (before_place is not None and mid_place is not None and mid_place != before_place) or scrolled_on_screen
         if self._agent_state() == AgentState.FREE_ROAM:
             if press in ("a", "b"):
                 self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
             elif press in DIRECTIONS:
                 passed = record.transition_states[-1]["core"].get("transition_passed_frames") if record.transition_states else None
-                faded = passed is not None and any(
-                    is_cutscene_frame_changing(record.frame_before, f) for f in passed
+                box_or_emote = (
+                    has_bottom_dialogue_box(record.frame_after)
+                    or self._is_top_box_dialogue(record.frame_after)
+                    or has_emote_bubble(record.frame_after)
                 )
-                if (faded
-                        or is_cutscene_frame_changing(record.frame_before, record.frame_after)
-                        or has_bottom_dialogue_box(record.frame_after)
-                        or self._is_top_box_dialogue(record.frame_after)):
-                    if (before_place is None
-                            or after_place is None
-                            or after_place == before_place
-                            or has_bottom_dialogue_box(record.frame_after)
-                            or self._is_top_box_dialogue(record.frame_after)):
-                        self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
+                cutscene_changed = not displaced and (
+                    (
+                        passed is not None
+                        and any(
+                            is_cutscene_frame_changing(record.frame_before, f, ignore_player_box=True) for f in passed
+                        )
+                    )
+                    or is_cutscene_frame_changing(record.frame_before, record.frame_after, ignore_player_box=True)
+                )
+                if box_or_emote or cutscene_changed:
+                    self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
         elif self._agent_state() == AgentState.IN_MENU:
             self._settle_state()
+        if self._last_terminated or self._last_truncated:
+            self.press_outcomes.append(press)
+            return True
+        after_place = self._current_map_place() if before_place is not None else None
+        cur_frame = self._current_frame()
+        still_free = (
+            self._agent_state() == AgentState.FREE_ROAM
+            and not has_bottom_dialogue_box(cur_frame)
+            and not self._is_top_box_dialogue(cur_frame)
+            and not is_battle_screen(cur_frame)
+        )
+        outcome_label = press
+        if before_place is not None and after_place is not None and after_place != before_place:
+            self._repeated_blocked_presses = 0
+            self._no_displacement_directional_presses = 0
+            self._last_was_turn_at_place = False
+            outcome_label = f"{press} (moved {before_place[1]} -> {after_place[1]})"
+        elif before_place is not None and scrolled_on_screen:
+            self._repeated_blocked_presses = 0
+            self._no_displacement_directional_presses = 0
+            self._last_was_turn_at_place = False
+            dx, dy = DIRECTIONS[press]
+            est_after = (before_place[1][0] + dx, before_place[1][1] + dy)
+            outcome_label = f"{press} (moved {before_place[1]} -> {est_after})"
+        elif before_place is not None and still_free and after_place == before_place:
+            zero_list = self._zero_disp_at_place.setdefault(before_place, [])
+            blocked_here = self._blocked_at_place.get(before_place, [])
+            sprite_turned = self._player_sprite_turned(record.frame_before, record.frame_after)
+            is_known_blocked = (
+                (self.presses and self.presses[-1] == press)
+                or was_facing == press
+                or not sprite_turned
+                or press in blocked_here
+            )
+            already_tried = press in zero_list
+            if not already_tried:
+                zero_list.append(press)
+            if is_known_blocked:
+                self._no_displacement_directional_presses += 1
+                self._last_was_turn_at_place = False
+                self._record_blocked_direction(before_place, press)
+                outcome_label = f"{press} (blocked at {before_place[1]}, 0 steps)"
+            else:
+                if already_tried or self._last_was_turn_at_place:
+                    self._no_displacement_directional_presses += 1
+                self._last_was_turn_at_place = True
+                outcome_label = f"{press} (turned to face {press} at {before_place[1]} — press {press} again to step {press})"
+        self.press_outcomes.append(outcome_label)
         return True
 
     def _execute(self) -> int:
@@ -2999,6 +3045,9 @@ Press: <one of a, b, start, up, down, left, right>
                 return self._finish(FREE_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(FREE_TRUNCATED, "truncated")
+            after_frame = self._get_state()["core"]["current_frame"]
+            if self._effective_state(after_frame) == AgentState.IN_BATTLE or is_battle_screen(after_frame):
+                return self._finish(FREE_OK, "termination_met")
             if (
                 self._repeated_blocked_presses >= self.MAX_REPEATED_BLOCKED_PRESSES
                 or self._no_displacement_directional_presses >= self.MAX_NO_DISPLACEMENT_DIRECTIONAL_PRESSES

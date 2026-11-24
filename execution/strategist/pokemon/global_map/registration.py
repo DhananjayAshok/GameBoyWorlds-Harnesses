@@ -67,7 +67,9 @@ def _still_lit(piece: np.ndarray, prior: np.ndarray) -> np.ndarray:
     for qy in (0, half):
         for qx in (0, half):
             q = (slice(qy, qy + half), slice(qx, qx + half))
-            lit[q] = new[q].max() > BLACK_LEVEL or prior[q].max() <= BLACK_LEVEL
+            new_black = new[q].max() <= BLACK_LEVEL and new[q].min() == new[q].max()
+            prior_black = prior[q].max() <= BLACK_LEVEL and prior[q].min() == prior[q].max()
+            lit[q] = not new_black or prior_black
     return lit
 
 
