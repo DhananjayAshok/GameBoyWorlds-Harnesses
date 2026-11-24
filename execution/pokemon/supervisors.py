@@ -25,7 +25,8 @@ from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeE
 from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUGH_AFTER_BLOCK,
                                        PLAYTHROUGH_AREA_MAP_BLOCK, PLAYTHROUGH_ATTEMPTS_BLOCK,
                                        PLAYTHROUGH_BATTLE_INSTRUCTIONS_PROMPT, PLAYTHROUGH_BATTLE_TIPS_BLOCK,
-                                       PLAYTHROUGH_CLARIFY_TARGET_PROMPT, PLAYTHROUGH_GUIDANCE_BLOCK,
+                                       PLAYTHROUGH_CLARIFY_TARGET_PROMPT, PLAYTHROUGH_DECISION_RETRY_BLOCK,
+                                       PLAYTHROUGH_GUIDANCE_BLOCK,
                                        PLAYTHROUGH_JUDGE_PROMPT, PLAYTHROUGH_LOG_BLOCK,
                                        PLAYTHROUGH_MENU_OBJECTIVE_PROMPT, PLAYTHROUGH_PLAN_PROMPT,
                                        PLAYTHROUGH_REMAINING_SUBGOALS_BLOCK, PLAYTHROUGH_REMAINING_SUBGOALS_LINE,
@@ -731,6 +732,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             log_warn(f"Could not parse a plan from: {output!r}", self._parameters)
         return subgoals
 
+    MAX_DECISION_RETRY_CHARS = 1500
+
     def _decide(self, subgoal: str, attempts: List[str], frame) -> Tuple[Optional[Tuple[str, Optional[str]]], str]:
         attempts_block = ""
         if attempts:
@@ -741,6 +744,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                   .replace("[ATTEMPTS_BLOCK]", attempts_block))
         output = self._vlm_call("decision", texts=prompt, images=[frame])
         decision = parse_decision(output)
+        if decision is None:
+            retry_prompt = prompt + PLAYTHROUGH_DECISION_RETRY_BLOCK.replace(
+                "[PREVIOUS]", (output or "")[-self.MAX_DECISION_RETRY_CHARS:]
+            )
+            output = self._vlm_call("decision", texts=retry_prompt, images=[frame])
+            decision = parse_decision(output)
         if decision is None:
             log_warn(f"Could not parse a decision from: {output!r}", self._parameters)
         reasoning = (parse_key_value(output, "Reasoning") or "").strip()
