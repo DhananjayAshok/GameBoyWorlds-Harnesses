@@ -14,7 +14,8 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  has_top_dialogue_box,
                                                  is_battle_decision_screen,
                                                  is_battle_defeat_text, is_battle_menu_crop,
-                                                 is_battle_screen, is_cutscene_frame_changing,
+                                                 is_battle_screen, is_blank_or_fade_frame,
+                                                 is_cutscene_frame_changing,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
                                                  is_move_selection_screen, is_overworld_pack_menu,
                                                  is_pack_item_list_screen, is_pack_screen,
@@ -113,8 +114,9 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
 
 INTERACT_SETTLE_WAIT = 4
 INTERACT_POST_DIALOGUE_SETTLE_WAIT = 6
-INTERACT_MAX_CUTSCENE_WAIT = 24
+INTERACT_MAX_CUTSCENE_WAIT = 30
 INTERACT_POST_MOTION_WAIT = 4
+INTERACT_POST_WARP_BANNER_WAIT = 6
 INTERACT_MODAL_MAX_PRESSES = 8
 MAX_INTERACT_DIALOGUE_STEPS = 10
 
@@ -154,13 +156,17 @@ class InteractionExecutor(PolicyExecutor):
         state = self._agent_state()
         waited = 0
         post_motion_remaining = 0
+        saw_fade = False
         while (state == AgentState.FREE_ROAM
                and not (self._last_terminated or self._last_truncated)
                and waited < INTERACT_MAX_CUTSCENE_WAIT):
             frame = self._current_frame()
             if waited > 0 and (self._has_interaction_overlay(frame) or is_battle_screen(frame)):
                 break
-            emote_open = has_emote_bubble(frame)
+            fade_open = is_blank_or_fade_frame(frame)
+            if fade_open:
+                saw_fade = True
+            emote_open = has_emote_bubble(frame) or fade_open
             if waited >= settle_wait and not emote_open and post_motion_remaining <= 0:
                 break
             wait_record = self._take_action(WaitAction)
@@ -172,9 +178,16 @@ class InteractionExecutor(PolicyExecutor):
             if (self._has_interaction_overlay(wait_record.frame_after)
                     or is_battle_screen(wait_record.frame_after)):
                 break
+            fade_now = is_blank_or_fade_frame(wait_record.frame_before) or is_blank_or_fade_frame(wait_record.frame_after)
+            if fade_now:
+                saw_fade = True
             if (is_cutscene_frame_changing(wait_record.frame_before, wait_record.frame_after)
-                    or has_emote_bubble(wait_record.frame_after)):
-                post_motion_remaining = INTERACT_POST_MOTION_WAIT
+                    or has_emote_bubble(wait_record.frame_after)
+                    or fade_now):
+                if saw_fade and has_bottom_location_banner(wait_record.frame_after):
+                    post_motion_remaining = max(post_motion_remaining, INTERACT_POST_WARP_BANNER_WAIT)
+                else:
+                    post_motion_remaining = max(post_motion_remaining, INTERACT_POST_MOTION_WAIT)
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
         return state
@@ -228,6 +241,18 @@ class InteractionExecutor(PolicyExecutor):
                 state = self._wait_for_interaction(records, settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT)
         return state
 
+    def _settle_after_interaction_dialogue_step(self, records: List[EnvironmentStepRecord]) -> AgentState:
+        state = self._agent_state()
+        if state == AgentState.FREE_ROAM:
+            self._wait_for_interaction(records, settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT)
+            if self._agent_state() == AgentState.FREE_ROAM and self._has_interaction_overlay():
+                self._advance_interaction_overlay(records)
+            if self._agent_state() == AgentState.IN_MENU:
+                self._settle_interaction_menu_state(records)
+        elif state == AgentState.IN_MENU:
+            self._settle_interaction_menu_state(records)
+        return self._agent_state()
+
     def _clear_interaction_dialogue(self, records: List[EnvironmentStepRecord]) -> None:
         for _ in range(MAX_INTERACT_DIALOGUE_STEPS):
             if self._agent_state() != AgentState.IN_DIALOGUE or self._last_terminated or self._last_truncated:
@@ -236,19 +261,50 @@ class InteractionExecutor(PolicyExecutor):
             records.append(pass_record)
             if self._last_terminated or self._last_truncated:
                 break
-            if self._agent_state() == AgentState.FREE_ROAM:
-                self._wait_for_interaction(records, settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT)
-                if self._agent_state() == AgentState.FREE_ROAM and self._has_interaction_overlay():
-                    self._advance_interaction_overlay(records)
-                if self._agent_state() == AgentState.IN_MENU:
-                    self._settle_interaction_menu_state(records)
-                if self._agent_state() != AgentState.IN_DIALOGUE:
+            state = self._settle_after_interaction_dialogue_step(records)
+            if self._last_terminated or self._last_truncated or state != AgentState.IN_DIALOGUE:
+                break
+            if pass_record.action_success != -1:
+                continue
+            fanfare_progressed = False
+            for _ in range(DIALOGUE_FANFARE_RETRY_LIMIT):
+                before_btn = self._current_frame()
+                btn_record = self._take_action_string("button(a)")
+                if btn_record is None:
                     break
-            elif self._agent_state() == AgentState.IN_MENU:
-                self._settle_interaction_menu_state(records)
-                if self._agent_state() != AgentState.IN_DIALOGUE:
+                records.append(btn_record)
+                if self._last_terminated or self._last_truncated:
+                    fanfare_progressed = True
                     break
-            elif pass_record.action_success == -1:
+                state = self._settle_after_interaction_dialogue_step(records)
+                if self._last_terminated or self._last_truncated or state != AgentState.IN_DIALOGUE:
+                    fanfare_progressed = True
+                    break
+                if btn_record.frame_changed or is_cutscene_frame_changing(before_btn, self._current_frame()):
+                    for _ in range(DIALOGUE_BUTTON_SETTLE_WAIT):
+                        if self._agent_state() != AgentState.IN_DIALOGUE or self._last_terminated or self._last_truncated:
+                            break
+                        wait_record = self._take_action(WaitAction)
+                        records.append(wait_record)
+                    if self._last_terminated or self._last_truncated:
+                        fanfare_progressed = True
+                        break
+                    self._settle_after_interaction_dialogue_step(records)
+                    fanfare_progressed = True
+                    break
+                retry = self._take_action(PassDialogueAction)
+                records.append(retry)
+                if self._last_terminated or self._last_truncated:
+                    fanfare_progressed = True
+                    break
+                state = self._settle_after_interaction_dialogue_step(records)
+                if self._last_terminated or self._last_truncated or state != AgentState.IN_DIALOGUE:
+                    fanfare_progressed = True
+                    break
+                if retry.action_success != -1 or retry.frame_changed:
+                    fanfare_progressed = True
+                    break
+            if not fanfare_progressed:
                 break
 
     def _current_map_place(self) -> Optional[Tuple[int, Tuple[int, int]]]:
@@ -508,8 +564,9 @@ MOVE_INTERRUPTED = -7
 MOVE_OUT_OF_STEPS = -8
 LOCATION_FAIL_CODES = (MOVE_TARGET_NOT_FOUND, MOVE_TARGET_AMBIGUOUS, MOVE_BAD_LOCATION)
 MOVE_SETTLE_WAIT = 2
-MOVE_MAX_CUTSCENE_WAIT = 24
+MOVE_MAX_CUTSCENE_WAIT = 30
 MOVE_POST_MOTION_WAIT = 2
+MOVE_POST_WARP_BANNER_WAIT = 6
 
 GRID_DESCRIPTION = """The screen is a grid of cells. The player is at (0, 0). x increases to the right, from -4 at the left edge to 5 at the right edge. y increases upward, from 4 at the top edge to -4 at the bottom edge."""
 
@@ -605,11 +662,15 @@ class GridMoveExecutor(PolicyExecutor):
         self._saw_cutscene_activity = False
         waited = 0
         post_motion_remaining = 0
+        saw_fade = False
         while (state == AgentState.FREE_ROAM
                and not (self._last_terminated or self._last_truncated)
                and waited < MOVE_MAX_CUTSCENE_WAIT):
             frame = self._get_state()["core"]["current_frame"]
-            box_open = has_bottom_dialogue_box(frame) or has_emote_bubble(frame)
+            fade_open = is_blank_or_fade_frame(frame)
+            if fade_open:
+                saw_fade = True
+            box_open = has_bottom_dialogue_box(frame) or has_emote_bubble(frame) or fade_open
             if box_open:
                 self._saw_cutscene_activity = True
             if waited >= MOVE_SETTLE_WAIT and not box_open and post_motion_remaining <= 0:
@@ -620,11 +681,18 @@ class GridMoveExecutor(PolicyExecutor):
             state = self._get_state()["pokemon_core"]["agent_state"]
             if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
                 break
+            fade_now = is_blank_or_fade_frame(wait_record.frame_before) or is_blank_or_fade_frame(wait_record.frame_after)
+            if fade_now:
+                saw_fade = True
             if (is_cutscene_frame_changing(wait_record.frame_before, wait_record.frame_after)
                     or has_bottom_dialogue_box(wait_record.frame_after)
-                    or has_emote_bubble(wait_record.frame_after)):
+                    or has_emote_bubble(wait_record.frame_after)
+                    or fade_now):
                 self._saw_cutscene_activity = True
-                post_motion_remaining = MOVE_POST_MOTION_WAIT
+                if saw_fade and has_bottom_location_banner(wait_record.frame_after):
+                    post_motion_remaining = max(post_motion_remaining, MOVE_POST_WARP_BANNER_WAIT)
+                else:
+                    post_motion_remaining = max(post_motion_remaining, MOVE_POST_MOTION_WAIT)
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
         if state == AgentState.IN_MENU:
@@ -2544,11 +2612,13 @@ DIALOGUE_NOT_IN_DIALOGUE = -1
 DIALOGUE_STUCK = -2
 
 DIALOGUE_SETTLE_WAIT = 6
-DIALOGUE_MAX_CUTSCENE_WAIT = 24
+DIALOGUE_MAX_CUTSCENE_WAIT = 30
 DIALOGUE_POST_MOTION_WAIT = 4
+DIALOGUE_POST_WARP_BANNER_WAIT = 6
 DIALOGUE_FANFARE_RETRY_LIMIT = 4
 DIALOGUE_BUTTON_SETTLE_WAIT = 2
 DIALOGUE_TOP_BOX_PRESSES = 4
+DIALOGUE_TOP_BOX_SCROLL_WAITS = 3
 FREE_SETTLE_WAIT = 4
 MENU_SETTLE_WAIT = 1
 
@@ -2579,13 +2649,18 @@ class _DialogueSettlingExecutor(PolicyExecutor):
         state = self._agent_state()
         waited = 0
         post_motion_remaining = 0
+        saw_fade = False
         while (state == AgentState.FREE_ROAM
                and not (self._last_terminated or self._last_truncated)
                and waited < DIALOGUE_MAX_CUTSCENE_WAIT):
             frame = self._current_frame()
+            fade_open = is_blank_or_fade_frame(frame)
+            if fade_open:
+                saw_fade = True
             box_open = (has_bottom_dialogue_box(frame)
                         or self._is_top_box_dialogue(frame)
-                        or has_emote_bubble(frame))
+                        or has_emote_bubble(frame)
+                        or fade_open)
             if waited >= settle_wait and not box_open and post_motion_remaining <= 0:
                 break
             wait_record = self._take_action(WaitAction)
@@ -2594,11 +2669,18 @@ class _DialogueSettlingExecutor(PolicyExecutor):
             state = self._agent_state()
             if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
                 break
+            fade_now = is_blank_or_fade_frame(wait_record.frame_before) or is_blank_or_fade_frame(wait_record.frame_after)
+            if fade_now:
+                saw_fade = True
             if (is_cutscene_frame_changing(wait_record.frame_before, wait_record.frame_after)
                     or has_bottom_dialogue_box(wait_record.frame_after)
                     or self._is_top_box_dialogue(wait_record.frame_after)
-                    or has_emote_bubble(wait_record.frame_after)):
-                post_motion_remaining = DIALOGUE_POST_MOTION_WAIT
+                    or has_emote_bubble(wait_record.frame_after)
+                    or fade_now):
+                if saw_fade and has_bottom_location_banner(wait_record.frame_after):
+                    post_motion_remaining = max(post_motion_remaining, DIALOGUE_POST_WARP_BANNER_WAIT)
+                else:
+                    post_motion_remaining = max(post_motion_remaining, DIALOGUE_POST_MOTION_WAIT)
             elif post_motion_remaining > 0:
                 post_motion_remaining -= 1
         return state
@@ -2643,6 +2725,16 @@ class _DialogueSettlingExecutor(PolicyExecutor):
         if self._agent_state() == AgentState.IN_MENU and self._is_top_box_dialogue():
             menu_action = "back" if button == "b" else "confirm"
             progressed = False
+            if has_bottom_dialogue_box(self._current_frame()):
+                pass_rec = self._take_action(PassDialogueAction)
+                drop_prefix_crops(captured_dialogue_crops([pass_rec]), self.dialogue_crops)
+                if self._last_terminated or self._last_truncated:
+                    return True
+                if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
+                    self._settle_after_step()
+                    return True
+                if pass_rec.action_success != -1 or pass_rec.frame_changed:
+                    return True
             for _ in range(DIALOGUE_TOP_BOX_PRESSES):
                 record = self._take_action(MenuAction, menu_action=menu_action)
                 drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
@@ -2653,6 +2745,26 @@ class _DialogueSettlingExecutor(PolicyExecutor):
                 if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
                     self._settle_after_step()
                     return True
+                if has_bottom_dialogue_box(self._current_frame()) and (
+                    record.frame_changed or not is_same_battle_frame(record.frame_before, record.frame_after)
+                ):
+                    for _ in range(DIALOGUE_TOP_BOX_SCROLL_WAITS):
+                        if (self._agent_state() != AgentState.IN_MENU
+                                or not self._is_top_box_dialogue()
+                                or self._last_terminated
+                                or self._last_truncated):
+                            break
+                        wait_rec = self._take_action(WaitAction)
+                        drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                        if wait_rec.frame_changed:
+                            progressed = True
+                        if is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                            break
+                    if self._last_terminated or self._last_truncated:
+                        return True
+                    if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
+                        self._settle_after_step()
+                        return True
             return progressed
         if button != "b" and is_evolution_screen(self._current_frame()):
             progressed = False

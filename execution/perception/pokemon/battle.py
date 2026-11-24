@@ -143,6 +143,20 @@ CUTSCENE_DIFF_THRESHOLD = 40
 CUTSCENE_TILE_MIN_PIXELS = 10
 CUTSCENE_MAX_TILE_SHIFT = 2
 CUTSCENE_DIFF_MIN_PIXELS = 80
+CUTSCENE_PLAYER_SPIN_MIN_PIXELS = 40
+FADE_UPPER_BOTTOM = 88
+FADE_MAX_RANGE = 16
+
+
+def is_blank_or_fade_frame(frame: np.ndarray) -> bool:
+    """Return True if the upper overworld viewport is a uniform white, grey, or black fade/blank transition frame."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < FADE_UPPER_BOTTOM:
+        return False
+    upper = img[:FADE_UPPER_BOTTOM, :]
+    return int(upper.max()) - int(upper.min()) <= FADE_MAX_RANGE
 
 
 def has_bottom_dialogue_box(frame: np.ndarray) -> bool:
@@ -245,7 +259,13 @@ def is_cutscene_frame_changing(
     for (iy, ix), key in pair_keys.items():
         if pair_counts[key] >= 2:
             t_min[iy, ix] = 0
-    return int(t_min[t_min >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_DIFF_MIN_PIXELS
+    if int(t_min[t_min >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_DIFF_MIN_PIXELS:
+        return True
+    if not ignore_player_box:
+        player_tiles = t_min[7:10, 8:10]
+        if int(player_tiles[player_tiles >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_PLAYER_SPIN_MIN_PIXELS:
+            return True
+    return False
 
 
 BANNER_TOP = 112
