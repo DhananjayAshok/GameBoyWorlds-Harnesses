@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
-from .model import BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, OCCUPIED, UNKNOWN, WALKABLE
+from .model import BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, OCCUPIED, UNKNOWN, WALKABLE, is_door
 
 if TYPE_CHECKING:
     from .model import Cell, GlobalMap
@@ -80,6 +80,8 @@ def path_in_segment(gmap: GlobalMap, segment: int, start: Cell,
                 landing = seg.get(nxt)
                 if nxt != goal and nxt not in walked and (landing is None or landing.kind not in STEP_COSTS):
                     continue
+            elif is_door(c):
+                continue
             elif c.kind in STEP_COSTS:
                 step = STEP_COSTS[c.kind]
             else:

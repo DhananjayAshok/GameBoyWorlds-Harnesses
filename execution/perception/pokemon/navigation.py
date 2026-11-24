@@ -378,11 +378,33 @@ def cell_kinds(
             walk_patterns
             and pattern in walk_patterns
             and "npc" not in cell_tags
-            and bool(cell_tags & WALKABLE_TAGS)
+            and "unknown" not in cell_tags
+            and "water" not in cell_tags
+            and (
+                bool(cell_tags & WALKABLE_TAGS)
+                or (len(pattern) == 4 and len(set(pattern)) == 1 and pattern[0] is not None)
+            )
         ):
             kinds[cell] = WALKABLE
         else:
             kinds[cell] = BLOCKED
+    for cell, cell_q in quarter_tags.items():
+        if (
+            len(cell_q) == 4
+            and cell_q.get("top_left") == "entrance"
+            and cell_q.get("top_right") == "entrance"
+            and cell_q.get("bottom_left") != "entrance"
+            and cell_q.get("bottom_right") != "entrance"
+        ):
+            ext_hashes = {
+                hashes.get(cell, {}).get("bottom_left"),
+                hashes.get(cell, {}).get("bottom_right"),
+            } - {None}
+            if len(ext_hashes) == 1:
+                ext_h = next(iter(ext_hashes))
+                for nb in ((cell[0], cell[1] - 1), (cell[0] - 1, cell[1]), (cell[0] + 1, cell[1])):
+                    if nb != (0, 0) and tuple(hashes.get(nb, {}).get(q) for q in QUARTERS) == (ext_h,) * 4:
+                        kinds[nb] = BLOCKED
     return kinds
 
 

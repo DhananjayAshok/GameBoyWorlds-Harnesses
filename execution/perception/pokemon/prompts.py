@@ -13,7 +13,7 @@ You are given two images:
 2. The contents of that grid cell on its own.
 
 Classify what is in the outlined cell into exactly one of these categories:
-- Ground: plain navigable ground the player can walk on, including ground with a repeating texture (such as mottled or diagonal-patterned grass/lawn or paved road) and flat horizontal-bar or step openings that interrupt a one-way ledge row so the player can walk through
+- Ground: plain navigable ground the player can walk on, including ground with a repeating texture (such as mottled or diagonal-patterned grass/lawn, paved road, or speckled/pebbled cave and dungeon floor) and flat horizontal-bar or step openings that interrupt a one-way ledge row so the player can walk through
 - Ground Decoration: walkable ground with small decorations on it, such as flowers or little tufts that look like tiny Digletts
 - Ledge: a raised one-way ridge or slope along the ground that the player can hop across in one direction (such as a horizontal south-facing ledge in the bottom half of a cell or a vertical one-way ledge along the side of a cell; do not confuse with flat horizontal-bar step gaps interrupting a ledge row, which are Ground)
 - Obstacle: a solid boundary or obstacle that blocks movement from all sides and cannot be interacted with (trees, bushes, rocks, walls, fences, bollards, buildings, or a plain empty table or counter with nothing on it; never classify flat repeating ground or lawn textures as a hedge or obstacle, and classify one-way jumpable ground ridges as Ledge rather than a rocky cliff wall or rocky fence)

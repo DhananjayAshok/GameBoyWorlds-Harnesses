@@ -233,9 +233,21 @@ class GlobalMap(StrategistArtifact):
         return restored
 
     @staticmethod
-    def _can_learn_walkable(tags: Iterable[str]) -> bool:
+    def _can_learn_walkable(
+        tags: Iterable[str],
+        hashes: Optional[Tuple[Optional[str], ...]] = None,
+        pixels: Optional[np.ndarray] = None,
+    ) -> bool:
         tag_set = set(tags)
-        return bool(tag_set & WALKABLE_TAGS) and "npc" not in tag_set and "unknown" not in tag_set
+        if "npc" in tag_set or "unknown" in tag_set or "water" in tag_set:
+            return False
+        if bool(tag_set & WALKABLE_TAGS):
+            return True
+        if hashes is not None and len(hashes) == 4 and len(set(hashes)) == 1 and hashes[0] is not None:
+            if pixels is not None and pixels.size > 0 and int(pixels.min()) == int(pixels.max()):
+                return False
+            return True
+        return False
 
     def _classify(self, tags: Iterable[str], hashes: Tuple[Optional[str], ...]) -> str:
         tag_set = set(tags)
@@ -244,13 +256,13 @@ class GlobalMap(StrategistArtifact):
             return LEDGE
         if kind == BLOCKED and hashes in self.left_ledge_patterns:
             return LEDGE_LEFT
-        if kind == BLOCKED and hashes in self.walk_patterns and self._can_learn_walkable(tag_set):
+        if kind == BLOCKED and hashes in self.walk_patterns and self._can_learn_walkable(tag_set, hashes):
             return WALKABLE
         return kind
 
     def _learn_walkable(self, cell: "MapCell") -> int:
         pattern = cell.hashes
-        if any(h is None for h in pattern) or not self._can_learn_walkable(cell.tags):
+        if any(h is None for h in pattern) or not self._can_learn_walkable(cell.tags, pattern, cell.pixels):
             return 0
         self.ledge_patterns.discard(pattern)
         self.left_ledge_patterns.discard(pattern)
@@ -1649,10 +1661,31 @@ class GlobalMap(StrategistArtifact):
                     qtags = {
                         normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None)) for t in tiles
                     }
-                    if not self._can_learn_walkable(qtags):
+                    t_img = getattr(tiles[0], "image", None)
+                    if not self._can_learn_walkable(qtags, pattern, t_img):
                         continue
                 cleaned_patterns.add(pattern)
             self.walk_patterns = cleaned_patterns
+        for si, seg in enumerate(self.segments):
+            if not seg or si >= len(self.visits) or not self.visits[si]:
+                continue
+            seg_blocked = self.blocked_cells[si] if si < len(self.blocked_cells) else set()
+            uniform_visited: Dict[Tuple[Optional[str], ...], List[MapCell]] = defaultdict(list)
+            for g, cnt in self.visits[si].items():
+                if cnt <= 0 or g in seg_blocked:
+                    continue
+                c = seg.get(g)
+                if (
+                    c is not None
+                    and c.hashes
+                    and len(c.hashes) == 4
+                    and len(set(c.hashes)) == 1
+                    and c.hashes[0] is not None
+                ):
+                    uniform_visited[c.hashes].append(c)
+            for cells_for_pat in uniform_visited.values():
+                if len(cells_for_pat) >= 2:
+                    self._learn_walkable(cells_for_pat[0])
         while len(self.blocked_cells) < len(self.segments):
             self.blocked_cells.append(set())
         changed = 0
@@ -1976,7 +2009,12 @@ class GlobalMap(StrategistArtifact):
                     if lc is not None and lc.kind in (WALKABLE, UNKNOWN, OCCUPIED) and land not in visited:
                         visited.add(land)
                         queue.append(land)
-                elif c.kind in (WALKABLE, UNKNOWN, OCCUPIED) or is_door(c):
+                elif is_door(c):
+                    if nxt not in visited:
+                        visited.add(nxt)
+                        if nxt in seeds:
+                            queue.append(nxt)
+                elif c.kind in (WALKABLE, UNKNOWN, OCCUPIED):
                     if nxt not in visited:
                         visited.add(nxt)
                         queue.append(nxt)

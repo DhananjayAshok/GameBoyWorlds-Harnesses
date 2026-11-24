@@ -95,10 +95,63 @@ ITEM_BALL_DESC_PATTERN = re.compile(
     r"\b(?:ball|item)\b",
     re.IGNORECASE,
 )
+SPECKLED_GROUND_OBSTACLE_DESC_PATTERN = re.compile(
+    r"\b(?:rocky|cave|cliff|plateau|stone|ground|floor)\b",
+    re.IGNORECASE,
+)
+ROCKY_PLATEAU_TOP_EDGE_DESC_PATTERN = re.compile(
+    r"\b(?:plateau|cliff|ridge)\b",
+    re.IGNORECASE,
+)
+STAIR_OR_STEP_DESC_PATTERN = re.compile(
+    r"\b(?:step|steps|stair|stairs|ladder)\b",
+    re.IGNORECASE,
+)
 
 
 def is_solid_shade_piece(image: Optional[np.ndarray]) -> bool:
     return image is not None and image.size > 0 and int(image.min()) == int(image.max())
+
+
+def is_speckled_ground_quarter(
+    tag: str, description: Optional[str], image: Optional[np.ndarray] = None
+) -> bool:
+    if tag != "obstacle" or not description or image is None or image.size == 0:
+        return False
+    if TABLETOP_SURFACE_DESC_PATTERN.search(description):
+        return False
+    if not SPECKLED_GROUND_OBSTACLE_DESC_PATTERN.search(description):
+        return False
+    arr = np.squeeze(np.asarray(image))
+    if arr.shape != (8, 8):
+        return False
+    vals, counts = np.unique(arr, return_counts=True)
+    if len(vals) < 3:
+        return False
+    min_s, max_s = int(arr.min()), int(arr.max())
+    if min_s < 60 or (max_s - min_s) > 64:
+        return False
+    dom = float(counts.max()) / arr.size
+    if not (0.55 <= dom <= 0.85):
+        return False
+    row_means = [float(arr[r, :].mean()) for r in range(8)]
+    col_means = [float(arr[:, c].mean()) for c in range(8)]
+    return (max(row_means) - min(row_means)) <= 24.0 and (max(col_means) - min(col_means)) <= 24.0
+
+
+def is_rocky_plateau_top_edge_quarter(
+    tag: str, description: Optional[str], image: Optional[np.ndarray] = None
+) -> bool:
+    if tag != "ground" or not description or image is None or image.size == 0:
+        return False
+    if not ROCKY_PLATEAU_TOP_EDGE_DESC_PATTERN.search(description):
+        return False
+    if STAIR_OR_STEP_DESC_PATTERN.search(description):
+        return False
+    arr = np.squeeze(np.asarray(image))
+    if arr.shape != (8, 8):
+        return False
+    return int(arr[2:, :].min()) - int(arr[:2, :].min()) >= 80
 
 
 def is_indoor_floor_ladder_quarter(
@@ -170,6 +223,10 @@ def normalize_tabletop_tag(tag: str, description: Optional[str], image: Optional
         return "staircase"
     if is_overworld_item_ball_quarter(tag, description, image):
         return "item"
+    if is_speckled_ground_quarter(tag, description, image):
+        return "ground"
+    if is_rocky_plateau_top_edge_quarter(tag, description, image):
+        return "obstacle"
     if description:
         stripped = description.strip()
         if tag == "obstacle" and TABLETOP_OBJECT_PATTERN.search(stripped):
