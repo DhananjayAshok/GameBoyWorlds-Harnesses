@@ -34,8 +34,8 @@ Here is the player's report of the episode:
 
 Write one line summarising the episode for your own log.[TOWN_QUESTION]
 
-Respond in exactly this format:
-Reasoning: <what actually happened and what it means>
+Keep `Reasoning:` concise (at most 1-2 sentences). Respond in exactly this format:
+Reasoning: <in 1-2 concise sentences, what actually happened and what it means>
 Summary: <one sentence>[TOWN_FORMAT]
 [STOP]"""
 
@@ -59,8 +59,8 @@ Each fact is stored on its own, away from this report, so it must make sense wit
 
 Write at most [MAX_FACTS] facts, one per line. If nothing is worth remembering, write None.
 
-Respond in exactly this format:
-Reasoning: <what this episode taught you>
+Keep `Reasoning:` concise (at most 2-3 sentences). Respond in exactly this format:
+Reasoning: <in 2-3 concise sentences, what this episode taught you>
 Facts:
 - <fact>
 - <fact>
@@ -147,14 +147,16 @@ Here is the new knowledge you wish to remember:
 
 Decide how to update your database so all of this knowledge is stored without duplicating what is already there:
 - If an existing entry already covers a fact completely, leave it alone.
+- Store location, building, NPC, item, and Pokemon facts under their specific `Locations`, `NPCs`, `Items`, or `Pokemon` entries rather than duplicating them into `[1] All > Active Story`. Only update `[1] All > Active Story` when the overarching active story objective itself changes, and keep `[1] All > Active Story` strictly to the current chapter (at most 3-4 concise sentences, under 100 words), pruning completed earlier-town history that is already stored under `Locations`.
+- Keep every entry description concise and distilled (at most 3-5 sentences).
 - If an existing entry is about the same topic or heading and should be expanded or corrected, write:
-  Change: UPDATE | <entry number> | <the full rewritten description keeping everything still true>
+  Change: UPDATE | <entry number> | <the concise rewritten description keeping what is still true and relevant>
 - If a fact needs a new entry under an existing entry, write:
   Change: ADD | <parent entry number> | <new short entry title> | <the entry description>
 - Do not use `|` inside a title or description. Update or add each entry at most once. If everything is already in your database, write the single line `Change: NONE`.
 
-Respond in exactly this format:
-Reasoning: <how each fact fits into the existing entries>
+Keep `Reasoning:` concise (at most 2-3 sentences). Respond in exactly this format:
+Reasoning: <in 2-3 concise sentences, how each fact fits into the existing entries>
 Change: <UPDATE | <number> | <new description>, or ADD | <parent number> | <title> | <description>>
 (one `Change:` line per update or addition, or instead the single line `Change: NONE`)
 [STOP]"""
@@ -266,8 +268,8 @@ Here is the player's report of the episode:
 
 Has this goal been achieved, in this episode or before it? Answer Yes only if the report or your notepad clearly shows it has happened.
 
-Respond in exactly this format:
-Reasoning: <the evidence for and against>
+Keep `Reasoning:` concise (at most 2-3 sentences). Respond in exactly this format:
+Reasoning: <in 2-3 concise sentences, the evidence for and against>
 Achieved: <Yes or No>
 [STOP]"""
 
@@ -482,8 +484,8 @@ Each fact is stored on its own, away from this notepad, so it must make sense wi
 
 Write at most [MAX_FACTS] facts, one per line. If nothing is worth remembering, write None.
 
-Respond in exactly this format:
-Reasoning: <what in the notepad will still matter later>
+Keep `Reasoning:` concise (at most 2-3 sentences). Respond in exactly this format:
+Reasoning: <in 2-3 concise sentences, what in the notepad will still matter later>
 Facts:
 - <fact>
 - <fact>

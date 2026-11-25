@@ -865,8 +865,6 @@ class PokemonStrategist:
                 return True
         if town_event is not None:
             return True
-        if closed and not self.notepad.text.strip():
-            return True
         return False
 
     @staticmethod
@@ -1155,10 +1153,8 @@ class PokemonStrategist:
         if closed:
             if any(status == "complete" for _, status in closed):
                 self.guide.mark_goal_completed(self.global_map, episode_number=n)
-            if extracted:
+            if extracted or any(len(path) <= 3 for path, _ in closed):
                 self.notepad.clear(episode_number=n)
-            else:
-                self._absorb_notepad(closed, n)
         self._update_notepad(report.digest, summary, n)
         if events and self._should_update_guide(events, record.status):
             update_guide(self.guide, events, report.digest, self._vlm_caller("guide_update"), self._game, n,
@@ -1173,8 +1169,7 @@ class PokemonStrategist:
         if self.npcs is None:
             return
         try:
-            self.npcs.finish_conversations()
-            self.npcs.read_conversations(self._vlm_caller("npc_ocr"))
+            self.npcs.prepare_episode_summaries(self.global_map, vlm_caller=self._vlm_caller)
         except Exception as e:
             log_warn(f"NPC registry: reading the conversations failed and was skipped: "
                      f"{type(e).__name__}: {e}", self._parameters)

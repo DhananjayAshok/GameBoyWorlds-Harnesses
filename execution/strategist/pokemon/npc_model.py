@@ -99,7 +99,7 @@ GIFT_OR_QUEST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 NAMED_SPEAKER_INTRO_PATTERN = re.compile(
-    r"(?:\b(?:I'm|I\s+am)\s+[A-Z]{2,}\b|\b(?:GYM\s+LEADER|ELITE\s+FOUR|CHAMPION)\b)"
+    r"(?:\b(?:I'm|I\s+am|My\s+name's|My\s+name\s+is)\s+(?!OK\b)(?:[A-Z]{2,}\b|\?{2,})|(?i:\b(?:GYM\s+LEADER|ELITE\s+FOUR|CHAMPION)\b))"
 )
 
 
@@ -183,15 +183,16 @@ def is_routine_conversation(reg: Any, conv: Any) -> bool:
             getattr(conv, "led_to", None) == "battle" or getattr(conv, "outcome", None) == "battle"):
         if GIFT_OR_QUEST_PATTERN.search(text) or NAMED_SPEAKER_INTRO_PATTERN.search(text):
             return False
-        if any(TAG.match(ln) for ln in text.splitlines()):
-            return False
-        if getattr(conv, "name_type", None) == "personal":
-            return False
-        npc_id = getattr(conv, "npc", None)
-        if npc_id in getattr(reg, "npcs", {}):
-            npc = reg.get(npc_id)
-            if npc.real_name and npc.name_type == "personal":
+        if getattr(conv, "trigger", None) == "a_press":
+            if any(TAG.match(ln) for ln in text.splitlines()):
                 return False
+            if getattr(conv, "name_type", None) == "personal":
+                return False
+            npc_id = getattr(conv, "npc", None)
+            if npc_id in getattr(reg, "npcs", {}):
+                npc = reg.get(npc_id)
+                if npc.real_name and npc.name_type == "personal":
+                    return False
         return True
     return False
 
@@ -348,12 +349,29 @@ def _interacted_with(reg, npc) -> bool:
     for cid in npc.conversations:
         conv = reg.conversations.get(cid)
         if (conv is not None and conv.trigger != "battle_start"
-                and (conv.text or conv.crops or conv.trigger == "a_press" or conv.complete)):
+                and (conv.text or conv.crops or conv.trigger == "a_press" or conv.complete)
+                and not is_routine_conversation(reg, conv)):
             return True
     return False
 
 
+def _settle_routine_npc_needs(reg) -> None:
+    for npc in reg.live_npcs():
+        convs = [reg.conversations[cid] for cid in npc.conversations
+                 if cid in reg.conversations and reg.conversations[cid].trigger != "battle_start"]
+        if not convs:
+            continue
+        if any(c.led_to == "battle" or c.outcome == "battle" for c in convs):
+            if npc.kind in ("unknown", "person"):
+                npc.kind = "trainer"
+        elif any(is_routine_service_text(c.text) for c in convs) and npc.kind == "unknown":
+            npc.kind = "person"
+        if all(is_routine_conversation(reg, c) for c in convs):
+            npc.needs = None
+
+
 def run_model(reg, vlm_card: Callable[..., Any], vlm_judge: Callable[..., Any], game: str, gmap) -> None:
+    _settle_routine_npc_needs(reg)
     cards = [n for n in reg.live_npcs() if n.needs == "card" and _interacted_with(reg, n)][:MAX_BATCH]
     judges = [n for n in reg.live_npcs() if n.needs == "judge" and _interacted_with(reg, n)][:MAX_BATCH]
     if cards:
@@ -378,6 +396,10 @@ def _cards(reg, people, vlm_call, game: str, gmap) -> None:
         if others:
             lines = "\n".join(_describe(reg, gmap, o, k + 1) for k, o in enumerate(others))
             block = NPC_CANDIDATES_BLOCK.replace("[LIST]", lines)
+        said = _last_summary(reg, npc)
+        if said:
+            who = f' (named "{npc.real_name}")' if npc.real_name else ""
+            block += f'When spoken to, this character{who} said: "{said[:160]}"\n'
         prompts.append(NPC_CARD_PROMPT.replace("[GAME]", game).replace("[CANDIDATES]", block))
         look = reg.look_of(npc)
         first = npc.sightings[0].view if npc.sightings else 0
@@ -517,6 +539,12 @@ def run_summaries(reg, vlm_call: Callable[..., Any], game: str, gmap, only=None)
         service = routine_service_summary(c.text) or routine_trainer_challenge_summary(reg, c)
         if service is not None:
             c.summary, c.outcome, c.summarised = service[0], service[1], True
+            if c.outcome == "battle":
+                tag = TAG.match(c.text)
+                if tag and not c.speaker_name:
+                    c.speaker_name, c.name_type = tag.group(1).strip()[:40], "personal"
+                if c.npc in reg.npcs and reg.get(c.npc).kind in ("unknown", "person"):
+                    reg.get(c.npc).kind = "trainer"
             todo.remove(c)
     done = {}
     for c in reg.conversations.values():
@@ -554,21 +582,35 @@ def run_summaries(reg, vlm_call: Callable[..., Any], game: str, gmap, only=None)
         c.summary, c.speaker_name, c.name_type, c.summarised = (parsed["summary"], parsed["name"],
                                                                 parsed["name_type"], True)
         c.outcome = "battle" if c.led_to == "battle" else parsed["outcome"]
+        if c.outcome == "battle" and c.npc in reg.npcs and reg.get(c.npc).kind in ("unknown", "person"):
+            reg.get(c.npc).kind = "trainer"
         reg.stats["summaries"] += 1
 
 
 def apply_real_names(reg) -> None:
-    taken = {n.real_name.casefold() for n in reg.live_npcs() if n.real_name}
-    for npc in reg.live_npcs():
-        if npc.real_name:
+    by_name = {n.real_name.casefold(): n for n in reg.live_npcs() if n.real_name}
+    for npc in list(reg.live_npcs()):
+        if npc.merged_into is not None or npc.real_name:
             continue
         names = Counter((c.speaker_name, c.name_type) for c in
                         (reg.conversations[i] for i in npc.conversations if i in reg.conversations)
                         if c.speaker_name)
         for (name, kind), _ in names.most_common():
-            if kind != "personal" or name.casefold() in taken:
+            if kind != "personal":
+                continue
+            key = name.casefold()
+            existing = by_name.get(key)
+            if existing is not None:
+                existing = reg.get(existing.id)
+                if (existing.id != npc.id
+                        and (reg.look_of(existing).id == reg.look_of(npc).id
+                             or existing.id in npc.candidates
+                             or npc.id in existing.candidates)
+                        and try_merge(reg, existing, npc)):
+                    reg.stats["merged_by_model"] += 1
+                    break
                 continue
             npc.real_name, npc.name_type = name, kind
-            taken.add(name.casefold())
+            by_name[key] = npc
             reg.stats["real_names"] += 1
             break

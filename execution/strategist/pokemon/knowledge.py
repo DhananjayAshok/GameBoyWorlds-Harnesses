@@ -82,7 +82,7 @@ class KnowledgeTree(StrategistArtifact):
 
     @update
     def set_description(self, path: KnowledgePath, description: str) -> None:
-        self._at(path).root.description = description
+        self._at(path).root.description = _compact_entry_description(path, description)
 
     def diff(self, old: "KnowledgeTree") -> Dict[str, Any]:
         new_nodes = self.tree.paths()
@@ -259,13 +259,47 @@ DEFAULT_CATEGORY_DESCRIPTIONS = {
 }
 
 
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<!\b[A-Z][a-z]\.)(?<!\b[A-Z][a-z]{2}\.)(?<!\b[A-Z][a-z]{3}\.)(?<=[.!?])\s+"
+)
+_ACTIVE_STORY_PREFIX = "What is currently happening and what the player is in the middle of."
+
+
+def compact_active_story(description: str, max_sentences: int = 4, max_words: int = 110) -> str:
+    text = " ".join((description or "").split())
+    if len(text.split()) <= max_words:
+        return text
+    has_prefix = text.startswith(_ACTIVE_STORY_PREFIX)
+    body = text[len(_ACTIVE_STORY_PREFIX):].strip() if has_prefix else text
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(body) if s.strip()]
+    kept: List[str] = []
+    word_count = 0
+    for s in reversed(sentences):
+        s_words = len(s.split())
+        if kept and (len(kept) >= max_sentences or word_count + s_words > max_words):
+            break
+        kept.append(s)
+        word_count += s_words
+    kept.reverse()
+    result = " ".join(kept)
+    if has_prefix and result:
+        return f"{_ACTIVE_STORY_PREFIX} {result}"
+    return result or text[:600]
+
+
+def _compact_entry_description(path: KnowledgePath, description: str) -> str:
+    if path == ("All", "Active Story"):
+        return compact_active_story(description)
+    return description
+
+
 def tree_entries(knowledge: KnowledgeTree) -> List[Tuple[KnowledgePath, KnowledgeNode]]:
     return list(knowledge.tree.paths().items())
 
 
 def render_knowledge_tree(knowledge: KnowledgeTree) -> str:
     entries = tree_entries(knowledge)
-    return "\n".join(f"[{i}] {_path_text(path)}: {node.description}"
+    return "\n".join(f"[{i}] {_path_text(path)}: {_compact_entry_description(path, node.description)}"
                       for i, (path, node) in enumerate(entries))
 
 
@@ -359,6 +393,11 @@ def remember_all(knowledge: KnowledgeTree, facts: List[str], vlm_call: Callable[
     cleaned = [f.strip() for f in facts if f and f.strip()]
     if not cleaned:
         return []
+    story_sub = knowledge.tree.at(("All", "Active Story"))
+    if story_sub is not None:
+        compacted = compact_active_story(story_sub.root.description)
+        if compacted != story_sub.root.description:
+            story_sub.root.description = compacted
     entries = tree_entries(knowledge)
     prompt = (P.KNOWLEDGE_BATCH_UPDATE_PROMPT
               .replace("[GAME]", game)

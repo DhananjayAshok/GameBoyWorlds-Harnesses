@@ -212,7 +212,8 @@ class NPCRegistry(StrategistArtifact):
 
     _TRANSIENT = ("_gmap", "_episode", "_tracks", "_last_people", "_last_people_at", "_stack", "_stack_ref",
                   "_look_merges", "_weak", "_facing", "_open", "_frame", "_free_frame", "_free_identified",
-                  "_free_pos", "_live", "_a_step", "_a_facing", "_resume", "_last_closed")
+                  "_free_pos", "_live", "_a_step", "_a_facing", "_resume", "_last_closed", "_moved_since_close",
+                  "_last_battle_step", "_last_battle_pos")
 
     def __init__(self, game: str, run_name: str) -> None:
         self.game = game
@@ -259,6 +260,8 @@ class NPCRegistry(StrategistArtifact):
         self._resume: Optional[str] = None
         self._last_closed: Optional[str] = None
         self._moved_since_close: bool = False
+        self._last_battle_step: Optional[int] = None
+        self._last_battle_pos: Optional[Tuple[int, Cell]] = None
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -339,6 +342,7 @@ class NPCRegistry(StrategistArtifact):
         self._forget_screen()
         self._facing, self._open, self._last_closed = self.last_facing, None, None
         self._moved_since_close = False
+        self._last_battle_step, self._last_battle_pos = None, None
         self._a_step, self._a_facing = None, None
         if self.pending_press is not None:
             p_step, p_facing, p_seg, p_pos = self.pending_press
@@ -871,8 +875,11 @@ class NPCRegistry(StrategistArtifact):
                 self._close_conversation("battle", True)
         elif in_battle:
             self._upgrade_recent_to_battle(crops)
+        if in_battle and self._gmap is not None:
+            self._last_battle_step = self._gmap.step
+            self._last_battle_pos = self._gmap.resolve(self._gmap.segment, self._gmap.pos)
 
-    def _recent_pre_battle_conversation(self) -> Optional[Conversation]:
+    def _recent_pre_battle_conversation(self, allow_stationary_wait: bool = False) -> Optional[Conversation]:
         if self._last_closed is None or self._gmap is None or self._moved_since_close:
             return None
         conv = self.conversations.get(self._last_closed)
@@ -881,7 +888,7 @@ class NPCRegistry(StrategistArtifact):
         if conv.led_to != "free_roam" or conv.sign is not None:
             return None
         end_step = conv.map_step_end if conv.map_step_end is not None else conv.map_step_start
-        if self._gmap.step - end_step > MAX_PRE_BATTLE_WAIT_STEPS:
+        if not allow_stationary_wait and self._gmap.step - end_step > MAX_PRE_BATTLE_WAIT_STEPS:
             return None
         if self._gmap.resolve(self._gmap.segment, self._gmap.pos) != self._gmap.resolve(conv.segment, conv.square):
             return None
@@ -900,7 +907,7 @@ class NPCRegistry(StrategistArtifact):
     def _upgrade_recent_to_battle(self, crops: Optional[List[np.ndarray]] = None) -> None:
         from execution.pokemon.executors import drop_prefix_crops
 
-        conv = self._recent_pre_battle_conversation()
+        conv = self._recent_pre_battle_conversation(allow_stationary_wait=True)
         if conv is None:
             return
         if crops and not conv.crops:
@@ -1488,10 +1495,18 @@ class NPCRegistry(StrategistArtifact):
                 confidence = "low"
         if speaker is None and sign_square is None:
             how = "none"
+        post_battle = (
+            not a_press
+            and not self._moved_since_close
+            and self._last_battle_step is not None
+            and 0 <= g.step - self._last_battle_step <= MAX_PRE_BATTLE_WAIT_STEPS
+            and self._last_battle_pos == g.resolve(g.segment, g.pos)
+        )
         conv = Conversation(
             id=self._next("conv"), npc=speaker, sign=None, episode=self._episode, map_step_start=g.step,
             map_step_end=None, segment=g.segment, square=g.pos, target=sign_square,
-            trigger="a_press" if a_press else "npc_started", how=how, confidence=confidence)
+            trigger="a_press" if a_press else "npc_started", how=how, confidence=confidence,
+            outcome="battle" if post_battle else None)
         if speaker is not None:
             npc = self.get(speaker)
             conv.npc = npc.id
@@ -1721,7 +1736,14 @@ class NPCRegistry(StrategistArtifact):
             if not merged_text.strip() and c.led_to == "battle":
                 self._mark_battle_start(c)
                 continue
+            if c.outcome == "battle" and c.led_to != "battle":
+                if (npc_model.GIFT_OR_QUEST_PATTERN.search(merged_text)
+                        or npc_model.NAMED_SPEAKER_INTRO_PATTERN.search(merged_text)
+                        or any(npc_model.TAG.match(ln) for ln in merged_text.splitlines())):
+                    c.outcome = None
             c.text, c.read = merged_text, True
+            if npc_model._match_item_pickup(merged_text) is not None and c.npc is not None:
+                self._reassign_item_pickup_to_sign(c)
             self._update_sign_text(c)
             self._attribute_by_text(c)
             self.stats["conversations_read"] += 1
@@ -1758,13 +1780,31 @@ class NPCRegistry(StrategistArtifact):
         self._stack = None
         self.stats["looks_merged"] += 1
 
+    def _reassign_item_pickup_to_sign(self, conv: Conversation) -> None:
+        old_npc = self.get(conv.npc) if conv.npc in self.npcs else None
+        target_sq = conv.target or conv.square
+        self._detach_conversation(conv)
+        sign = self._sign_for(conv.segment, target_sq)
+        conv.sign, conv.target, conv.how = sign.id, target_sq, "seen"
+        if conv.id not in sign.conversations:
+            sign.conversations.append(conv.id)
+        sign.episode = max(sign.episode, conv.episode)
+        if old_npc is not None and not old_npc.conversations:
+            old_npc.needs = None
+            if old_npc.hidden == "conversation":
+                self.look_of(old_npc).kind_hint = "object"
+                old_npc.sightings.clear()
+
     def _reconcile_conversations(self) -> None:
         gmap = self._gmap
         if gmap is None:
             return
         convs = sorted(self.conversations.values(), key=lambda c: c.map_step_start)
-        for conv in convs:
+        for idx, conv in enumerate(convs):
             if conv.trigger == "battle_start":
+                continue
+            if conv.text and npc_model._match_item_pickup(conv.text) is not None and conv.npc is not None:
+                self._reassign_item_pickup_to_sign(conv)
                 continue
             rseg, rsq = gmap.resolve(conv.segment, conv.square)
             end_step = conv.map_step_end if conv.map_step_end is not None else conv.map_step_start
@@ -1782,10 +1822,22 @@ class NPCRegistry(StrategistArtifact):
                         continue
                     if conv.led_to == "free_roam":
                         conv.led_to = "battle"
+                elif (conv.led_to == "free_roam" and conv.outcome is None and conv.text.strip()
+                        and not npc_model.GIFT_OR_QUEST_PATTERN.search(conv.text)
+                        and not npc_model.NAMED_SPEAKER_INTRO_PATTERN.search(conv.text)
+                        and not any(npc_model.TAG.match(ln) for ln in conv.text.splitlines())):
+                    for prev in reversed(convs[:idx]):
+                        if prev.episode != conv.episode or prev.trigger == "battle_start":
+                            continue
+                        if gmap.resolve(prev.segment, prev.square) != (rseg, rsq):
+                            break
+                        if prev.led_to == "battle" or prev.outcome == "battle":
+                            conv.outcome = "battle"
+                        break
             if conv.npc in self.npcs:
                 npc = self.get(conv.npc)
                 conv.npc = npc.id
-                if conv.led_to == "battle" and npc.kind in ("unknown", "person"):
+                if (conv.led_to == "battle" or conv.outcome == "battle") and npc.kind in ("unknown", "person"):
                     npc.kind = "trainer"
                 if conv.trigger == "npc_started":
                     seen = self.last_seen(gmap, npc)
@@ -1885,8 +1937,8 @@ class NPCRegistry(StrategistArtifact):
                 if a and b and a[0] == b[0] and _manhattan(a[1], b[1]) <= NEAR:
                     self.merge_npcs(older, newer)
 
-    @update
-    def end_episode(self, gmap: GlobalMap, vlm_caller: Optional[Callable[[str], Callable[..., Any]]] = None) -> None:
+    def prepare_episode_summaries(self, gmap: GlobalMap,
+                                  vlm_caller: Optional[Callable[[str], Callable[..., Any]]] = None) -> None:
         self._gmap = gmap
         self.finish_conversations()
         if vlm_caller is not None:
@@ -1896,16 +1948,29 @@ class NPCRegistry(StrategistArtifact):
                 log_warn(f"NPC registry: reading conversations failed and was skipped: {type(e).__name__}: {e}")
         self.consolidate()
         if vlm_caller is not None:
+            for label, step in (("summaries", lambda: self.run_summaries(vlm_caller("npc_summary"), gmap)),
+                                ("real names", self.apply_real_names),
+                                ("text attribution", self.attribute_conversations)):
+                try:
+                    step()
+                except Exception as e:
+                    log_warn(f"NPC registry: {label} skipped: {type(e).__name__}: {e}")
+        npc_model._settle_routine_npc_needs(self)
+
+    @update
+    def end_episode(self, gmap: GlobalMap, vlm_caller: Optional[Callable[[str], Callable[..., Any]]] = None) -> None:
+        self.prepare_episode_summaries(gmap, vlm_caller)
+        if vlm_caller is not None:
             self._model_steps(vlm_caller, gmap)
         self._tracks = {}
         self._forget_screen()
 
     def _model_steps(self, vlm_caller: Callable[[str], Callable[..., Any]], gmap: GlobalMap) -> None:
-        for label, step in (("cards and judges", lambda: self.run_model(vlm_caller("npc_card"),
-                                                                       vlm_caller("npc_judge"), gmap)),
-                            ("summaries", lambda: self.run_summaries(vlm_caller("npc_summary"), gmap)),
+        for label, step in (("summaries", lambda: self.run_summaries(vlm_caller("npc_summary"), gmap)),
                             ("real names", self.apply_real_names),
-                            ("text attribution", self.attribute_conversations)):
+                            ("text attribution", self.attribute_conversations),
+                            ("cards and judges", lambda: self.run_model(vlm_caller("npc_card"),
+                                                                       vlm_caller("npc_judge"), gmap))):
             try:
                 step()
             except Exception as e:
@@ -2213,7 +2278,7 @@ class NPCRegistry(StrategistArtifact):
         for c in self.conversations.values():
             if c.episode != episode or c.trigger == "battle_start" or not c.text.strip():
                 continue
-            if npc_model.is_battle_start_text(c.text):
+            if npc_model.is_battle_start_text(c.text) or npc_model.is_routine_conversation(self, c):
                 continue
             who = (f'"{display_name(self.get(c.npc))}"' if c.npc in self.npcs else "a sign" if c.sign else "someone")
             lines.append(f'- {who} in {npc_model._area(self, gmap, gmap.resolve(c.segment, c.square)[0])}: '
