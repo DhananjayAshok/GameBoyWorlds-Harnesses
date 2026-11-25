@@ -1953,7 +1953,7 @@ Press: <one of up, down, left, right, confirm, back>
     def _non_battle_menu_outcome(self, frame: np.ndarray) -> Optional[AgentState]:
         if effective_agent_state(AgentState.IN_MENU, frame) == AgentState.IN_DIALOGUE:
             return AgentState.IN_DIALOGUE
-        if is_overworld_pack_menu(frame) or is_start_menu_screen(frame):
+        if is_start_menu_screen(frame) or (not self._in_bag_menu and is_overworld_pack_menu(frame)):
             return AgentState.IN_MENU
         if not self._saw_battle_state and (
             is_party_menu_screen(frame) or is_pack_screen(frame) or has_menu_cursor(frame)

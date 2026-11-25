@@ -585,7 +585,7 @@ def is_overworld_pack_menu(frame: np.ndarray) -> bool:
             is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, x0:x0 + TILE_SIZE])
             for ty in range(3, 12)
         )
-        if n_v >= 5:
+        if n_v >= 6:
             return True
     return False
 
