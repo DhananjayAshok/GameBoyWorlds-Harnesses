@@ -168,6 +168,115 @@ def sanitize_false_loss_summary(summary: str) -> str:
     )
 
 
+NARRATIVE_COORD_RE = re.compile(
+    r"\[Area coordinate:\s*\((-?\d+),\s*(-?\d+)\)\s*->\s*\((-?\d+),\s*(-?\d+)\)([^\]]*)\]"
+)
+BLOCKED_AT_COORD_RE = re.compile(
+    r"\bBlocked\s+moving\s+(up|down|left|right)\s+at\s+\((-?\d+),\s*(-?\d+)\)",
+    re.IGNORECASE,
+)
+BLOCKED_DIR_NOTE_RE = re.compile(
+    r"\b(?:Blocked|Stopped|Could not finish)\s+moving\s+(up|down|left|right)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_blocked_moves_from_narrative(
+    narrative: Optional[ List[str] ],
+    end_pos: Optional[Tuple[int, int]] = None,
+) -> Dict[Tuple[int, int], List[str]]:
+    if not narrative:
+        return {}
+    lines = list(narrative)
+    last_new_area_idx = -1
+    last_after_pos: Optional[Tuple[int, int]] = None
+    for i, line in enumerate(lines):
+        m_coord = NARRATIVE_COORD_RE.search(line)
+        if m_coord:
+            last_after_pos = (int(m_coord.group(3)), int(m_coord.group(4)))
+            if "entered new area" in m_coord.group(5).lower():
+                last_new_area_idx = i
+    if end_pos is not None and last_after_pos is not None and last_after_pos != end_pos:
+        return {}
+    out: Dict[Tuple[int, int], List[str]] = {}
+    for line in lines[last_new_area_idx + 1:]:
+        for m_at in BLOCKED_AT_COORD_RE.finditer(line):
+            d = m_at.group(1).lower()
+            pos = (int(m_at.group(2)), int(m_at.group(3)))
+            if d not in out.get(pos, ()):
+                out.setdefault(pos, []).append(d)
+        if "did not work: move_blocked" in line:
+            m_coord = NARRATIVE_COORD_RE.search(line)
+            m_dir = BLOCKED_DIR_NOTE_RE.search(line)
+            if m_coord and m_dir:
+                after_pos = (int(m_coord.group(3)), int(m_coord.group(4)))
+                d = m_dir.group(1).lower()
+                if d not in out.get(after_pos, ()):
+                    out.setdefault(after_pos, []).append(d)
+    return out
+
+
+def sanitize_stale_notepad_routes(
+    text: str,
+    gmap: GlobalMap,
+    blocked_moves: Optional[Dict[Tuple[int, int], Any]] = None,
+) -> str:
+    if not text or not gmap.current:
+        return text
+    from execution.strategist.pokemon.global_map.model import BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT
+    from execution.strategist.pokemon.global_map.routes import blocked_target_cells, compress_moves, path_in_segment
+
+    seg = gmap.current
+    px, py = gmap.pos
+    blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
+
+    def trace_is_blocked(seq_str: str) -> Tuple[bool, Tuple[int, int]]:
+        cx, cy = px, py
+        hit_blocked = False
+        for part in seq_str.split(","):
+            tokens = part.strip().lower().split()
+            if len(tokens) != 2 or tokens[0] not in DIRECTIONS or not tokens[1].isdigit():
+                return False, (cx, cy)
+            d, count = tokens[0], int(tokens[1])
+            dx, dy = DIRECTIONS[d]
+            for _ in range(count):
+                if blocked_moves and d in blocked_moves.get((cx, cy), ()):
+                    hit_blocked = True
+                nx, ny = cx + dx, cy + dy
+                c = seg.get((nx, ny))
+                if (nx, ny) in blocked_targets or (c is not None and c.kind in (BLOCKED, LEDGE, LEDGE_LEFT)):
+                    hit_blocked = True
+                cx, cy = nx, ny
+        return hit_blocked, (cx, cy)
+
+    pattern = re.compile(
+        r"(?:(mapped\s+route(?:,\s*|\s*\()\s*)(\d+)(\s+moves\s*(?:\):\s*|:\s*)))?"
+        r"(\b(?:up|down|left|right)\s+\d+(?:\s*,\s*(?:up|down|left|right)\s+\d+)+)",
+        re.IGNORECASE,
+    )
+
+    def repl(m: re.Match) -> str:
+        prefix, _old_count, mid, seq = m.group(1), m.group(2), m.group(3), m.group(4)
+        is_blk, goal = trace_is_blocked(seq)
+        if not is_blk:
+            return m.group(0)
+        goal_cell = seg.get(goal)
+        found = (
+            path_in_segment(gmap, gmap.segment, (px, py), goal, blocked_moves=blocked_moves)
+            if (goal_cell is None or goal_cell.kind not in (BLOCKED, LEDGE, LEDGE_LEFT))
+            else None
+        )
+        if found is not None and found[1]:
+            new_seq = compress_moves(found[1])
+            new_count = str(len(found[1]))
+            if prefix is not None:
+                return f"{prefix}{new_count}{mid}{new_seq}"
+            return new_seq
+        return "route blocked by wall — use live mapped routes below"
+
+    return pattern.sub(repl, text)
+
+
 def sanitize_false_loss_notepad(text: str) -> str:
     if not text:
         return text
@@ -309,6 +418,7 @@ class PokemonStrategist:
         self._last_battle_hp_episode: Optional[int] = None
         self._fought_since_last_hp: int = 0
         self._healing_bag_empty: bool = False
+        self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {}
 
         self._started_at = datetime.now()
         self._session_dir = self._resolve_session_dir()
@@ -482,6 +592,63 @@ class PokemonStrategist:
             warning = " — party has taken battle attrition and has not healed at a Pokemon Center yet."
         return f"\nParty health status: {status}{warning}\n"
 
+    def _ingest_narrative_blocked_moves(
+        self,
+        narrative: Optional[List[str]],
+        segment: Optional[int] = None,
+        end_pos: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        if not narrative or not self.global_map.current:
+            return
+        from execution.strategist.pokemon.global_map.model import DIRECTIONS
+
+        seg_id = self.global_map.segment if segment is None else segment
+        extracted = extract_blocked_moves_from_narrative(narrative, end_pos=end_pos)
+        if not extracted:
+            return
+        for b_pos, b_dirs in extracted.items():
+            for b_dir in b_dirs:
+                if b_dir not in DIRECTIONS:
+                    continue
+                detail = f"blocked moving {b_dir}"
+                dir_list = self._blocked_moves.setdefault((seg_id, b_pos), {}).setdefault(b_dir, [])
+                if detail not in dir_list:
+                    dir_list.append(detail)
+                if seg_id == self.global_map.segment:
+                    dx, dy = DIRECTIONS[b_dir]
+                    self.global_map.record_blocked_step(cell=(b_pos[0] + dx, b_pos[1] + dy))
+
+    def _current_segment_blocked_moves(self) -> Dict[Tuple[int, int], set]:
+        if not self.global_map.current or not self._blocked_moves:
+            return {}
+        cur_seg, _ = self.global_map.resolve(self.global_map.segment, self.global_map.pos)
+        out: Dict[Tuple[int, int], set] = {}
+        for (b_seg, b_pos), by_dir in self._blocked_moves.items():
+            try:
+                r_seg, r_pos = self.global_map.resolve(b_seg, b_pos)
+            except Exception:  # noqa: BLE001
+                continue
+            if r_seg == cur_seg and by_dir:
+                out.setdefault(r_pos, set()).update(by_dir.keys())
+        return out
+
+    def _local_blocked_cells(self) -> set:
+        from execution.perception.pokemon.navigation import in_bounds
+        from execution.strategist.pokemon.global_map.routes import blocked_target_cells
+
+        local_blocked = set(self.global_map.local_blocked_cells())
+        if not self.global_map.current:
+            return local_blocked
+        seg_blocked_moves = self._current_segment_blocked_moves()
+        if not seg_blocked_moves:
+            return local_blocked
+        px, py = self.global_map.pos
+        for target in blocked_target_cells(self.global_map, self.global_map.segment, seg_blocked_moves):
+            rel = (target[0] - px, target[1] - py)
+            if rel != (0, 0) and in_bounds(rel):
+                local_blocked.add(rel)
+        return local_blocked
+
     def _load_prior_episodes(self) -> List[EpisodeRecord]:
         if self.start_episode <= 0:
             return []
@@ -503,6 +670,23 @@ class PokemonStrategist:
             except Exception as e:  # noqa: BLE001
                 log_warn(f"Strategist: could not load episode {n} report from {self._resume_dir!r}: {e}",
                          self._parameters)
+        if episodes and self.global_map.current:
+            last_ep = episodes[-1]
+            if last_ep.supervisor_report is not None and last_ep.supervisor_report.narrative:
+                self._ingest_narrative_blocked_moves(
+                    last_ep.supervisor_report.narrative,
+                    segment=self.global_map.segment,
+                    end_pos=self.global_map.pos,
+                )
+                self.global_map.refresh(self.tiles._by_hash)
+            if self.notepad.text.strip():
+                sanitized = sanitize_stale_notepad_routes(
+                    self.notepad.text,
+                    self.global_map,
+                    self._current_segment_blocked_moves(),
+                )
+                if sanitized != self.notepad.text:
+                    self.notepad.update(sanitized, episode_number=self.start_episode)
         if false_loss_episodes:
             if (self.start_episode - 1) in false_loss_episodes and self.notepad.text.strip():
                 cleaned_notes = sanitize_false_loss_notepad(self.notepad.text)
@@ -604,13 +788,20 @@ class PokemonStrategist:
         return False
 
     def _fill(self, prompt: str) -> str:
+        notepad_text = self.notepad.text.strip()
+        if notepad_text and self.global_map.current:
+            notepad_text = sanitize_stale_notepad_routes(
+                notepad_text,
+                self.global_map,
+                self._current_segment_blocked_moves(),
+            )
         return (prompt.replace("[GAME]", self._game)
                 .replace("[RECENT_BLOCK]", self._recent_block())
                 .replace("[MAX_STEPS]", str(self._supervisor_max_steps))
                 .replace("[GOAL]", frontier_text(self.goals))
                 .replace("[CURRENT]", self._current_place())
                 .replace("[PARTY_BLOCK]", self._party_status_block())
-                .replace("[NOTEPAD]", self.notepad.text.strip() or "(empty)")
+                .replace("[NOTEPAD]", notepad_text or "(empty)")
                 .replace("[GUIDE]", guide_block(self.guide, self.global_map, self.start_episode + self._episodes_run,
                                                 goal_completed_since_entry=self._goal_completed_since_building_entry())))
 
@@ -660,7 +851,7 @@ class PokemonStrategist:
             if self._identified:
                 kinds = cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
                                    people, self.global_map.left_ledge_patterns,
-                                   self.global_map.local_blocked_cells())
+                                   self._local_blocked_cells())
                 self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                                       + "\nWalkable cells on each edge of the screen:\n"
                                       + verbalize_edges(kinds, identified=self._identified, people=people, global_map=self.global_map))
@@ -773,7 +964,7 @@ class PokemonStrategist:
             return ""
         local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
                             self._screen_people(), self.global_map.left_ledge_patterns,
-                            self.global_map.local_blocked_cells())
+                            self._local_blocked_cells())
                  if self._identified else None)
         self.global_map.prune_routes()
         _, failed = self._failure_streak()
@@ -786,7 +977,8 @@ class PokemonStrategist:
         block, override = prompt_block(self.global_map, list(self.global_map.new_cells_by_episode), local,
                                        explore=self._explore_now,
                                        episode=self.start_episode + self._episodes_run,
-                                       failed_tasks=failed)
+                                       failed_tasks=failed,
+                                       blocked_moves=self._current_segment_blocked_moves())
         if override is not None:
             keep_exploring(self.global_map, override["until"])
         if marks is not None:
@@ -944,8 +1136,13 @@ class PokemonStrategist:
         if not self.global_map.current:
             return "(none)"
         self.global_map.mark_explored(self.start_episode + self._episodes_run)
-        lines = list(door_lines(self.global_map))
-        exp = explore_text(self.global_map)
+        local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
+                            self._screen_people(), self.global_map.left_ledge_patterns,
+                            self._local_blocked_cells())
+                 if self._identified else None)
+        seg_blocked_moves = self._current_segment_blocked_moves()
+        lines = list(door_lines(self.global_map, local, blocked_moves=seg_blocked_moves))
+        exp = explore_text(self.global_map, local, blocked_moves=seg_blocked_moves)
         if exp and exp != "(none)":
             lines.append(exp)
         return "\n".join(lines) or "(none)"
@@ -961,6 +1158,12 @@ class PokemonStrategist:
             log_warn("No usable notepad update; leaving the notepad as it was.", self._parameters)
             return
         action, notes = update
+        if self.global_map.current:
+            notes = sanitize_stale_notepad_routes(
+                notes,
+                self.global_map,
+                self._current_segment_blocked_moves(),
+            )
         if action == "APPEND":
             self.notepad.add(notes, episode_number=n)
         else:
@@ -1062,7 +1265,12 @@ class PokemonStrategist:
             if unsuccessful_for <= 0 or unsuccessful_for % self._subgoal_every:
                 return
         self.global_map.clear_routes()
-        create_subgoals(self.goals, self.knowledge, self._current_place(), explore_text(self.global_map),
+        local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
+                            self._screen_people(), self.global_map.left_ledge_patterns,
+                            self._local_blocked_cells())
+                 if self._identified else None)
+        create_subgoals(self.goals, self.knowledge, self._current_place(),
+                        explore_text(self.global_map, local, blocked_moves=self._current_segment_blocked_moves()),
                         self.notepad.text,
                         lambda request: navigate_map(self.global_map, request, self._vlm_caller, self._game,
                                                      self._parameters),
@@ -1111,6 +1319,7 @@ class PokemonStrategist:
             screen_people=self._screen_people if self.npcs is not None else None,
             initial_battle_hp=self._last_battle_hp,
             initial_healing_bag_empty=self._healing_bag_empty,
+            initial_blocked_moves=self._blocked_moves,
             **self._supervisor_kwargs,
         )
         env.marker = lambda: (len(supervisor.report.narrative), len(supervisor.report.event_log))
@@ -1121,6 +1330,19 @@ class PokemonStrategist:
         record.status = str(result.get("status", "unknown"))
         self.report.event_log.append(report)
         record_so_far()
+        for b_place, by_dir in (getattr(supervisor, "_blocked_moves", None) or {}).items():
+            dst_by_dir = self._blocked_moves.setdefault(b_place, {})
+            for b_dir, notes in by_dir.items():
+                dst_list = dst_by_dir.setdefault(b_dir, [])
+                for note in notes:
+                    if note not in dst_list:
+                        dst_list.append(note)
+        if report is not None and report.narrative:
+            self._ingest_narrative_blocked_moves(
+                report.narrative,
+                segment=self.global_map.segment,
+                end_pos=self.global_map.pos,
+            )
         # Let a mid-door-warp black screen clear, so the next task starts from the new place.
         settle_screen(self._env)
         self._name_segments(report, n)

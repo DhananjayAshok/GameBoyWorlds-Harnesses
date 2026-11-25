@@ -116,7 +116,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                  battle_tips: Optional[List[str]] = None,
                  screen_people: Optional[Callable[[], Dict[Tuple[int, int], str]]] = None,
                  initial_battle_hp: Optional[Tuple[int, int]] = None,
-                 initial_healing_bag_empty: bool = False, **kwargs: Any) -> None:
+                 initial_healing_bag_empty: bool = False,
+                 initial_blocked_moves: Optional[Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]]] = None,
+                 **kwargs: Any) -> None:
         self._screen_people = screen_people
         self._current_tag: Optional[str] = None
         self._guidance = guidance
@@ -135,7 +137,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._max_total_calls = max(self.MAX_TOTAL_EXECUTOR_CALLS, max_steps * 3)
         self._start_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self._leg_stops: List[Tuple[int, Tuple[int, int]]] = []
-        self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {}
+        self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {
+            k: {d: list(notes) for d, notes in by_dir.items()}
+            for k, by_dir in (initial_blocked_moves or {}).items()
+        }
         self._last_settled_step: Optional[int] = None
         self.last_executor = None
         self.plan: List[str] = []

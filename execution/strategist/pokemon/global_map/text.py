@@ -89,16 +89,49 @@ def sector(dx: int, dy: int) -> str:
     return SECTORS[int(round(math.atan2(dy, dx) / (math.pi / 4))) % 8]
 
 
+def blocked_moves_lines(
+    gmap: GlobalMap,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> List[str]:
+    if not blocked_moves or not gmap.current:
+        return []
+    from .model import DIRECTIONS
+
+    px, py = gmap.pos
+    items = []
+    for b_pos in sorted(blocked_moves):
+        dirs = [d for d in blocked_moves[b_pos] if d in DIRECTIONS]
+        if not dirs:
+            continue
+        seen_d: List[str] = []
+        for d in dirs:
+            if d not in seen_d:
+                seen_d.append(d)
+        dx, dy = b_pos[0] - px, b_pos[1] - py
+        here = " [HERE]" if (dx, dy) == (0, 0) else f" (relative ({dx}, {dy}) from you)"
+        items.append(f"- at area coordinate {b_pos}{here}: blocked moving {', '.join(seen_d)}")
+    if not items:
+        return []
+    return [
+        "Blocked movement directions empirically recorded in this area "
+        "(impassable wall/obstacle — never route through these coordinates/directions):",
+        *items,
+    ]
+
+
 def _mapped_paths_from_start(
     gmap: GlobalMap,
     blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+    local_kinds: Optional[Dict[Cell, str]] = None,
 ) -> Dict[Cell, Optional[Tuple[Cell, str, str]]]:
     import heapq
+    from execution.perception.pokemon.navigation import in_bounds
     from .model import DIRECTIONS
     from .routes import STEP_COSTS
 
     seg = gmap.current
     start = gmap.pos
+    px, py = start
     blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
     best: Dict[Cell, int] = {start: 0}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
@@ -114,6 +147,10 @@ def _mapped_paths_from_start(
             nxt, move = (cell[0] + dx, cell[1] + dy), "walk"
             if nxt in blocked_targets:
                 continue
+            if local_kinds is not None:
+                rel = (nxt[0] - px, nxt[1] - py)
+                if in_bounds(rel) and local_kinds.get(rel) == BLOCKED:
+                    continue
             c = seg.get(nxt)
             if c is None:
                 continue
@@ -121,6 +158,10 @@ def _mapped_paths_from_start(
                 nxt, move, step = (nxt[0] + dx, nxt[1] + dy), "jump", 2
                 if nxt in blocked_targets:
                     continue
+                if local_kinds is not None:
+                    rel_land = (nxt[0] - px, nxt[1] - py)
+                    if in_bounds(rel_land) and local_kinds.get(rel_land) == BLOCKED:
+                        continue
                 landing = seg.get(nxt)
                 if landing is None or landing.kind not in STEP_COSTS:
                     continue
@@ -160,7 +201,7 @@ def frontier_targets(
     from .routes import compress_moves
 
     px, py = gmap.pos
-    previous = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves)
+    previous = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves, local_kinds=local_kinds)
     mass: Counter = Counter()
     nearest: Dict[str, Dict[str, Any]] = {}
     for g in gmap.frontier():
@@ -431,7 +472,7 @@ def door_lines(
 
     px, py = gmap.pos
     walked = walked_squares(gmap, gmap.segment)
-    reached = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves)
+    reached = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves, local_kinds=local_kinds)
     doors = []
     for door in gmap.reachable_door_list():
         leads_to = door["leads_to"]

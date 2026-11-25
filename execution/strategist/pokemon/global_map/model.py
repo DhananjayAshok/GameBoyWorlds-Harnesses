@@ -308,15 +308,15 @@ class GlobalMap(StrategistArtifact):
         seg_blocked = self.blocked_cells[si] if si < len(self.blocked_cells) else set()
         restored = 0
         for g, cnt in self.visits[si].items():
-            if cnt <= 0:
+            if cnt <= 0 or g in seg_blocked:
                 continue
-            seg_blocked.discard(g)
             c = seg.get(g)
             if (
                 c is not None
                 and c.kind == BLOCKED
                 and not is_door(c)
                 and "ground" in c.tags
+                and "obstacle" not in c.tags
                 and not (set(c.tags) & {"sign", "interactable object", "pc", "water", "ledge", "right_ledge", "left_ledge"})
             ):
                 c.kind = WALKABLE
@@ -2336,14 +2336,11 @@ class GlobalMap(StrategistArtifact):
                     new_kind = self._classify(new_tags, c.hashes)
                 if g in seg_blocked:
                     if (
-                        (si < len(self.visits) and self.visits[si].get(g, 0) > 0)
-                        or (
-                            c.hashes
-                            and len(c.hashes) == 4
-                            and len(set(c.hashes)) == 1
-                            and c.hashes[0] is not None
-                            and c.hashes in self.walk_patterns
-                        )
+                        c.hashes
+                        and len(c.hashes) == 4
+                        and len(set(c.hashes)) == 1
+                        and c.hashes[0] is not None
+                        and c.hashes in self.walk_patterns
                     ):
                         seg_blocked.discard(g)
                     elif new_kind == WALKABLE and not bool(set(new_tags) & DOOR_TAGS):
@@ -2351,15 +2348,25 @@ class GlobalMap(StrategistArtifact):
                 if (
                     si < len(self.visits)
                     and self.visits[si].get(g, 0) > 0
+                    and g not in seg_blocked
                     and new_kind == BLOCKED
                     and not is_door(c)
                     and not bool(set(new_tags) & DOOR_TAGS)
+                    and _pattern_learnable(c.hashes, c.pixels)
                     and (c.kind == WALKABLE or "ground" in c.tags or "ground" in new_tags)
                     and not (set(new_tags) & {"sign", "interactable object", "pc", "water", "ledge", "right_ledge", "left_ledge"})
                 ):
                     new_kind = WALKABLE
                     if "obstacle" in new_tags:
                         new_tags = tuple(t for t in new_tags if t != "obstacle") or ("ground",)
+                elif (
+                    si < len(self.visits)
+                    and self.visits[si].get(g, 0) > 0
+                    and new_kind == BLOCKED
+                    and "obstacle" in new_tags
+                    and not _pattern_learnable(c.hashes, c.pixels)
+                ):
+                    self.visits[si].pop(g, None)
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1

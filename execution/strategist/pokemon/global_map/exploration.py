@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from .routes import plan_route
-from .text import LEGEND, ascii_window, door_lines, elsewhere_lines, frontier_targets, route_lines
+from .text import (LEGEND, ascii_window, blocked_moves_lines, door_lines, elsewhere_lines, frontier_targets,
+                   route_lines)
 
 if TYPE_CHECKING:
     from .model import Cell, GlobalMap
@@ -38,8 +39,13 @@ def explore_elsewhere(gmap: GlobalMap) -> List[Dict[str, Any]]:
     return out
 
 
-def explore_text(gmap: GlobalMap) -> str:
+def explore_text(
+    gmap: GlobalMap,
+    local_kinds: Optional[Dict[Cell, str]] = None,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> str:
     here, lines = gmap.area_label(gmap.segment), []
+    lines += blocked_moves_lines(gmap, blocked_moves)
     edge = len(gmap.frontier())
     doors = gmap.reachable_door_list()
     unentered = sum(door["leads_to"] is None for door in doors)
@@ -53,7 +59,7 @@ def explore_text(gmap: GlobalMap) -> str:
             )
         else:
             lines.append(f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''}.")
-        targets, mass = frontier_targets(gmap)
+        targets, mass = frontier_targets(gmap, local_kinds, blocked_moves=blocked_moves)
         if targets:
             for t in targets:
                 route_note = f" (mapped route, {t['path_steps']} moves: {t['path_moves']})" if t.get("path_moves") else ""
@@ -100,26 +106,28 @@ def stuck_signs(gmap: GlobalMap, recent_episodes: Iterable[int], failure_streak:
 def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
                  local_kinds: Optional[Dict[Cell, str]] = None,
                  explore: bool = False, episode: Optional[int] = None,
-                 failed_tasks: Iterable[str] = ()) -> Tuple[str, Optional[Dict[str, Any]]]:
+                 failed_tasks: Iterable[str] = (),
+                 blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
     """The map section of the dispatch prompt and, when exploring, the target that overrides the task.
     Does not change the map: the caller applies override["until"] with `keep_exploring`."""
     recent = list(recent_episodes)
     stale = gmap.episodes_without_new_cells(recent)
-    targets, mass = frontier_targets(gmap, local_kinds)
+    targets, mass = frontier_targets(gmap, local_kinds, blocked_moves=blocked_moves)
     here = gmap.info(gmap.segment)
     lines = [f"You are in the area you named {gmap.place_label()}: {here.description}"] if here.name else []
     if here.explored is not None and not targets:
         lines.append("You have fully explored this area: no edge of its map is left unexplored.")
     lines += [
         "MAP OF EVERYTHING YOU HAVE SEEN IN THIS AREA (north is up, one character per step):",
-        ascii_window(gmap),
+        ascii_window(gmap, blocked_moves=blocked_moves),
         "Legend: " + LEGEND,
         f"Squares mapped here: {len(gmap.current)} (in {gmap.n_areas} separate area(s) overall). "
         f"New squares found in the last episode: "
         f"{gmap.new_cells_by_episode.get(max(recent), 0) if recent else 0}; "
         f"episodes in a row with nothing new: {stale}.",
     ]
-    lines += door_lines(gmap, local_kinds)
+    lines += blocked_moves_lines(gmap, blocked_moves)
+    lines += door_lines(gmap, local_kinds, blocked_moves=blocked_moves)
     lines += route_lines(gmap)
     if targets:
         lines.append("The nearest edge of the map you have NOT explored yet in each direction "
