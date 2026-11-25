@@ -228,6 +228,7 @@ class GlobalMap(StrategistArtifact):
         self.stats: Counter = Counter()
         self.exploring_until: Optional[int] = None
         self.segment_born = 0
+        self.segment_born_id = 0
         self.warps: List[Tuple[int, int, Cell, int, Cell]] = []
         self.warp_moves: List[Optional[str]] = []
         self.fade_direction: Optional[str] = None
@@ -250,6 +251,7 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("seen_entrances", None)
         self.__dict__.setdefault("exploring_until", None)
         self.__dict__.setdefault("segment_born", 0)
+        self.__dict__.setdefault("segment_born_id", len(self.segments) - 1)
         self.__dict__.setdefault("warps", [])
         self.__dict__.setdefault("warp_moves", [None] * len(self.warps))
         self.__dict__.setdefault("in_battle", False)
@@ -860,6 +862,7 @@ class GlobalMap(StrategistArtifact):
         self.faded = False
         self.in_battle = False
         self.segment_born = self.stats["placed"]
+        self.segment_born_id = self.segment
         self.stats["new_segment"] += 1
         self.observe(frame, identified, shift)
         if prev_segment != self.segment:
@@ -1164,13 +1167,22 @@ class GlobalMap(StrategistArtifact):
         return targets
 
     def _try_merge(self, frame: np.ndarray) -> None:
-        if self.segment == 0 or self.stats["placed"] - self.segment_born > MERGE_WINDOW:
+        if (
+            self.segment == 0
+            or self.segment != getattr(self, "segment_born_id", len(self.segments) - 1)
+            or bool(self.info(self.segment).name)
+            or self.stats["placed"] - self.segment_born > MERGE_WINDOW
+            or getattr(self, "_last_merge_try_pos", None) == (self.segment, self.pos)
+        ):
             return
+        self._last_merge_try_pos = (self.segment, self.pos)
         warp_targets = self._known_warp_targets(for_merge=True)
         found = self.relocalise(frame, exclude=self.segment, warp_targets=warp_targets)
         if found is None:
             return
         target, target_pos = found
+        if self.names_differ(self.segment, target):
+            return
         offset = (target_pos[0] - self.pos[0], target_pos[1] - self.pos[1])
         if self.merge_breaks_doors(self.segment, target, offset):
             alt_offset = None
@@ -1192,8 +1204,6 @@ class GlobalMap(StrategistArtifact):
                 self.stats["merge_door_vetoes"] += 1
                 return
             offset = alt_offset
-        if self.names_differ(self.segment, target):
-            return
         self._merge(self.segment, target, offset)
         if self.segment == target and self.pos != target_pos:
             self.pos = target_pos
@@ -1983,10 +1993,17 @@ class GlobalMap(StrategistArtifact):
             after_moves.append(m)
             before_warps.append((t, a, pa, b, pb))
 
+        overlap_cache: Dict[Tuple[int, int], Optional[Dict[str, Any]]] = {}
+
         def coupled_same(other1: int, q1: Cell, other2: int, q2: Cell) -> bool:
             if other1 == other2:
                 return self._same_door(other1, q1, q2)
-            ov = self.overlap(other1, other2)
+            if self.names_differ(other1, other2):
+                return False
+            cache_key = (other1, other2)
+            if cache_key not in overlap_cache:
+                overlap_cache[cache_key] = self.overlap(other1, other2)
+            ov = overlap_cache[cache_key]
             if (
                 ov is not None
                 and ov["matches"] >= CONSOLIDATE_MIN_CELLS

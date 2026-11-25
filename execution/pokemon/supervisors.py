@@ -1171,7 +1171,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if self._env_done() or self._battles_lost():
                 break
             if self._agent_state() == AgentState.FREE_ROAM:
+                step_before_settle = getattr(getattr(self._env, "_emulator", None), "step_count", None)
                 self._settle_free_roam()
+                step_after_settle = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+                if step_after_settle != step_before_settle and combined is not None:
+                    combined["report"].final_state = self._env.get_info()
             next_frame = self._current_frame()
             next_state = self._effective_state(next_frame)
             if next_state == AgentState.FREE_ROAM:
@@ -1199,7 +1203,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self,
         ticks: int = 2,
         max_cutscene_ticks: int = 30,
-        post_motion_ticks: int = 4,
+        post_motion_ticks: int = 2,
         post_warp_banner_ticks: int = 6,
     ) -> None:
         cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
@@ -1213,6 +1217,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     or is_blank_or_fade_frame(before)
                     or (has_top_dialogue_box(before) and not has_menu_cursor(before))):
                 return
+        env_dialogue_settled = getattr(self._env, "_last_dialogue_settled_step", None)
+        if cur_step is not None and cur_step == env_dialogue_settled:
+            ticks = min(ticks, 1)
         waited = 0
         post_motion_remaining = 0
         saw_fade = False
