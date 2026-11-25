@@ -1508,28 +1508,36 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             dir_list = self._blocked_moves.setdefault(b_place, {}).setdefault(b_dir, [])
                             if detail not in dir_list:
                                 dir_list.append(detail)
-                    move_dir = parse_edge_direction(task) if action == "MoveOff" else None
-                    if move_dir is None and result.get("notes"):
-                        m_dir = re.search(r"Blocked.*moving\s+(up|down|left|right)", str(result.get("notes")), re.IGNORECASE)
-                        if m_dir:
-                            move_dir = m_dir.group(1).lower()
-                    if move_dir is None and action == "Free":
-                        m_dir = re.search(r"\b(up|down|left|right|north|south|west|east)\b", task, re.IGNORECASE)
-                        if m_dir:
-                            aliases = {"north": "up", "south": "down", "west": "left", "east": "right"}
-                            move_dir = aliases.get(m_dir.group(1).lower(), m_dir.group(1).lower())
-                    if move_dir:
-                        recorder = getattr(self._env, "record_blocked_step", None)
-                        if callable(recorder):
-                            try:
-                                recorder(direction=move_dir)
-                            except Exception:  # noqa: BLE001
-                                pass
-                        detail = f"{request} -> {result['reason']}"
-                        for place_key in {p for p in (before_place, after_place) if p is not None}:
-                            dir_list = self._blocked_moves.setdefault(place_key, {}).setdefault(move_dir, [])
-                            if detail not in dir_list:
-                                dir_list.append(detail)
+                    if not exec_blocked:
+                        move_dir = None
+                        if result.get("notes"):
+                            m_dir = re.search(
+                                r"(?:Blocked|Stopped|Could not finish).*moving\s+(up|down|left|right)",
+                                str(result.get("notes")),
+                                re.IGNORECASE,
+                            )
+                            if m_dir:
+                                move_dir = m_dir.group(1).lower()
+                        if move_dir is None and action == "MoveOff":
+                            move_dir = parse_edge_direction(task)
+                        if move_dir is None and action == "Free":
+                            m_dir = re.search(r"\b(up|down|left|right|north|south|west|east)\b", task, re.IGNORECASE)
+                            if m_dir:
+                                aliases = {"north": "up", "south": "down", "west": "left", "east": "right"}
+                                move_dir = aliases.get(m_dir.group(1).lower(), m_dir.group(1).lower())
+                        if move_dir:
+                            recorder = getattr(self._env, "record_blocked_step", None)
+                            if callable(recorder):
+                                try:
+                                    recorder(direction=move_dir)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            detail = f"{request} -> {result['reason']}"
+                            target_places = [after_place] if after_place is not None else [before_place]
+                            for place_key in (p for p in target_places if p is not None):
+                                dir_list = self._blocked_moves.setdefault(place_key, {}).setdefault(move_dir, [])
+                                if detail not in dir_list:
+                                    dir_list.append(detail)
                 note = f"{request} did not work: {result['reason']}" + (
                     f" ({result['notes']})" if result.get("notes") else "")
                 if move_tag:

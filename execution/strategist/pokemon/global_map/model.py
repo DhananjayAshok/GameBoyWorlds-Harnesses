@@ -689,7 +689,7 @@ class GlobalMap(StrategistArtifact):
             if (x, y) == (0, 0) or self.visits[self.segment].get(g, 0) > 0:
                 seg_blocked.discard(g)
             elif g in seg_blocked and kind == WALKABLE and not bool(set(tags) & DOOR_TAGS):
-                if (can_learn_walkable or len(set(hashes)) == 1) and None not in hashes and hashes in self.walk_patterns:
+                if len(set(hashes)) == 1 and None not in hashes and hashes in self.walk_patterns:
                     seg_blocked.discard(g)
                 else:
                     kind = BLOCKED
@@ -856,11 +856,12 @@ class GlobalMap(StrategistArtifact):
             ):
                 dx, dy = DIRECTIONS[direction]
                 seg = self.segments[self.segment]
+                seg_blocked = self.blocked_cells[self.segment] if self.segment < len(self.blocked_cells) else set()
                 adv_pos = self.pos
                 for _ in range(reported):
                     nxt = (adv_pos[0] + dx, adv_pos[1] + dy)
                     c_nxt = seg.get(nxt)
-                    if c_nxt is not None and c_nxt.kind in (BLOCKED, LEDGE, LEDGE_LEFT):
+                    if nxt in seg_blocked or (c_nxt is not None and c_nxt.kind in (BLOCKED, LEDGE, LEDGE_LEFT)):
                         break
                     adv_pos = nxt
                     self.visits[self.segment][adv_pos] += 1

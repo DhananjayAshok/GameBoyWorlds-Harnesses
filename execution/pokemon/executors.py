@@ -652,6 +652,7 @@ class GridMoveExecutor(PolicyExecutor):
         self._displacement: Tuple[int, int] = (0, 0)
         self._last_step_taken = 0
         self._saw_cutscene_activity = False
+        self._blocked_at_place: Dict[Any, List[str]] = {}
         super().__init__(env, task, max_steps, screen_tiles=screen_tiles, cell_kinds=cell_kinds,
                          identified=identified, **kwargs)
 
@@ -682,6 +683,11 @@ class GridMoveExecutor(PolicyExecutor):
             return None
 
     def _record_empirical_block(self, direction: str) -> None:
+        place = self._current_map_place()
+        if place is not None and direction in DIRECTIONS:
+            blocked_list = self._blocked_at_place.setdefault(place, [])
+            if direction not in blocked_list:
+                blocked_list.append(direction)
         recorder = getattr(self._env, "record_blocked_step", None)
         if callable(recorder):
             try:
@@ -889,6 +895,7 @@ class GridMoveExecutor(PolicyExecutor):
             self._steps_taken += taken
             self._last_step_taken += taken
             after_place = self._current_map_place()
+            mult = 2 if (move_kind == "jump" and taken > 0) else 1
             if (
                 before_place is not None
                 and after_place is not None
@@ -898,7 +905,6 @@ class GridMoveExecutor(PolicyExecutor):
                 step_dx = after_place[1][0] - before_place[1][0]
                 step_dy = after_place[1][1] - before_place[1][1]
             else:
-                mult = 2 if (move_kind == "jump" and taken > 0) else 1
                 step_dx, step_dy = dx * taken * mult, dy * taken * mult
             self._displacement = (self._displacement[0] + step_dx, self._displacement[1] + step_dy)
             state = self._get_state()["pokemon_core"]["agent_state"]
@@ -925,6 +931,25 @@ class GridMoveExecutor(PolicyExecutor):
                         and self._n_moves < self._max_steps):
                     retried_after_cutscene = True
                     continue
+                settled_place = self._current_map_place()
+                if (
+                    taken > 0
+                    and before_place is not None
+                    and settled_place == before_place
+                ):
+                    gmap = getattr(self._env, "_map", None)
+                    if gmap is not None and getattr(gmap, "pos", None) is not None:
+                        expected_pos = (
+                            before_place[1][0] + dx * taken * mult,
+                            before_place[1][1] + dy * taken * mult,
+                        )
+                        gmap.pos = expected_pos
+                        if gmap.segment < len(gmap.visits):
+                            gmap.visits[gmap.segment][expected_pos] += 1
+                        self._displacement = (
+                            self._displacement[0] - step_dx + dx * taken * mult,
+                            self._displacement[1] - step_dy + dy * taken * mult,
+                        )
                 self._record_empirical_block(direction)
                 if taken == 0 and not action_return.get("rotated"):
                     return self._fail(MOVE_BLOCKED, "move_blocked",
