@@ -27,7 +27,7 @@ from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
                                                      filter_forward_edge_cells, filter_open_lane_edge_cells, in_bounds,
                                                      is_boundary_exit_direction, is_ledge_roofed_edge_cell,
-                                                     parse_all_cells, parse_avoided_cells,
+                                                     is_on_edge, parse_all_cells, parse_avoided_cells,
                                                      parse_cell, parse_edge_direction, shortest_path, verbalize_edges,
                                                      warp_cells)
 from execution.executor_action import coords_to_string
@@ -1445,6 +1445,8 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 else:
                     preferred = candidate_explicit
             path = shortest_path(self.cell_kinds, (0, 0), preferred, avoid_cells=path_avoid, people=people)
+            if path is None and open_cells:
+                path = shortest_path(self.cell_kinds, (0, 0), open_cells, avoid_cells=path_avoid, people=people)
             target = path[-1][2] if path else preferred[0]
             return direction, target
 
@@ -1458,6 +1460,13 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 )
                 if len(aligned) == 1:
                     return direction, aligned[0]
+
+        unreached_edge_coords = [c for c in coords if is_on_edge(c, direction)]
+        if unreached_edge_coords and (open_cells or forward_cells or cells):
+            candidates = open_cells or forward_cells or cells
+            path = shortest_path(self.cell_kinds, (0, 0), candidates, avoid_cells=path_avoid, people=people)
+            if path:
+                return direction, path[-1][2]
 
         stripped = self._task.strip().lower()
         is_bare_direction = stripped in ("up", "down", "left", "right", "north", "south", "west", "east")
@@ -1584,11 +1593,72 @@ Location: <(x, y) or Not Found>
                         if safe_open_path:
                             target = safe_open_path[-1][2]
 
-        initial_edge_runs = edge_runs(edge_cells(self.cell_kinds, direction), direction)
+        initial_cells = edge_cells(self.cell_kinds, direction)
+        initial_forward = filter_forward_edge_cells(initial_cells, direction)
+        initial_open = filter_open_lane_edge_cells(
+            initial_forward or initial_cells,
+            direction,
+            self.cell_kinds,
+            getattr(self._env, "_map", None),
+            identified=self.identified,
+            people=self._people_now(),
+        ) or initial_forward or initial_cells
+        initial_edge_runs = edge_runs(initial_cells, direction)
         target_run = next((r for r in initial_edge_runs if target in r), [target])
         self.target_cell = target
         initial_frame = self._get_state()["core"]["current_frame"]
         code = self._walk({target: None}, prefer_lateral=True)
+        if code == MOVE_BLOCKED:
+            if is_on_edge(self._displacement, direction) and self._can_step_from_current(direction) is not False:
+                target = self._displacement
+                target_run = next((r for r in initial_edge_runs if target in r), [target])
+                self.target_cell = target
+                self.report.termination_reason = None
+                self.report.notes = None
+                code = None
+            elif (
+                self._n_moves < self._max_steps
+                and self._get_state()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
+                and not has_bottom_dialogue_box(self._get_state()["core"]["current_frame"])
+            ):
+                dx_d, dy_d = self._displacement
+                fallback_map = {
+                    (oc[0] - dx_d, oc[1] - dy_d): oc
+                    for oc in initial_open
+                    if oc != target and in_bounds((oc[0] - dx_d, oc[1] - dy_d))
+                }
+                if fallback_map:
+                    self._refresh_local_perception()
+                    fb_avoid = warp_cells(self.identified, getattr(self._env, "_map", None))
+                    fb_path = shortest_path(
+                        self.cell_kinds,
+                        (0, 0),
+                        list(fallback_map.keys()),
+                        prefer_lateral=True,
+                        avoid_cells=fb_avoid,
+                        people=self._people_now(),
+                    )
+                    if fb_path is not None:
+                        rel_fb = fb_path[-1][2]
+                        orig_fb = fallback_map[rel_fb]
+                        self.report.termination_reason = None
+                        self.report.notes = None
+                        code = self._walk({rel_fb: None}, prefer_lateral=True)
+                        if code is None:
+                            target = orig_fb
+                            target_run = next((r for r in initial_edge_runs if target in r), [target])
+                            self.target_cell = target
+                        elif (
+                            code == MOVE_BLOCKED
+                            and is_on_edge(self._displacement, direction)
+                            and self._can_step_from_current(direction) is not False
+                        ):
+                            target = self._displacement
+                            target_run = next((r for r in initial_edge_runs if target in r), [target])
+                            self.target_cell = target
+                            self.report.termination_reason = None
+                            self.report.notes = None
+                            code = None
         if code is not None:
             return code
         after_walk_frame = self._get_state()["core"]["current_frame"]

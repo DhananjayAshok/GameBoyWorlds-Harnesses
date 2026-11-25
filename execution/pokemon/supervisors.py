@@ -12,9 +12,10 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_blank_or_fade_frame,
                                                  is_cutscene_frame_changing)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
-                                                     cell_kinds, compress_path, edge_cells, edge_runs,
-                                                     format_path_runs, in_bounds, parse_edge_direction, shortest_path,
-                                                     verbalize_edges)
+                                                     boundary_exit_direction, cell_kinds, compress_path, edge_cells,
+                                                     edge_runs, filter_open_lane_edge_cells, format_path_runs,
+                                                     in_bounds, is_boundary_exit_direction, is_on_edge,
+                                                     parse_edge_direction, shortest_path, verbalize_edges, warp_cells)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
                                          InteractionExecutor, MenuExecutor,
@@ -65,6 +66,65 @@ ACTION_PATTERN = re.compile(r"^\s*`?(" + "|".join(ACTIONS) + r")\s*\((.*)\)\s*`?
 
 
 FREE_TERMINATION_PATTERN = re.compile(r"[;,.]?\s*stop\s+when\s*:?\s*", re.IGNORECASE)
+
+_FREE_DIR_WORD_MAP = {
+    "up": "up", "north": "up",
+    "down": "down", "south": "down",
+    "left": "left", "west": "left",
+    "right": "right", "east": "right",
+}
+_FREE_NUM_WORD_MAP = {
+    "once": 1, "one": 1,
+    "twice": 2, "two": 2,
+    "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+_FREE_COUNT_TOKEN = r"(?:\d+|once|twice|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+_FREE_DIR_TOKEN = r"(?:up|down|left|right|north|south|west|east)"
+_FREE_COUNTED_DIR_PATTERN = re.compile(
+    rf"\b(?:"
+    rf"(?P<dir1>{_FREE_DIR_TOKEN})\s+(?P<cnt1>{_FREE_COUNT_TOKEN})(?:\s+(?:times?|steps?|tiles?|squares?))?\b"
+    rf"|(?P<cnt2>{_FREE_COUNT_TOKEN})\s+(?:times?|steps?|tiles?|squares?)\s+(?:to\s+the\s+)?(?P<dir2>{_FREE_DIR_TOKEN})\b"
+    rf")",
+    re.IGNORECASE,
+)
+_FREE_CLAUSE_DIR_PATTERN = re.compile(
+    rf"\b(?:press(?:ing)?|walk(?:ing)?|mov(?:e|ing)|go(?:ing)?|step(?:ping)?|head(?:ing)?)\s+(?P<dir>{_FREE_DIR_TOKEN})\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_count_token(token: str) -> int:
+    t = token.strip().lower()
+    if t.isdigit():
+        return int(t)
+    return _FREE_NUM_WORD_MAP.get(t, 1)
+
+
+def parse_free_directional_legs(instruction: str) -> List[Tuple[str, int]]:
+    legs: List[Tuple[str, int]] = []
+    for m in _FREE_COUNTED_DIR_PATTERN.finditer(instruction):
+        d_raw = m.group("dir1") or m.group("dir2")
+        c_raw = m.group("cnt1") or m.group("cnt2")
+        if d_raw and c_raw:
+            d = _FREE_DIR_WORD_MAP[d_raw.lower()]
+            c = _parse_count_token(c_raw)
+            if c > 0:
+                if legs and legs[-1][0] == d:
+                    legs[-1] = (d, legs[-1][1] + c)
+                else:
+                    legs.append((d, c))
+    if legs:
+        return legs
+    for m in _FREE_CLAUSE_DIR_PATTERN.finditer(instruction):
+        prefix = instruction[max(0, m.start() - 4):m.start()].lower()
+        if "to " in prefix and legs:
+            continue
+        d = _FREE_DIR_WORD_MAP[m.group("dir").lower()]
+        if not legs or legs[-1][0] != d:
+            legs.append((d, 1))
+    return legs
 
 
 def split_free_argument(argument: str) -> Tuple[str, Optional[str]]:
@@ -849,6 +909,120 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     MAX_DECISION_RETRY_CHARS = 1500
 
+    def _best_open_edge_target(
+        self,
+        direction: str,
+        local_kinds: Dict[Tuple[int, int], str],
+    ) -> Optional[Tuple[int, int]]:
+        cells = edge_cells(local_kinds, direction)
+        if not cells:
+            return None
+        runs = edge_runs(cells, direction)
+        open_cells = [c for r in runs if self._run_pocket_bounds(direction, r) is None for c in r]
+        if not open_cells:
+            return None
+        gmap = self._global_map()
+        people = self._people_now()
+        warps = warp_cells(identified=self._identified, global_map=gmap)
+        open_lane_cells = filter_open_lane_edge_cells(
+            open_cells, direction, local_kinds, gmap, identified=self._identified, people=people
+        )
+        candidates = open_lane_cells or open_cells
+        path = shortest_path(local_kinds, (0, 0), candidates, avoid_cells=warps, people=people)
+        return path[-1][2] if path else candidates[0]
+
+    def _coerce_free_navigation_decision(
+        self,
+        argument: Optional[str],
+        frame,
+    ) -> Optional[Tuple[str, str]]:
+        if not argument:
+            return None
+        if (
+            self._effective_state(frame) != AgentState.FREE_ROAM
+            or self._is_in_dialogue(frame)
+            or has_bottom_dialogue_box(frame)
+            or has_top_dialogue_box(frame)
+            or has_emote_bubble(frame)
+            or is_blank_or_fade_frame(frame)
+            or has_menu_cursor(frame)
+            or is_battle_screen(frame)
+        ):
+            return None
+        instruction, termination = split_free_argument(argument)
+        if re.search(
+            r"\b(?:a|b|start|menu|talk|speak|interact|dialogue|text|cutscene|wait|evolve|evolution)\b",
+            instruction,
+            re.IGNORECASE,
+        ):
+            return None
+        if re.search(
+            r"\b(?:up\s+and\s+down|down\s+and\s+up|left\s+and\s+right|right\s+and\s+left|back\s+and\s+forth|tall\s+grass|grind|level\s+up)\b",
+            instruction,
+            re.IGNORECASE,
+        ):
+            return None
+        if termination and re.search(r"\bwild\s+pokemon\b", termination, re.IGNORECASE) and not re.search(
+            r"\b(?:or|walked|reached|passed|past|cleared|entered|exited|chamber|corridor|passage|pillar|wall)\b",
+            termination,
+            re.IGNORECASE,
+        ):
+            return None
+        local_kinds = self._current_local_kinds()
+        if not local_kinds:
+            return None
+        if boundary_exit_direction(local_kinds, self._identified, (0, 0)) is not None:
+            return None
+        legs = parse_free_directional_legs(instruction)
+        if not legs:
+            return None
+        if len(legs) == 1 and legs[0][1] <= 2 and is_boundary_exit_direction(local_kinds, (0, 0), legs[0][0]):
+            return None
+        if len(legs) < 2 and legs[0][1] < 4:
+            return None
+        gmap = self._global_map()
+        warps = warp_cells(identified=self._identified, global_map=gmap)
+        if len(legs) >= 2:
+            cur = (0, 0)
+            prefix_ok = True
+            for d_leg, n_leg in legs[:-1]:
+                dx_l, dy_l = DIRECTIONS[d_leg]
+                for _ in range(n_leg):
+                    nxt = (cur[0] + dx_l, cur[1] + dy_l)
+                    if not in_bounds(nxt) or local_kinds.get(nxt) != WALKABLE or nxt in warps:
+                        prefix_ok = False
+                        break
+                    cur = nxt
+                if not prefix_ok:
+                    break
+            if prefix_ok:
+                dir_last, n_last = legs[-1]
+                dx_last, dy_last = DIRECTIONS[dir_last]
+                probe = cur
+                reached_edge_cell = None
+                for _ in range(max(n_last, 10)):
+                    if is_on_edge(probe, dir_last):
+                        reached_edge_cell = probe
+                        break
+                    nxt = (probe[0] + dx_last, probe[1] + dy_last)
+                    if not in_bounds(nxt) or local_kinds.get(nxt) != WALKABLE or nxt in warps:
+                        break
+                    probe = nxt
+                    if is_on_edge(probe, dir_last):
+                        reached_edge_cell = probe
+                        break
+                if reached_edge_cell is not None and reached_edge_cell in edge_cells(local_kinds, dir_last):
+                    return "MoveOff", f"{dir_last} via {reached_edge_cell}"
+            for d_leg, _ in legs:
+                target = self._best_open_edge_target(d_leg, local_kinds)
+                if target is not None:
+                    return "MoveOff", f"{d_leg} via {target}"
+        elif len(legs) == 1 and legs[0][1] >= 4:
+            target = self._best_open_edge_target(legs[0][0], local_kinds)
+            if target is not None:
+                return "MoveOff", f"{legs[0][0]} via {target}"
+        return None
+
     def _decide(self, subgoal: str, attempts: List[str], frame) -> Tuple[Optional[Tuple[str, Optional[str]]], str]:
         attempts_block = ""
         if attempts:
@@ -857,16 +1031,34 @@ class PokemonPlayThroughSupervisor(Supervisor):
         prompt = (self._fill_prompt(PLAYTHROUGH_SUBGOAL_DECISION_PROMPT)
                   .replace("[SUBGOAL]", subgoal)
                   .replace("[ATTEMPTS_BLOCK]", attempts_block))
-        output = self._vlm_call("decision", texts=prompt, images=[frame])
+        output, records = self._vlm_infer("decision", texts=prompt, images=[frame])
         decision = parse_decision(output)
         if decision is None:
+            self.report.event_log.extend(records)
+            hook = getattr(self, "_on_event_logged", None)
+            if callable(hook):
+                hook()
             retry_prompt = prompt + PLAYTHROUGH_DECISION_RETRY_BLOCK.replace(
                 "[PREVIOUS]", (output or "")[-self.MAX_DECISION_RETRY_CHARS:]
             )
-            output = self._vlm_call("decision", texts=retry_prompt, images=[frame])
+            output, records = self._vlm_infer("decision", texts=retry_prompt, images=[frame])
             decision = parse_decision(output)
         if decision is None:
             log_warn(f"Could not parse a decision from: {output!r}", self._parameters)
+        elif decision[0] == "Free":
+            coerced = self._coerce_free_navigation_decision(decision[1], frame)
+            if coerced is not None:
+                decision = coerced
+                if records:
+                    records[-1].response = re.sub(
+                        r"(?im)^(\s*Action\s*:\s*).*$",
+                        f"\1{coerced[0]}({coerced[1]})",
+                        str(records[-1].response),
+                    )
+        self.report.event_log.extend(records)
+        hook = getattr(self, "_on_event_logged", None)
+        if callable(hook):
+            hook()
         reasoning = (parse_key_value(output, "Reasoning") or "").strip()
         return decision, reasoning
 
