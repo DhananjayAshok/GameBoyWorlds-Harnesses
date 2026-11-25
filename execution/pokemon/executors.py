@@ -3014,7 +3014,7 @@ What you have been asked to do: "[TASK]"
 Stop when: [TERMINATION]
 
 The image is the current screen.
-Choose the single button press that best moves towards what you have been asked to do.
+Choose the single button press that best moves towards what you have been asked to do. Note: a thin 2-tile-tall area/location name banner at the bottom of the screen is a non-blocking overlay that disappears automatically as you walk—do not press a or b to dismiss an area/location name banner when your task is to walk.
 
 The buttons are: a, b, start, up, down, left, right.
 
@@ -3031,7 +3031,7 @@ Stop when: [TERMINATION]
 
 The image is the current screen.
 [HISTORY]
-First decide, from this screen, whether the condition to stop at has been met (a bordered dialogue box at the bottom of the screen—even if blank or mid-text—means dialogue is still open). If it has not, choose the single button press that best moves towards it. Keep Reasoning concise (at most 3-4 sentences) and never repeat a direction listed as blocked at your current position.
+First decide, from this screen, whether the condition to stop at has been met (a 3-tile-tall bordered dialogue box at the bottom of the screen—even if blank or mid-text—means dialogue is still open, whereas a thin 2-tile-tall area/location name banner is a non-blocking overlay that does not block walking and should not be dismissed with a or b). If it has not, choose the single button press that best moves towards it. Keep Reasoning concise (at most 3-4 sentences) and never repeat a direction listed as blocked at your current position.
 
 The buttons are: a, b, start, up, down, left, right.
 
@@ -3178,7 +3178,25 @@ Press: <one of a, b, start, up, down, left, right>
         displaced = (before_place is not None and mid_place is not None and mid_place != before_place) or scrolled_on_screen
         if self._agent_state() == AgentState.FREE_ROAM:
             if press in ("a", "b"):
-                self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
+                passed = record.transition_states[-1]["core"].get("transition_passed_frames") if record.transition_states else None
+                box_or_emote = (
+                    has_bottom_dialogue_box(record.frame_after)
+                    or self._is_top_box_dialogue(record.frame_after)
+                    or has_emote_bubble(record.frame_after)
+                )
+                cutscene_changed = (
+                    (
+                        passed is not None
+                        and any(is_cutscene_frame_changing(record.frame_before, f) for f in passed)
+                    )
+                    or is_cutscene_frame_changing(record.frame_before, record.frame_after)
+                )
+                if (
+                    box_or_emote
+                    or cutscene_changed
+                    or not has_bottom_location_banner(record.frame_before)
+                ):
+                    self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
             elif press in DIRECTIONS:
                 passed = record.transition_states[-1]["core"].get("transition_passed_frames") if record.transition_states else None
                 box_or_emote = (

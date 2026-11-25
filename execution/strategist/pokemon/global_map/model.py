@@ -1864,6 +1864,56 @@ class GlobalMap(StrategistArtifact):
         trans_src_p = (src_p[0] + dx, src_p[1] + dy)
         return max(abs(trans_src_p[0] - dst_p[0]), abs(trans_src_p[1] - dst_p[1])) <= DOOR_REACH
 
+    def _is_scripted_cutscene_warp(
+        self,
+        a: int,
+        pa: Cell,
+        b: int,
+        pb: Cell,
+        move: Optional[str],
+        source: Optional[int] = None,
+        target: Optional[int] = None,
+        offset: Cell = (0, 0),
+    ) -> bool:
+        if move in DIRECTIONS:
+            return False
+        ra, rpa = self.resolve(a, pa)
+        if source is not None and target is not None and ra == source:
+            ra, rpa = target, (rpa[0] + offset[0], rpa[1] + offset[1])
+        rb, rpb = self.resolve(b, pb)
+        if source is not None and target is not None and rb == source:
+            rb, rpb = target, (rpb[0] + offset[0], rpb[1] + offset[1])
+        if ra == rb or not self._has_min_observations(ra):
+            return False
+        seg_a = self.segments[ra] if 0 <= ra < len(self.segments) else {}
+        da = self._door_at(ra, rpa)
+        ca = seg_a.get(da)
+        if ca is None or is_door(ca) or ca.kind in (OCCUPIED, UNKNOWN):
+            return False
+        for (_, a2, pa2, b2, pb2), m2 in zip(self.warps, self.warp_moves):
+            if (a2, pa2, b2, pb2, m2) == (a, pa, b, pb, move):
+                continue
+            ra2, rpa2 = self.resolve(a2, pa2)
+            if source is not None and target is not None and ra2 == source:
+                ra2, rpa2 = target, (rpa2[0] + offset[0], rpa2[1] + offset[1])
+            rb2, rpb2 = self.resolve(b2, pb2)
+            if source is not None and target is not None and rb2 == source:
+                rb2, rpb2 = target, (rpb2[0] + offset[0], rpb2[1] + offset[1])
+            if ra2 == rb2:
+                continue
+            if (ra2 == ra and self._same_door(ra, rpa, rpa2)) or (rb2 == ra and self._same_door(ra, rpa, rpb2)):
+                return False
+        seg_b = self.segments[rb] if 0 <= rb < len(self.segments) else {}
+        cb = seg_b.get(rpb)
+        if cb is not None and is_door(cb):
+            return False
+        near_b_door = any(
+            (rpb[0] + ox, rpb[1] + oy) in seg_b and is_door(seg_b[(rpb[0] + ox, rpb[1] + oy)])
+            for ox in (-1, 0, 1)
+            for oy in (-1, 0, 1)
+        )
+        return not near_b_door
+
     def _is_round_trip_same_door_warp(
         self,
         a: int,
@@ -1927,6 +1977,8 @@ class GlobalMap(StrategistArtifact):
         for (t, a, pa, b, pb), m in zip(self.warps, self.warp_moves):
             if self._is_round_trip_same_door_warp(a, pa, b, pb, m, source, target, offset):
                 continue
+            if self._is_scripted_cutscene_warp(a, pa, b, pb, m, source, target, offset):
+                continue
             after.append((t, *moved(a, pa), *moved(b, pb)))
             after_moves.append(m)
             before_warps.append((t, a, pa, b, pb))
@@ -1978,6 +2030,9 @@ class GlobalMap(StrategistArtifact):
     def arrival_breaks_doors(self, segment: int, pos: Cell) -> bool:
         if not self.faded:
             return False
+        move = self.fade_direction if self.fade_direction in DIRECTIONS else None
+        if self._is_scripted_cutscene_warp(self.segment, self.pos, segment, pos, move):
+            return False
         cur_seg, _ = self.resolve(self.segment, self.pos)
         dst_seg, dst_pos = self.resolve(segment, pos)
         if (
@@ -1992,7 +2047,6 @@ class GlobalMap(StrategistArtifact):
                 for c in d["cells"]
             ):
                 return True
-        move = self.fade_direction if self.fade_direction in DIRECTIONS else None
         after = self.warps + [(self.step, self.segment, self.pos, segment, pos)]
         return (self.door_conflicts(after, self.warp_moves + [move], self._same_door)
                 > self.door_conflicts(self.warps, self.warp_moves, self._same_door))
@@ -2170,7 +2224,10 @@ class GlobalMap(StrategistArtifact):
 
     def door_labels(self) -> Dict[Tuple[int, Cell], int]:
         labels: Dict[Tuple[int, Cell], int] = {}
-        for _, a, pa, b, pb in self.warps:
+        for idx, (_, a, pa, b, pb) in enumerate(self.warps):
+            m = self.warp_moves[idx] if idx < len(self.warp_moves) else None
+            if self._is_scripted_cutscene_warp(a, pa, b, pb, m):
+                continue
             ra, rpa = self.resolve(a, pa)
             rb, rpb = self.resolve(b, pb)
             if ra == rb:
