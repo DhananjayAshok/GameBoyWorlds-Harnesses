@@ -10,12 +10,13 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  has_menu_cursor, has_modal_preview_box,
                                                  has_top_dialogue_box, is_battle_screen,
                                                  is_blank_or_fade_frame,
-                                                 is_cutscene_frame_changing)
+                                                 is_cutscene_frame_changing, read_battle_hud_hp)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      boundary_exit_direction, cell_kinds, compress_path, edge_cells,
                                                      edge_runs, filter_open_lane_edge_cells, format_path_runs,
                                                      in_bounds, is_boundary_exit_direction, is_on_edge,
-                                                     parse_edge_direction, shortest_path, verbalize_edges, warp_cells)
+                                                     parse_all_cells, parse_edge_direction, shortest_path,
+                                                     verbalize_edges, warp_cells)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
                                          InteractionExecutor, MenuExecutor,
@@ -170,6 +171,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
     MAX_CONTINUATION_REPLANS = 3
     MAX_TOTAL_EXECUTOR_CALLS = 30
     MAX_INTERRUPTION_CHAIN = 6
+    MAX_WILD_MOVE_RESUMES = 2
+    WILD_FLEE_INSTRUCTION = "Run away from the wild Pokemon immediately to continue your task."
 
     def __init__(self, task: str, env, game: str, max_steps: int,
                  tile_recognizer: TileRecognizer, episode_number: int, guidance: Optional[str] = None,
@@ -1329,9 +1332,126 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return "win the current battle"
         return instructions
 
-    def _combat(self, instructions: str, *, counted: bool = True) -> Any:
+    @staticmethod
+    def _is_wild_encounter_dialogue(dialogue_text: Optional[str]) -> bool:
+        if not dialogue_text:
+            return False
+        text = " ".join(str(dialogue_text).split())
+        if re.search(r"\b(?:wants\s+to\s+(?:fight|battle)|sent\s+out)\b", text, re.IGNORECASE):
+            return False
+        return bool(re.search(r"\bwild\b.{1,30}\bappeared\b", text, re.IGNORECASE))
+
+    def _task_wants_wild_battles(self) -> bool:
+        combined = f"{self._task or ''} {self._guidance or ''}"
+        if re.search(
+            r"\b(?:flee|run(?:\s+away)?)\s+from\s+wild\b|\bavoid\s+wild\b",
+            combined,
+            re.IGNORECASE,
+        ):
+            if not re.search(
+                r"\b(?:train|grind|level\s+up|farm\s+exp|catch|capture)\b",
+                self._task or "",
+                re.IGNORECASE,
+            ):
+                return False
+        return bool(
+            re.search(
+                r"\b(?:train|grind|level\s+up|farm\s+exp|gain\s+(?:exp|levels?)|catch|capture)\b"
+                r"|\b(?:fight|battle|defeat)\s+wild\b",
+                combined,
+                re.IGNORECASE,
+            )
+        )
+
+    def _active_pokemon_hp_healthy(self, frame=None) -> bool:
+        hp = read_battle_hud_hp(frame) if frame is not None else None
+        if hp is None:
+            hp = self._last_seen_battle_hp
+        if hp is None:
+            return False
+        cur_hp, max_hp = hp
+        return cur_hp > 0 and max_hp > 0 and (cur_hp * 2 > max_hp)
+
+    def _combat(self, instructions: str, *, counted: bool = True, **executor_kwargs: Any) -> Any:
         task = instructions + (f"\nYour battle tips:\n{self._tips_text()}" if self._battle_tips else "")
-        return self.call_executor("combat", task, counted=counted)
+        return self.call_executor("combat", task, counted=counted, **executor_kwargs)
+
+    def _record_leg_blocked_moves(self, request: str) -> Dict[Any, Any]:
+        exec_blocked = getattr(self.last_executor, "_blocked_at_place", None) or {}
+        gmap_now = self._global_map()
+        for b_place, b_dirs in exec_blocked.items():
+            for b_dir in b_dirs:
+                detail = f"{request} -> blocked moving {b_dir}"
+                dir_list = self._blocked_moves.setdefault(b_place, {}).setdefault(b_dir, [])
+                if detail not in dir_list:
+                    dir_list.append(detail)
+                if gmap_now is not None and isinstance(b_place, tuple) and len(b_place) == 2:
+                    try:
+                        r_seg, r_pos = gmap_now.resolve(b_place[0], b_place[1])
+                        if r_seg == gmap_now.segment:
+                            gmap_now.record_blocked_step(direction=b_dir, source_cell=r_pos)
+                    except Exception:  # noqa: BLE001
+                        pass
+        return dict(exec_blocked)
+
+    def _prepare_wild_move_resume(
+        self,
+        action: str,
+        current_task: str,
+        leg_start_place: Optional[Tuple[int, Tuple[int, int]]],
+        after_place: Optional[Tuple[int, Tuple[int, int]]],
+        state_chain: str,
+        handled: Dict[str, Any],
+    ) -> Tuple[bool, Optional[str], bool]:
+        if (
+            not handled.get("succeeded")
+            or handled.get("reason") != "battle_ended"
+            or "in_battle" not in state_chain
+            or self._agent_state() != AgentState.FREE_ROAM
+            or self._is_in_dialogue()
+            or self._battles_lost()
+            or self._env_done()
+            or not self._is_wild_encounter_dialogue(handled.get("dialogue"))
+            or self._task_wants_wild_battles()
+            or not self._active_pokemon_hp_healthy()
+        ):
+            return False, None, False
+        gmap = self._global_map()
+        if gmap is None or leg_start_place is None or after_place is None:
+            return False, None, False
+        s_seg, s_pos = gmap.resolve(leg_start_place[0], leg_start_place[1])
+        a_seg, a_pos = gmap.resolve(after_place[0], after_place[1])
+        if s_seg != a_seg:
+            return False, None, False
+        dx = a_pos[0] - s_pos[0]
+        dy = a_pos[1] - s_pos[1]
+        if action == "MoveOff":
+            direction = parse_edge_direction(current_task)
+            if direction not in DIRECTIONS:
+                return False, None, False
+            coords = [c for c in parse_all_cells(current_task) if in_bounds(c)]
+            if len(coords) == 1 and (dx, dy) != (0, 0):
+                old_c = coords[0]
+                new_c = (old_c[0] - dx, old_c[1] - dy)
+                if is_on_edge(old_c, direction) and in_bounds(new_c) and is_on_edge(new_c, direction):
+                    return True, f"{direction} via {new_c}", False
+                return True, direction, False
+            return True, current_task, False
+        if action == "MoveTo":
+            coords = [c for c in parse_all_cells(current_task) if in_bounds(c)]
+            if len(coords) == 1:
+                old_c = coords[0]
+                new_c = (old_c[0] - dx, old_c[1] - dy)
+                if new_c == (0, 0):
+                    return False, None, True
+                if in_bounds(new_c):
+                    pattern = re.compile(rf"\(\s*{old_c[0]}\s*,\s*{old_c[1]}\s*\)")
+                    updated = pattern.sub(f"({new_c[0]}, {new_c[1]})", current_task, count=1)
+                    return True, updated, False
+                return False, None, False
+            if (dx, dy) == (0, 0):
+                return True, current_task, False
+        return False, None, False
 
     def _battles_lost(self) -> int:
         env_losses = self._env.get_info()["pokemon_core"].get("n_battles_lost", 0) - self._losses_at_start
@@ -1404,6 +1524,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         states_seen: List[str] = []
         combined: Optional[Dict[str, Any]] = None
         pending_crops = list(initial_dialogue_crops) if initial_dialogue_crops else None
+        pre_battle_dialogue: Optional[str] = None
         for step_idx in range(self.MAX_INTERRUPTION_CHAIN):
             if self._env_done() or self._battles_lost() or self._total_calls >= self._max_total_calls:
                 break
@@ -1420,16 +1541,41 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 task = dialogue_task if step_idx == 0 else "clear the dialogue that followed"
                 handled = self.call_executor("dialogue", task, counted=False,
                                              initial_dialogue_crops=pending_crops)
-                pending_crops = None
+                diag_crops = getattr(self.last_executor, "dialogue_crops", None)
+                pending_crops = list(diag_crops) if diag_crops else None
+                if handled.get("dialogue"):
+                    pre_battle_dialogue = (
+                        f"{pre_battle_dialogue}\n{handled['dialogue']}"
+                        if pre_battle_dialogue
+                        else str(handled["dialogue"])
+                    )
             elif state == AgentState.IN_BATTLE:
-                handled = self._combat(self._battle_instructions(frame), counted=False)
+                is_wild_flee = (
+                    self._is_wild_encounter_dialogue(pre_battle_dialogue)
+                    and not self._task_wants_wild_battles()
+                    and self._active_pokemon_hp_healthy(frame)
+                )
+                instructions = (
+                    self.WILD_FLEE_INSTRUCTION
+                    if is_wild_flee
+                    else self._battle_instructions(frame)
+                )
+                handled = self._combat(
+                    instructions,
+                    counted=False,
+                    initial_dialogue_crops=pending_crops,
+                    skip_intro_ocr=is_wild_flee,
+                )
+                pending_crops = None
             elif state == AgentState.IN_MENU:
                 objective, is_start_menu = self._menu_objective(
                     "deal with the menu that opened while the player was doing something else", frame)
                 handled = self.call_executor("menu", objective, is_start_menu=is_start_menu, counted=False)
+                pending_crops = None
             else:
                 handled = self.call_executor("free", self.CLEAR_EVENT_INSTRUCTION,
                                              termination=self.CLEAR_EVENT_TERMINATION, counted=False)
+                pending_crops = None
             combined = self._merge_handled(combined, handled)
             if self._env_done() or self._battles_lost():
                 break
@@ -1658,25 +1804,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 continue
             action, argument = decision
             is_move_action = ACTIONS[action][0] in MOVE_TAGS
+            leg_initial_state = None
             result, task = self._run_action(action, argument, frame)
+            if "report" in result and getattr(result["report"], "initial_state", None) is not None:
+                leg_initial_state = result["report"].initial_state
             after_place = self._record_map_stop()
             move_tag = self._format_leg_movement(before_place, after_place, prior_stops, is_move_action=is_move_action)
             request = f"{action}({task})"
-            exec_blocked = getattr(self.last_executor, "_blocked_at_place", None) or {}
-            gmap_now = self._global_map()
-            for b_place, b_dirs in exec_blocked.items():
-                for b_dir in b_dirs:
-                    detail = f"{request} -> blocked moving {b_dir}"
-                    dir_list = self._blocked_moves.setdefault(b_place, {}).setdefault(b_dir, [])
-                    if detail not in dir_list:
-                        dir_list.append(detail)
-                    if gmap_now is not None and isinstance(b_place, tuple) and len(b_place) == 2:
-                        try:
-                            r_seg, r_pos = gmap_now.resolve(b_place[0], b_place[1])
-                            if r_seg == gmap_now.segment:
-                                gmap_now.record_blocked_step(direction=b_dir, source_cell=r_pos)
-                        except Exception:  # noqa: BLE001
-                            pass
+            exec_blocked = self._record_leg_blocked_moves(request)
             if self._battles_lost():
                 note = f"{request}: the player lost a battle and blacked out"
                 self._note(note)
@@ -1688,6 +1823,96 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 self._note(note)
                 attempts.append(note)
                 return "env_done", attempts, subgoal_index
+
+            wild_resumes = 0
+            leg_start_place = before_place
+            current_task = task
+            while (
+                is_move_action
+                and not result["succeeded"]
+                and (self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue())
+                and wild_resumes < self.MAX_WILD_MOVE_RESUMES
+                and not self._env_done()
+                and not self._battles_lost()
+                and self._total_calls < self._max_total_calls
+            ):
+                if self._calls > 0:
+                    self._calls -= 1
+                seed_crops = getattr(self.last_executor, "dialogue_crops", None)
+                state, handled = self._handle_interruption(initial_dialogue_crops=seed_crops)
+                if leg_initial_state is not None:
+                    handled["report"].initial_state = leg_initial_state
+                after_place = self._record_map_stop()
+                move_tag = self._format_leg_movement(
+                    before_place, after_place, prior_stops, is_move_action=is_move_action)
+                note = (f"{request} was interrupted while the game was in {state}; "
+                        f"dealt with it ({handled['reason']}){self._dialogue_snippet(handled)}")
+                if move_tag:
+                    note = f"{move_tag} {note}"
+                self._note(note)
+                attempts.append(note)
+                if self._battles_lost():
+                    self._note("the player lost a battle and blacked out")
+                    return "lost_battle", attempts, subgoal_index
+                if self._env_done():
+                    return "env_done", attempts, subgoal_index
+                if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
+                    subgoal_places.append(after_place)
+                can_resume, resumed_task, already_completed = self._prepare_wild_move_resume(
+                    action, current_task, leg_start_place, after_place, state, handled
+                )
+                if already_completed:
+                    handled["succeeded"] = True
+                    result = handled
+                    break
+                if not can_resume or resumed_task is None:
+                    result = {"_interruption_handled": (state, handled)}
+                    break
+                wild_resumes += 1
+                leg_start_place = after_place
+                current_task = resumed_task
+                resume_frame = self._current_frame()
+                self._perceive(resume_frame)
+                move_tag_name = ACTIONS[action][0]
+                result = self._move(move_tag_name, current_task, counted=True)
+                if leg_initial_state is not None and "report" in result:
+                    result["report"].initial_state = leg_initial_state
+                if handled.get("dialogue"):
+                    combined_diag = "\n".join(filter(None, [handled.get("dialogue"), result.get("dialogue")]))
+                    if combined_diag:
+                        result["dialogue"] = combined_diag
+                after_place = self._record_map_stop()
+                move_tag = self._format_leg_movement(
+                    before_place, after_place, prior_stops, is_move_action=is_move_action)
+                exec_blocked.update(self._record_leg_blocked_moves(request))
+                if self._battles_lost():
+                    note = f"{request}: the player lost a battle and blacked out"
+                    self._note(note)
+                    attempts.append(note)
+                    return "lost_battle", attempts, subgoal_index
+                if self._env_done():
+                    note = f"{request} used up the last of the environment's steps"
+                    self._note(note)
+                    attempts.append(note)
+                    return "env_done", attempts, subgoal_index
+
+            if "_interruption_handled" in result:
+                state, handled = result["_interruption_handled"]
+                if handled.get("succeeded"):
+                    complete, summary, reached, replan_needed = self._judge(
+                        subgoal, f"{request} (cleared {state})", handled, subgoal_index,
+                        move_tag=move_tag, decision_reasoning=decision_reasoning)
+                    if move_tag and move_tag not in summary:
+                        summary = f"{move_tag} {summary}"
+                    self._note(summary)
+                    attempts.append(f"{request}: {summary}")
+                    if complete:
+                        return "complete", attempts, reached
+                    if replan_needed:
+                        return "stuck", attempts, subgoal_index
+                if not is_move_action or not handled.get("succeeded"):
+                    failed_attempts += 1
+                continue
 
             if result["succeeded"] and self._agent_state() == AgentState.FREE_ROAM and not self._env_done():
                 step_before_settle = getattr(getattr(self._env, "_emulator", None), "step_count", None)
@@ -1742,7 +1967,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     self._calls -= 1
                 seed_crops = getattr(self.last_executor, "dialogue_crops", None) if is_move_action else None
                 state, handled = self._handle_interruption(initial_dialogue_crops=seed_crops)
-                handled["report"].initial_state = result["report"].initial_state
+                if leg_initial_state is not None:
+                    handled["report"].initial_state = leg_initial_state
                 after_place = self._record_map_stop()
                 move_tag = self._format_leg_movement(
                     before_place, after_place, prior_stops, is_move_action=is_move_action)

@@ -1761,7 +1761,7 @@ BATTLE_UNREADABLE = -2
 BATTLE_ACTION_FAILED = -3
 BATTLE_OUT_OF_STEPS = -4
 
-BATTLE_EXIT_SETTLE_WAIT = 4
+BATTLE_EXIT_SETTLE_WAIT = 2
 MAX_TURN_PROGRESS_STEPS = 135
 MAX_BATTLE_DIALOGUE_STEPS = 90
 MAX_IDLE_PROGRESS_STEPS = 18
@@ -1856,10 +1856,23 @@ Reasoning: <what the menu or choice box shows, and what should be pressed next>
 Press: <one of up, down, left, right, confirm, back>
 [STOP]"""
 
-    def __init__(self, env, task, max_steps: int = 60, **kwargs):
+    def __init__(
+        self,
+        env,
+        task,
+        max_steps: int = 60,
+        initial_dialogue_crops: Optional[List[Any]] = None,
+        skip_intro_ocr: bool = False,
+        **kwargs,
+    ):
         self.history: List[str] = []
-        self.dialogue_crops: List[Any] = []
+        self.dialogue_crops: List[Any] = (
+            drop_prefix_crops([c for c in initial_dialogue_crops if not is_battle_menu_crop(c)])
+            if initial_dialogue_crops
+            else []
+        )
         self.dialogue_text: List[str] = []
+        self._skip_intro_ocr: bool = bool(skip_intro_ocr)
         self._exited_to_free_roam: bool = False
         self._bag_unavailable: bool = False
         self._in_bag_menu: bool = False
@@ -1970,14 +1983,27 @@ Press: <one of up, down, left, right, confirm, back>
     def _confirm_battle_exit(self, records: List[EnvironmentStepRecord]) -> bool:
         self._ensure_scripted("settle battle exit")
         state = self._agent_state()
+        waited = 0
         for _ in range(BATTLE_EXIT_SETTLE_WAIT):
             if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
                 break
             wait_record = self._take_action(WaitAction)
             records.append(wait_record)
+            waited += 1
             state = self._agent_state()
         if state != AgentState.IN_BATTLE and not is_battle_screen(self._current_frame()):
             self._exited_to_free_roam = True
+            if (
+                state == AgentState.FREE_ROAM
+                and waited >= BATTLE_EXIT_SETTLE_WAIT
+                and not (self._last_terminated or self._last_truncated)
+            ):
+                cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
+                if cur_step is not None:
+                    try:
+                        self._env._last_settled_step = cur_step
+                    except Exception:  # noqa: BLE001
+                        pass
             return True
         return False
 
@@ -2210,7 +2236,12 @@ Press: <one of up, down, left, right, confirm, back>
                 return self._fail(BATTLE_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._fail(BATTLE_TRUNCATED, "truncated")
-            texts = self._read_new_text(intro_records, new_turn=True)
+            if self._skip_intro_ocr and not self._exited_to_free_roam:
+                intro_crops = [c for c in captured_dialogue_crops(intro_records) if not is_battle_menu_crop(c)]
+                drop_prefix_crops(intro_crops, self.dialogue_crops)
+                texts = []
+            else:
+                texts = self._read_new_text(intro_records, new_turn=not bool(self.dialogue_crops))
             if presses or dismisses or texts:
                 entry = "- battle intro" + self._format_auto_suffix(presses, dismisses).replace(", then ", ": ")
                 if texts:
@@ -2537,7 +2568,13 @@ Press: <one of up, down, left, right, confirm, back>
                             return self._fail(BATTLE_TRUNCATED, "truncated")
 
             entry += self._format_auto_suffix(presses, dismisses)
-            texts = self._read_new_text(turn_records, new_turn=(option != "progress"))
+            if option == "run" and record.action_success == 0 and self._exited_to_free_roam:
+                flee_crops = [c for c in captured_dialogue_crops(turn_records) if not is_battle_menu_crop(c)]
+                drop_prefix_crops(flee_crops, self.dialogue_crops)
+                texts = ["Got away safely!"]
+                self.dialogue_text.extend(texts)
+            else:
+                texts = self._read_new_text(turn_records, new_turn=(option != "progress"))
             if texts:
                 entry += "\n  text on screen: " + " / ".join(texts)
             self.history.append(entry)
