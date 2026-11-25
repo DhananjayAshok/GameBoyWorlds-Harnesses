@@ -163,8 +163,13 @@ class MappingEnvironment:
     def blocked_cells(self) -> set:
         return self._map.local_blocked_cells()
 
-    def record_blocked_step(self, direction: Optional[str] = None, cell: Optional[Tuple[int, int]] = None):
-        return self._map.record_blocked_step(direction=direction, cell=cell)
+    def record_blocked_step(
+        self,
+        direction: Optional[str] = None,
+        cell: Optional[Tuple[int, int]] = None,
+        source_cell: Optional[Tuple[int, int]] = None,
+    ):
+        return self._map.record_blocked_step(direction=direction, cell=cell, source_cell=source_cell)
 
     def record_defeat(self, place: Optional[Tuple[int, Tuple[int, int]]] = None) -> None:
         self._map.record_defeat(place=place)

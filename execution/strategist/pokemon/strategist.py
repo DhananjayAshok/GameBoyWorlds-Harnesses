@@ -616,13 +616,21 @@ class PokemonStrategist:
                     dir_list.append(detail)
                 if seg_id == self.global_map.segment:
                     dx, dy = DIRECTIONS[b_dir]
-                    self.global_map.record_blocked_step(cell=(b_pos[0] + dx, b_pos[1] + dy))
+                    self.global_map.record_blocked_step(
+                        direction=b_dir,
+                        cell=(b_pos[0] + dx, b_pos[1] + dy),
+                        source_cell=b_pos,
+                    )
 
     def _current_segment_blocked_moves(self) -> Dict[Tuple[int, int], set]:
-        if not self.global_map.current or not self._blocked_moves:
+        if not self.global_map.current:
             return {}
         cur_seg, _ = self.global_map.resolve(self.global_map.segment, self.global_map.pos)
         out: Dict[Tuple[int, int], set] = {}
+        if hasattr(self.global_map, "segment_blocked_moves"):
+            for r_pos, dirs in self.global_map.segment_blocked_moves(cur_seg).items():
+                if dirs:
+                    out.setdefault(r_pos, set()).update(dirs)
         for (b_seg, b_pos), by_dir in self._blocked_moves.items():
             try:
                 r_seg, r_pos = self.global_map.resolve(b_seg, b_pos)

@@ -263,10 +263,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _current_segment_blocked_moves(self) -> Dict[Tuple[int, int], set]:
         gmap = self._global_map()
         place = self._current_map_place()
-        if gmap is None or place is None or not self._blocked_moves:
+        if gmap is None or place is None:
             return {}
         cur_seg, _ = place
         out: Dict[Tuple[int, int], set] = {}
+        if hasattr(gmap, "segment_blocked_moves"):
+            for r_pos, dirs in gmap.segment_blocked_moves(cur_seg).items():
+                if dirs:
+                    out.setdefault(r_pos, set()).update(dirs)
         for (b_seg, b_pos), by_dir in self._blocked_moves.items():
             try:
                 r_seg, r_pos = gmap.resolve(b_seg, b_pos)
@@ -560,13 +564,29 @@ class PokemonPlayThroughSupervisor(Supervisor):
         )
         lines.append(ascii_window(gmap, blocked_moves=seg_blocked_moves))
         lines.append("Legend: " + LEGEND)
-        blocked_lines = []
+        blocked_by_pos: Dict[Tuple[int, int], Dict[str, List[str]]] = {}
+        for r_pos, dirs in seg_blocked_moves.items():
+            for d in sorted(dirs):
+                blocked_by_pos.setdefault(r_pos, {}).setdefault(d, [])
         for (b_seg, b_pos), by_dir in self._blocked_moves.items():
             r_seg, r_pos = gmap.resolve(b_seg, b_pos)
             if r_seg == cur_seg:
-                here_tag = " [HERE]" if r_pos == cur_pos else ""
-                dir_summaries = [f"{d} ({'; '.join(notes[-2:])})" for d, notes in by_dir.items()]
-                blocked_lines.append(f"- at {r_pos}{here_tag}: blocked moving {', '.join(dir_summaries)}")
+                for d, notes in by_dir.items():
+                    dst_notes = blocked_by_pos.setdefault(r_pos, {}).setdefault(d, [])
+                    for n_str in notes:
+                        if n_str not in dst_notes:
+                            dst_notes.append(n_str)
+        blocked_lines = []
+        for r_pos in sorted(blocked_by_pos):
+            by_dir = blocked_by_pos[r_pos]
+            if not by_dir:
+                continue
+            here_tag = " [HERE]" if r_pos == cur_pos else ""
+            dir_summaries = [
+                f"{d} ({'; '.join(notes[-2:])})" if notes else d
+                for d, notes in by_dir.items()
+            ]
+            blocked_lines.append(f"- at {r_pos}{here_tag}: blocked moving {', '.join(dir_summaries)}")
         if blocked_lines:
             lines.append("Blocked movement directions recorded in this area during this episode (do NOT repeat these from the same coordinate):")
             lines.extend(blocked_lines)
@@ -1643,12 +1663,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
             move_tag = self._format_leg_movement(before_place, after_place, prior_stops, is_move_action=is_move_action)
             request = f"{action}({task})"
             exec_blocked = getattr(self.last_executor, "_blocked_at_place", None) or {}
+            gmap_now = self._global_map()
             for b_place, b_dirs in exec_blocked.items():
                 for b_dir in b_dirs:
                     detail = f"{request} -> blocked moving {b_dir}"
                     dir_list = self._blocked_moves.setdefault(b_place, {}).setdefault(b_dir, [])
                     if detail not in dir_list:
                         dir_list.append(detail)
+                    if gmap_now is not None and isinstance(b_place, tuple) and len(b_place) == 2:
+                        try:
+                            r_seg, r_pos = gmap_now.resolve(b_place[0], b_place[1])
+                            if r_seg == gmap_now.segment:
+                                gmap_now.record_blocked_step(direction=b_dir, source_cell=r_pos)
+                        except Exception:  # noqa: BLE001
+                            pass
             if self._battles_lost():
                 note = f"{request}: the player lost a battle and blacked out"
                 self._note(note)

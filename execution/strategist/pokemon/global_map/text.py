@@ -93,14 +93,21 @@ def blocked_moves_lines(
     gmap: GlobalMap,
     blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
 ) -> List[str]:
-    if not blocked_moves or not gmap.current:
+    if not gmap.current:
         return []
     from .model import DIRECTIONS
 
+    eff_moves = (
+        gmap.segment_blocked_moves(gmap.segment, blocked_moves)
+        if hasattr(gmap, "segment_blocked_moves")
+        else (blocked_moves or {})
+    )
+    if not eff_moves:
+        return []
     px, py = gmap.pos
     items = []
-    for b_pos in sorted(blocked_moves):
-        dirs = [d for d in blocked_moves[b_pos] if d in DIRECTIONS]
+    for b_pos in sorted(eff_moves):
+        dirs = [d for d in sorted(eff_moves[b_pos]) if d in DIRECTIONS]
         if not dirs:
             continue
         seen_d: List[str] = []
@@ -132,7 +139,12 @@ def _mapped_paths_from_start(
     seg = gmap.current
     start = gmap.pos
     px, py = start
-    blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
+    eff_moves = (
+        gmap.segment_blocked_moves(gmap.segment, blocked_moves)
+        if hasattr(gmap, "segment_blocked_moves")
+        else (blocked_moves or {})
+    )
+    blocked_targets = blocked_target_cells(gmap, gmap.segment, eff_moves)
     best: Dict[Cell, int] = {start: 0}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
     heap = [(0, start)]
@@ -140,7 +152,7 @@ def _mapped_paths_from_start(
         cost, cell = heapq.heappop(heap)
         if cost > best[cell]:
             continue
-        cell_blocked_dirs = set(blocked_moves.get(cell, ())) if blocked_moves else set()
+        cell_blocked_dirs = set(eff_moves.get(cell, ())) if eff_moves else set()
         for direction, (dx, dy) in DIRECTIONS.items():
             if direction in cell_blocked_dirs:
                 continue
@@ -294,9 +306,14 @@ def _obstacle_detour_info(
     start = (px, py)
     if not seg or start == goal_cell:
         return None
+    eff_moves = (
+        gmap.segment_blocked_moves(gmap.segment, blocked_moves)
+        if hasattr(gmap, "segment_blocked_moves")
+        else (blocked_moves or {})
+    )
     if reached is None:
-        reached = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves)
-    blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
+        reached = _mapped_paths_from_start(gmap, blocked_moves=eff_moves)
+    blocked_targets = blocked_target_cells(gmap, gmap.segment, eff_moves)
 
     on_screen_reached = {start}
     if local_kinds is not None:
@@ -387,7 +404,7 @@ def _obstacle_detour_info(
             }
         if cost > best[cur]:
             continue
-        cur_blocked_dirs = set(blocked_moves.get(cur, ())) if blocked_moves else set()
+        cur_blocked_dirs = set(eff_moves.get(cur, ())) if eff_moves else set()
         for d, (ox, oy) in DIRECTIONS.items():
             if d in cur_blocked_dirs:
                 continue

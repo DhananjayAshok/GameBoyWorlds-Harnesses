@@ -22,7 +22,13 @@ OPPOSITE = {"up": "down", "down": "up", "left": "right", "right": "left"}
 
 def walked_squares(gmap: GlobalMap, segment: int) -> set:
     seg = gmap.segments[segment]
-    emp_blocked = gmap.blocked_cells[segment] if segment < len(getattr(gmap, "blocked_cells", ())) else set()
+    emp_blocked = set(gmap.blocked_cells[segment]) if segment < len(getattr(gmap, "blocked_cells", ())) else set()
+    if hasattr(gmap, "segment_blocked_moves"):
+        seg_moves = gmap.segment_blocked_moves(segment)
+    else:
+        seg_moves = {}
+    if seg_moves:
+        emp_blocked |= blocked_target_cells(gmap, segment, seg_moves)
     points = [p for _, s, p in gmap.trail if s == segment]
     walked = set(points) | set(gmap.visits[segment])
     for a, b in zip(points, points[1:]):
@@ -53,12 +59,19 @@ def blocked_target_cells(
     segment: int,
     blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
 ) -> set:
-    if not blocked_moves:
-        return set()
     seg = gmap.segments[segment] if 0 <= segment < len(gmap.segments) else {}
     cur_pos = gmap.pos if gmap.segment == segment else None
-    out = set()
-    for b_pos, dirs in blocked_moves.items():
+    out = set(gmap.blocked_cells[segment]) if segment < len(getattr(gmap, "blocked_cells", ())) else set()
+    if cur_pos is not None:
+        out.discard(cur_pos)
+    eff_moves = (
+        gmap.segment_blocked_moves(segment, blocked_moves)
+        if hasattr(gmap, "segment_blocked_moves")
+        else (blocked_moves or {})
+    )
+    if not eff_moves:
+        return out
+    for b_pos, dirs in eff_moves.items():
         for d in dirs:
             if d not in DIRECTIONS:
                 continue
@@ -85,7 +98,12 @@ def path_in_segment(
 
     seg = gmap.segments[segment]
     walked = walked_squares(gmap, segment) if walked is None else walked
-    blocked_targets = blocked_target_cells(gmap, segment, blocked_moves)
+    eff_moves = (
+        gmap.segment_blocked_moves(segment, blocked_moves)
+        if hasattr(gmap, "segment_blocked_moves")
+        else (blocked_moves or {})
+    )
+    blocked_targets = blocked_target_cells(gmap, segment, eff_moves)
     best: Dict[Cell, int] = {start: 0}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
     heap = [(0, start)]
@@ -100,7 +118,7 @@ def path_in_segment(
             return cost, moves[::-1]
         if cost > best[cell]:
             continue
-        cell_blocked_dirs = set(blocked_moves.get(cell, ())) if blocked_moves else set()
+        cell_blocked_dirs = set(eff_moves.get(cell, ())) if eff_moves else set()
         for direction, (dx, dy) in DIRECTIONS.items():
             if direction in cell_blocked_dirs:
                 continue

@@ -18,12 +18,14 @@ from execution.perception.pokemon.battle import (
 )
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import (LEDGE_LEFT, LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
+                                                     classify_cell_from_quarters,
                                                      infer_spatial_patterned_floor_cells,
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
                                                      is_overhang_floor_cell, is_patterned_floor_cell,
                                                      is_player_overhang_floor_cell,
                                                      is_player_overhang_ledge_cell, is_south_ledge_cell,
-                                                     is_top_overhang_floor_cell, is_west_ledge_cell)
+                                                     is_top_overhang_floor_cell,
+                                                     is_walkable_pattern_learnable, is_west_ledge_cell)
 from execution.perception.pokemon.tiles import (TileRecognizer, filter_cell_warp_quarter_tags,
                                                 normalize_tabletop_tag)
 
@@ -272,6 +274,7 @@ class GlobalMap(StrategistArtifact):
         self.left_ledge_patterns: set = set()
         self.walk_patterns: set = set()
         self.blocked_cells: List[set] = [set()]
+        self.blocked_moves: List[Dict[Cell, set]] = [{}]
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -298,6 +301,9 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("blocked_cells", [set() for _ in self.segments])
         while len(self.blocked_cells) < len(self.segments):
             self.blocked_cells.append(set())
+        self.__dict__.setdefault("blocked_moves", [{} for _ in self.segments])
+        while len(self.blocked_moves) < len(self.segments):
+            self.blocked_moves.append({})
         for si in range(len(self.segments)):
             self._heal_visited_ground(si)
 
@@ -317,6 +323,7 @@ class GlobalMap(StrategistArtifact):
                 and not is_door(c)
                 and "ground" in c.tags
                 and "obstacle" not in c.tags
+                and self._can_learn_walkable(c.tags, c.hashes, c.pixels)
                 and not (set(c.tags) & {"sign", "interactable object", "pc", "water", "ledge", "right_ledge", "left_ledge"})
             ):
                 c.kind = WALKABLE
@@ -351,17 +358,18 @@ class GlobalMap(StrategistArtifact):
         tags: Iterable[str],
         hashes: Optional[Tuple[Optional[str], ...]] = None,
         pixels: Optional[np.ndarray] = None,
+        quarter_tags: Optional[Dict[str, str]] = None,
+        quarter_descriptions: Optional[Dict[str, Optional[str]]] = None,
+        quarter_images: Optional[Dict[str, Optional[np.ndarray]]] = None,
     ) -> bool:
-        tag_set = set(tags)
-        if "npc" in tag_set or "unknown" in tag_set or "water" in tag_set or "obstacle" in tag_set:
-            return False
-        if bool(tag_set & WALKABLE_TAGS):
-            return True
-        if hashes is not None and len(hashes) == 4 and len(set(hashes)) == 1 and hashes[0] is not None:
-            if pixels is not None and pixels.size > 0 and int(pixels.min()) == int(pixels.max()):
-                return False
-            return True
-        return False
+        return is_walkable_pattern_learnable(
+            tags,
+            hashes=hashes,
+            pixels=pixels,
+            quarter_tags=quarter_tags,
+            quarter_descriptions=quarter_descriptions,
+            quarter_images=quarter_images,
+        )
 
     def _classify(self, tags: Iterable[str], hashes: Tuple[Optional[str], ...]) -> str:
         tag_set = set(tags)
@@ -383,9 +391,10 @@ class GlobalMap(StrategistArtifact):
         relabelled = 0
         if pattern not in self.walk_patterns:
             self.walk_patterns.add(pattern)
-            for other in self.segments:
-                for c in other.values():
-                    if c.kind == BLOCKED and c.hashes == pattern:
+            for si_other, other in enumerate(self.segments):
+                seg_blk = self.blocked_cells[si_other] if si_other < len(self.blocked_cells) else set()
+                for g_other, c in other.items():
+                    if g_other not in seg_blk and c.kind == BLOCKED and c.hashes == pattern:
                         c.kind = WALKABLE
                         relabelled += 1
             self.stats["walk_patterns_learned"] += 1
@@ -425,40 +434,57 @@ class GlobalMap(StrategistArtifact):
         self.stats["ledge_cells_relabelled"] += relabelled
         return relabelled
 
-    def record_blocked_step(self, direction: Optional[str] = None, cell: Optional[Cell] = None) -> Optional[Cell]:
+    def record_blocked_step(
+        self,
+        direction: Optional[str] = None,
+        cell: Optional[Cell] = None,
+        source_cell: Optional[Cell] = None,
+    ) -> Optional[Cell]:
         if not self.current or self.pos is None:
             return None
         while len(self.blocked_cells) <= self.segment:
             self.blocked_cells.append(set())
+        while len(self.blocked_moves) <= self.segment:
+            self.blocked_moves.append({})
+        src = self.pos if source_cell is None else source_cell
         if cell is None:
             if direction not in DIRECTIONS:
                 return None
             dx, dy = DIRECTIONS[direction]
-            target = (self.pos[0] + dx, self.pos[1] + dy)
+            target = (src[0] + dx, src[1] + dy)
         else:
             target = cell
-        if target == self.pos:
+            if direction not in DIRECTIONS and src is not None:
+                for d_name, (dx, dy) in DIRECTIONS.items():
+                    if (src[0] + dx, src[1] + dy) == target:
+                        direction = d_name
+                        break
+        if target == self.pos and source_cell is None:
             return None
         seg = self.segments[self.segment]
         c = seg.get(target)
         if c is not None and (is_door(c) or c.kind in (LEDGE, LEDGE_LEFT)):
             return None
-        if (
+        if direction in DIRECTIONS and src is not None and (c is None or c.kind != OCCUPIED):
+            self.blocked_moves[self.segment].setdefault(src, set()).add(direction)
+        is_uniform_walk_pattern = (
             c is not None
             and c.hashes
             and len(c.hashes) == 4
             and len(set(c.hashes)) == 1
             and c.hashes[0] is not None
             and c.hashes in self.walk_patterns
-        ):
+            and self._can_learn_walkable(c.tags, c.hashes, c.pixels)
+        )
+        if is_uniform_walk_pattern:
             return None
         if self.visits[self.segment].get(target, 0) > 0:
             if (
                 c is None
                 or not c.hashes
                 or len(c.hashes) != 4
-                or len(set(c.hashes)) == 1
-                or c.hashes in self.walk_patterns
+                or None in c.hashes
+                or (c.hashes in self.walk_patterns and self._can_learn_walkable(c.tags, c.hashes, c.pixels))
             ):
                 return None
             self.visits[self.segment].pop(target, None)
@@ -468,15 +494,68 @@ class GlobalMap(StrategistArtifact):
             self.stats["empirical_blocked_cells"] += 1
         return target
 
+    def clear_traversed_step(self, prev_pos: Cell, new_pos: Cell, segment: Optional[int] = None) -> None:
+        si = self.segment if segment is None else segment
+        if not (0 <= si < len(self.segments)):
+            return
+        dx, dy = new_pos[0] - prev_pos[0], new_pos[1] - prev_pos[1]
+        if (dx == 0 and dy == 0) or ((dx == 0) == (dy == 0)):
+            return
+        steps = abs(dx) + abs(dy)
+        if steps > MAX_STEP_FILL:
+            return
+        sx = (dx > 0) - (dx < 0)
+        sy = (dy > 0) - (dy < 0)
+        step_dir = next((d for d, delta in DIRECTIONS.items() if delta == (sx, sy)), None)
+        seg_blocked = self.blocked_cells[si] if si < len(self.blocked_cells) else None
+        seg_moves = self.blocked_moves[si] if si < len(self.blocked_moves) else None
+        cur = prev_pos
+        for _ in range(steps):
+            if seg_moves and step_dir in DIRECTIONS and cur in seg_moves:
+                seg_moves[cur].discard(step_dir)
+                if not seg_moves[cur]:
+                    seg_moves.pop(cur, None)
+            cur = (cur[0] + sx, cur[1] + sy)
+            if seg_blocked is not None:
+                seg_blocked.discard(cur)
+
+    def segment_blocked_moves(
+        self,
+        segment: Optional[int] = None,
+        extra_blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+    ) -> Dict[Cell, set]:
+        si = self.segment if segment is None else segment
+        out: Dict[Cell, set] = {}
+        if 0 <= si < len(getattr(self, "blocked_moves", ())):
+            for b_pos, dirs in self.blocked_moves[si].items():
+                valid_dirs = {d for d in dirs if d in DIRECTIONS}
+                if valid_dirs:
+                    out.setdefault(b_pos, set()).update(valid_dirs)
+        if extra_blocked_moves:
+            for b_pos, dirs in extra_blocked_moves.items():
+                valid_dirs = {d for d in dirs if d in DIRECTIONS}
+                if valid_dirs:
+                    out.setdefault(b_pos, set()).update(valid_dirs)
+        return out
+
     def local_blocked_cells(self) -> set:
-        if not self.current or self.pos is None or self.segment >= len(self.blocked_cells):
+        if not self.current or self.pos is None:
             return set()
+        from .routes import blocked_target_cells
+
         px, py = self.pos
         out = set()
-        for gx, gy in self.blocked_cells[self.segment]:
-            lx, ly = gx - px, gy - py
-            if -4 <= lx <= 5 and -4 <= ly <= 4 and (lx, ly) != (0, 0):
-                out.add((lx, ly))
+        if self.segment < len(self.blocked_cells):
+            for gx, gy in self.blocked_cells[self.segment]:
+                lx, ly = gx - px, gy - py
+                if -4 <= lx <= 5 and -4 <= ly <= 4 and (lx, ly) != (0, 0):
+                    out.add((lx, ly))
+        seg_moves = self.segment_blocked_moves(self.segment)
+        if seg_moves:
+            for gx, gy in blocked_target_cells(self, self.segment, seg_moves):
+                lx, ly = gx - px, gy - py
+                if -4 <= lx <= 5 and -4 <= ly <= 4 and (lx, ly) != (0, 0):
+                    out.add((lx, ly))
         return out
 
     def names_differ(self, a: int, b: int) -> bool:
@@ -609,28 +688,6 @@ class GlobalMap(StrategistArtifact):
                 quarter_images.setdefault((ix, iy), {})[iq] = img
             for cell in list(quarter_tags):
                 quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
-        top_overhang_cells = {
-            cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-        }
-        player_overhang_cells = {
-            cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-        }
-        npc_head_overhang_cells = {
-            cell for cell in quarter_tags if is_npc_head_overhang_floor_cell(cell, quarter_tags)
-        }
-        south_ledge_cells = {
-            cell for cell in quarter_tags if is_south_ledge_cell(cell, quarter_tags, quarter_descriptions)
-        }
-        west_ledge_cells = {
-            cell for cell in quarter_tags if is_west_ledge_cell(cell, quarter_tags, quarter_descriptions)
-        }
-        east_cliff_cells = {
-            cell
-            for cell in quarter_tags
-            if is_east_cliff_barrier_cell(
-                cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
-            )
-        }
         local_hashes_by_cell = {
             cell: {q: getattr(identified.get((cell[0], cell[1], q)), "hash", None) for q in QUARTERS}
             for cell in quarter_tags
@@ -644,60 +701,54 @@ class GlobalMap(StrategistArtifact):
             pixels = piece.copy()
             quarters = split_quarters(piece)
             hashes = self._cell_hashes(quarters)
+            cell_q = quarter_tags.get((x, y))
+            cell_d = quarter_descriptions.get((x, y))
+            cell_imgs = quarter_images.get((x, y))
             if (x, y) == (0, 0):
                 tags, kind = ("player",), WALKABLE
             elif shift != (0, 0):
                 tags, kind = ("unknown",), UNKNOWN
-            elif (x, y) in top_overhang_cells:
-                tags = tuple(sorted({
-                    quarter_tags[(x, y)][q] for q in ("bottom_left", "bottom_right") if q in quarter_tags[(x, y)]
-                }))
-                kind = WALKABLE
-            elif (x, y) in player_overhang_cells or (x, y) in npc_head_overhang_cells:
-                tags = tuple(sorted({
-                    quarter_tags[(x, y)][q] for q in ("top_left", "top_right") if q in quarter_tags[(x, y)]
-                }))
-                kind = WALKABLE
-            elif (x, y) in patterned_floor_cells and (x, y) not in east_cliff_cells:
-                tags = tuple(sorted({
-                    t for t in quarter_tags[(x, y)].values() if t in WALKABLE_TAGS
-                })) or ("ground",)
-                kind = WALKABLE
-            elif (x, y) in south_ledge_cells:
-                tags = tuple(sorted(
-                    {quarter_tags[(x, y)][q] for q in ("top_left", "top_right") if q in quarter_tags[(x, y)]}
-                    | {"ledge"}
-                ))
-                kind = LEDGE
-            elif (x, y) in west_ledge_cells:
-                tags = tuple(sorted(
-                    {quarter_tags[(x, y)][q] for q in ("top_right", "bottom_right") if q in quarter_tags[(x, y)]}
-                    | {"ledge"}
-                ))
-                kind = LEDGE_LEFT
+            elif cell_q:
+                kind, tags = classify_cell_from_quarters(
+                    (x, y),
+                    quarter_tags,
+                    quarter_descriptions,
+                    quarter_images,
+                    hashes=hashes,
+                    patterned_floor_cells=patterned_floor_cells,
+                    ledge_patterns=self.ledge_patterns,
+                    left_ledge_patterns=self.left_ledge_patterns,
+                    walk_patterns=self.walk_patterns,
+                    allow_player_overhang=True,
+                    allow_player_cap=True,
+                )
             else:
-                cell_q = quarter_tags.get((x, y))
-                if cell_q:
-                    tags = tuple(sorted(set(cell_q.values())))
-                else:
-                    tags = tuple(sorted({
-                        normalize_tabletop_tag(
-                            identified[(x, y, q)].tag,
-                            identified[(x, y, q)].description,
-                            getattr(identified[(x, y, q)], "image", None),
-                        )
-                        for q in QUARTERS if (x, y, q) in identified
-                    }))
-                kind = BLOCKED if (x, y) in east_cliff_cells else self._classify(tags, hashes)
+                tags = tuple(sorted({
+                    normalize_tabletop_tag(
+                        identified[(x, y, q)].tag,
+                        identified[(x, y, q)].description,
+                        getattr(identified[(x, y, q)], "image", None),
+                    )
+                    for q in QUARTERS if (x, y, q) in identified
+                }))
+                kind = self._classify(tags, hashes)
             g = (px + x, py + y)
             while len(self.blocked_cells) <= self.segment:
                 self.blocked_cells.append(set())
             seg_blocked = self.blocked_cells[self.segment]
             is_uniform_piece = int(pixels.min()) == int(pixels.max())
-            if (x, y) == (0, 0) or self.visits[self.segment].get(g, 0) > 0:
+            cell_learnable = self._can_learn_walkable(
+                tags,
+                hashes=hashes,
+                pixels=pixels,
+                quarter_tags=cell_q,
+                quarter_descriptions=cell_d,
+                quarter_images=cell_imgs,
+            )
+            if (x, y) == (0, 0):
                 seg_blocked.discard(g)
             elif g in seg_blocked and kind == WALKABLE and not bool(set(tags) & DOOR_TAGS):
-                if len(set(hashes)) == 1 and None not in hashes and hashes in self.walk_patterns:
+                if len(set(hashes)) == 1 and None not in hashes and hashes in self.walk_patterns and cell_learnable:
                     seg_blocked.discard(g)
                 else:
                     kind = BLOCKED
@@ -734,10 +785,19 @@ class GlobalMap(StrategistArtifact):
                 old.kind == WALKABLE
                 and not is_door(old)
                 and self.visits[self.segment].get(g, 0) > 0
+                and g not in seg_blocked
                 and kind == BLOCKED
                 and not bool(set(tags) & DOOR_TAGS)
+                and cell_learnable
             ):
                 continue
+            if (
+                kind == BLOCKED
+                and not cell_learnable
+                and "obstacle" in tags
+                and self.visits[self.segment].get(g, 0) > 0
+            ):
+                self.visits[self.segment].pop(g, None)
             old.kind, old.tags, old.hashes, old.pixels = kind, tags, hashes, pixels
         self.visits[self.segment][self.pos] += 1
         self.trail.append((self.step, self.segment, self.pos))
@@ -817,6 +877,8 @@ class GlobalMap(StrategistArtifact):
                 if snapped is not None and snapped != self.pos:
                     self.pos = snapped
                     delta = (self.pos[0] - prev_pos[0], self.pos[1] - prev_pos[1])
+            if not structural and delta != (0, 0):
+                self.clear_traversed_step(prev_pos, self.pos, self.segment)
             placed_steps = abs(delta[0]) + abs(delta[1])
             if structural and direction in DIRECTIONS and reported is not None and placed_steps < reported:
                 rem_reported = reported - placed_steps
@@ -866,7 +928,10 @@ class GlobalMap(StrategistArtifact):
                 seg = self.segments[self.segment]
                 seg_blocked = self.blocked_cells[self.segment] if self.segment < len(self.blocked_cells) else set()
                 adv_pos = self.pos
+                seg_moves = self.blocked_moves[self.segment] if self.segment < len(self.blocked_moves) else {}
                 for _ in range(reported):
+                    if direction in seg_moves.get(adv_pos, ()):
+                        break
                     nxt = (adv_pos[0] + dx, adv_pos[1] + dy)
                     c_nxt = seg.get(nxt)
                     if nxt in seg_blocked or (c_nxt is not None and c_nxt.kind in (BLOCKED, LEDGE, LEDGE_LEFT)):
@@ -901,6 +966,7 @@ class GlobalMap(StrategistArtifact):
         self.segments.append({})
         self.visits.append(Counter())
         self.blocked_cells.append(set())
+        self.blocked_moves.append({})
         self.segment_info[len(self.segments) - 1] = SegmentInfo()
         self._link(
             len(self.segments) - 1,
@@ -1004,18 +1070,41 @@ class GlobalMap(StrategistArtifact):
             return None
         live_kinds: Dict[Cell, str] = {}
         if identified:
+            quarter_tags: Dict[Cell, Dict[str, str]] = {}
+            quarter_descriptions: Dict[Cell, Dict[str, Optional[str]]] = {}
+            quarter_images: Dict[Cell, Dict[str, Optional[np.ndarray]]] = {}
+            for (ix, iy, iq), tile in identified.items():
+                img = getattr(tile, "image", None)
+                quarter_tags.setdefault((ix, iy), {})[iq] = normalize_tabletop_tag(
+                    tile.tag, tile.description, img
+                )
+                quarter_descriptions.setdefault((ix, iy), {})[iq] = tile.description
+                quarter_images.setdefault((ix, iy), {})[iq] = img
+            for cell in list(quarter_tags):
+                quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
+            local_hashes_by_cell = {
+                cell: {q: getattr(identified.get((cell[0], cell[1], q)), "hash", None) for q in QUARTERS}
+                for cell in quarter_tags
+            }
+            patterned_floor_cells = infer_spatial_patterned_floor_cells(
+                quarter_tags, quarter_descriptions, quarter_images, local_hashes_by_cell
+            )
             for (x, y), h in local.items():
-                qtags = {
-                    normalize_tabletop_tag(
-                        identified[(x, y, q)].tag,
-                        identified[(x, y, q)].description,
-                        getattr(identified[(x, y, q)], "image", None),
+                if (x, y) in quarter_tags:
+                    lk, _ = classify_cell_from_quarters(
+                        (x, y),
+                        quarter_tags,
+                        quarter_descriptions,
+                        quarter_images,
+                        hashes=h,
+                        patterned_floor_cells=patterned_floor_cells,
+                        ledge_patterns=self.ledge_patterns,
+                        left_ledge_patterns=self.left_ledge_patterns,
+                        walk_patterns=self.walk_patterns,
+                        allow_player_overhang=True,
+                        allow_player_cap=True,
                     )
-                    for q in QUARTERS
-                    if (x, y, q) in identified
-                }
-                if qtags:
-                    live_kinds[(x, y)] = self._classify(qtags, h)
+                    live_kinds[(x, y)] = lk
         visits = self.visits[self.segment] if self.segment < len(self.visits) else Counter()
         px, py = self.pos
         scores: Dict[Cell, Dict[str, Any]] = {}
@@ -1288,6 +1377,8 @@ class GlobalMap(StrategistArtifact):
         src, dst = self.segments[source], self.segments[target]
         while len(self.blocked_cells) <= max(source, target):
             self.blocked_cells.append(set())
+        while len(self.blocked_moves) <= max(source, target):
+            self.blocked_moves.append({})
         for (x, y), c in src.items():
             g = (x + dx, y + dy)
             old = dst.get(g)
@@ -1303,6 +1394,11 @@ class GlobalMap(StrategistArtifact):
             g = (x + dx, y + dy)
             if self.visits[target].get(g, 0) == 0:
                 self.blocked_cells[target].add(g)
+        for (x, y), dirs in self.blocked_moves[source].items():
+            g = (x + dx, y + dy)
+            valid_dirs = {d for d in dirs if d in DIRECTIONS}
+            if valid_dirs:
+                self.blocked_moves[target].setdefault(g, set()).update(valid_dirs)
         self.trail = [(t, target, (p[0] + dx, p[1] + dy)) if si == source else (t, si, p)
                       for t, si, p in self.trail]
 
@@ -1323,6 +1419,7 @@ class GlobalMap(StrategistArtifact):
         self.segments[source] = {}
         self.visits[source] = Counter()
         self.blocked_cells[source] = set()
+        self.blocked_moves[source] = {}
         if self.segment == source:
             self.segment, self.pos = target, (self.pos[0] + dx, self.pos[1] + dy)
         self._clean_warps()
@@ -1463,6 +1560,8 @@ class GlobalMap(StrategistArtifact):
             self.visits[si] = Counter()
             if si < len(self.blocked_cells):
                 self.blocked_cells[si] = set()
+            if si < len(self.blocked_moves):
+                self.blocked_moves[si] = {}
             self._clean_warps()
             self.stats["transient_pruned"] += 1
             changed += 1
@@ -2223,18 +2322,15 @@ class GlobalMap(StrategistArtifact):
             qdescs = {q: t.description for q, t in zip(QUARTERS, tiles)}
             qimgs = {q: getattr(t, "image", None) for q, t in zip(QUARTERS, tiles)}
             tag_set = set(qtags.values())
-            if "npc" in tag_set or "unknown" in tag_set or "water" in tag_set:
-                return False
-            if is_top_overhang_floor_cell((0, 0), {(0, 0): qtags}, {(0, 0): qdescs}):
-                return True
-            if is_patterned_floor_cell((0, 0), {(0, 0): qtags}, {(0, 0): qdescs}, {(0, 0): qimgs}, min_ground_quarters=1):
-                return True
             t_img = cell_pixels if cell_pixels is not None else getattr(tiles[0], "image", None)
-            if len(set(pattern)) == 1:
-                if t_img is not None and t_img.size > 0 and int(t_img.min()) == int(t_img.max()):
-                    return False
-                return True
-            return self._can_learn_walkable(tag_set, pattern, t_img)
+            return self._can_learn_walkable(
+                tag_set,
+                hashes=pattern,
+                pixels=t_img,
+                quarter_tags=qtags,
+                quarter_descriptions=qdescs,
+                quarter_images=qimgs,
+            )
 
         if self.walk_patterns:
             self.walk_patterns = {
@@ -2261,6 +2357,8 @@ class GlobalMap(StrategistArtifact):
                     self._learn_walkable(cells_for_pat[0])
         while len(self.blocked_cells) < len(self.segments):
             self.blocked_cells.append(set())
+        while len(self.blocked_moves) < len(self.segments):
+            self.blocked_moves.append({})
         changed = 0
         for si, seg in enumerate(self.segments):
             if not seg:
@@ -2309,31 +2407,20 @@ class GlobalMap(StrategistArtifact):
             for g, c in seg.items():
                 if g not in quarter_tags or c.kind == OCCUPIED:
                     continue
-                if is_top_overhang_floor_cell(g, quarter_tags, quarter_descriptions):
-                    new_tags = tuple(sorted({quarter_tags[g]["bottom_left"], quarter_tags[g]["bottom_right"]}))
-                    new_kind = WALKABLE
-                elif is_npc_head_overhang_floor_cell(g, quarter_tags):
-                    new_tags = tuple(sorted({quarter_tags[g]["top_left"], quarter_tags[g]["top_right"]}))
-                    new_kind = WALKABLE
-                elif g in seg_patterned_floor_cells and not is_east_cliff_barrier_cell(
-                    g, quarter_tags, quarter_descriptions, quarter_images
-                ):
-                    new_tags = tuple(sorted({
-                        t for t in quarter_tags[g].values() if t in WALKABLE_TAGS
-                    })) or ("ground",)
-                    new_kind = WALKABLE
-                elif is_south_ledge_cell(g, quarter_tags, quarter_descriptions):
-                    new_tags = tuple(sorted({quarter_tags[g]["top_left"], quarter_tags[g]["top_right"], "ledge"}))
-                    new_kind = LEDGE
-                elif is_west_ledge_cell(g, quarter_tags, quarter_descriptions):
-                    new_tags = tuple(sorted({quarter_tags[g]["top_right"], quarter_tags[g]["bottom_right"], "ledge"}))
-                    new_kind = LEDGE_LEFT
-                elif is_east_cliff_barrier_cell(g, quarter_tags, quarter_descriptions, quarter_images):
-                    new_tags = tuple(sorted(set(quarter_tags[g].values())))
-                    new_kind = BLOCKED
-                else:
-                    new_tags = tuple(sorted(set(quarter_tags[g].values())))
-                    new_kind = self._classify(new_tags, c.hashes)
+                new_kind, new_tags = classify_cell_from_quarters(
+                    g,
+                    quarter_tags,
+                    quarter_descriptions,
+                    quarter_images,
+                    hashes=c.hashes,
+                    patterned_floor_cells=seg_patterned_floor_cells,
+                    ledge_patterns=self.ledge_patterns,
+                    left_ledge_patterns=self.left_ledge_patterns,
+                    walk_patterns=self.walk_patterns,
+                    allow_player_overhang=False,
+                    allow_player_cap=False,
+                )
+                learnable = _pattern_learnable(c.hashes, c.pixels)
                 if g in seg_blocked:
                     if (
                         c.hashes
@@ -2341,6 +2428,7 @@ class GlobalMap(StrategistArtifact):
                         and len(set(c.hashes)) == 1
                         and c.hashes[0] is not None
                         and c.hashes in self.walk_patterns
+                        and learnable
                     ):
                         seg_blocked.discard(g)
                     elif new_kind == WALKABLE and not bool(set(new_tags) & DOOR_TAGS):
@@ -2352,7 +2440,7 @@ class GlobalMap(StrategistArtifact):
                     and new_kind == BLOCKED
                     and not is_door(c)
                     and not bool(set(new_tags) & DOOR_TAGS)
-                    and _pattern_learnable(c.hashes, c.pixels)
+                    and learnable
                     and (c.kind == WALKABLE or "ground" in c.tags or "ground" in new_tags)
                     and not (set(new_tags) & {"sign", "interactable object", "pc", "water", "ledge", "right_ledge", "left_ledge"})
                 ):
@@ -2364,7 +2452,7 @@ class GlobalMap(StrategistArtifact):
                     and self.visits[si].get(g, 0) > 0
                     and new_kind == BLOCKED
                     and "obstacle" in new_tags
-                    and not _pattern_learnable(c.hashes, c.pixels)
+                    and not learnable
                 ):
                     self.visits[si].pop(g, None)
                 if (c.kind, c.tags) != (new_kind, new_tags):
@@ -2634,28 +2722,41 @@ class GlobalMap(StrategistArtifact):
 
     def reachable_cells(self, segment: Optional[int] = None) -> set:
         from collections import deque
-        from .routes import walked_squares
+        from .routes import blocked_target_cells, walked_squares
 
         si = self.segment if segment is None else segment
         seg = self.segments[si] if 0 <= si < len(self.segments) else {}
         if not seg:
             return set()
-        seeds = set(walked_squares(self, si))
+        seg_moves = self.segment_blocked_moves(si)
+        blocked_targets = set(self.blocked_cells[si]) if si < len(self.blocked_cells) else set()
+        if seg_moves:
+            blocked_targets |= blocked_target_cells(self, si, seg_moves)
+        if self.segment == si and self.pos is not None:
+            blocked_targets.discard(self.pos)
+        seeds = set(walked_squares(self, si)) - blocked_targets
         if self.segment == si and self.pos in seg:
             seeds.add(self.pos)
         if not seeds:
-            return {g for g, c in seg.items() if c.kind == WALKABLE}
+            return {g for g, c in seg.items() if c.kind == WALKABLE and g not in blocked_targets}
         visited = set(seeds)
         queue = deque(seeds)
         while queue:
             cell = queue.popleft()
+            cell_blocked_dirs = seg_moves.get(cell, ())
             for direction, (dx, dy) in DIRECTIONS.items():
+                if direction in cell_blocked_dirs:
+                    continue
                 nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in blocked_targets:
+                    continue
                 c = seg.get(nxt)
                 if c is None:
                     continue
                 if (c.kind == LEDGE and direction == "down") or (c.kind == LEDGE_LEFT and direction == "left"):
                     land = (nxt[0] + dx, nxt[1] + dy)
+                    if land in blocked_targets:
+                        continue
                     lc = seg.get(land)
                     if lc is not None and lc.kind in (WALKABLE, UNKNOWN, OCCUPIED) and land not in visited:
                         visited.add(land)
@@ -2780,14 +2881,23 @@ class GlobalMap(StrategistArtifact):
             if cave_void_cells
             else []
         )
+        from .routes import blocked_target_cells
+
+        seg_moves = self.segment_blocked_moves(si)
+        blocked_targets = set(self.blocked_cells[si]) if si < len(self.blocked_cells) else set()
+        if seg_moves:
+            blocked_targets |= blocked_target_cells(self, si, seg_moves)
         out = []
         for g, c in seg.items():
-            if c.kind != WALKABLE or (reach and g not in reach):
+            if c.kind != WALKABLE or g in blocked_targets or (reach and g not in reach):
                 continue
+            g_blocked_dirs = seg_moves.get(g, ())
             has_open_unmapped = False
-            for dx, dy in DIRECTIONS.values():
+            for d_name, (dx, dy) in DIRECTIONS.items():
+                if d_name in g_blocked_dirs:
+                    continue
                 u = (g[0] + dx, g[1] + dy)
-                if u in seg:
+                if u in seg or u in blocked_targets:
                     continue
                 if has_void and visits.get(g, 0) == 0:
                     if dx != 0 and (g[0] in void_cols or u[0] in void_cols):

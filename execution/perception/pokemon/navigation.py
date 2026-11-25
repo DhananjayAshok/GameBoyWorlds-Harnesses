@@ -409,6 +409,110 @@ def is_overhang_floor_cell(
     )
 
 
+def is_walkable_pattern_learnable(
+    tags: Iterable[str],
+    hashes: Optional[Tuple[Optional[str], ...]] = None,
+    pixels: Optional[Any] = None,
+    quarter_tags: Optional[Dict[str, str]] = None,
+    quarter_descriptions: Optional[Dict[str, Optional[str]]] = None,
+    quarter_images: Optional[Dict[str, Optional[Any]]] = None,
+) -> bool:
+    tag_set = set(quarter_tags.values()) if quarter_tags else set(tags)
+    if "npc" in tag_set or "unknown" in tag_set or "water" in tag_set:
+        return False
+    if quarter_tags and len(quarter_tags) == 4:
+        q_map = {(0, 0): quarter_tags}
+        d_map = {(0, 0): quarter_descriptions or {}} if quarter_descriptions is not None else None
+        i_map = {(0, 0): quarter_images or {}} if quarter_images is not None else None
+        if is_top_overhang_floor_cell((0, 0), q_map, d_map):
+            return True
+        if is_patterned_floor_cell((0, 0), q_map, d_map, i_map, min_ground_quarters=1):
+            return True
+    if "obstacle" in tag_set:
+        return False
+    if bool(tag_set & WALKABLE_TAGS):
+        return True
+    if hashes is not None and len(hashes) == 4 and len(set(hashes)) == 1 and hashes[0] is not None:
+        if pixels is not None and getattr(pixels, "size", 0) > 0:
+            arr = np.asarray(pixels)
+            if int(arr.min()) == int(arr.max()):
+                return False
+        return True
+    return False
+
+
+def classify_cell_from_quarters(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    hashes: Optional[Tuple[Optional[str], ...]] = None,
+    patterned_floor_cells: Optional[Collection[Cell]] = None,
+    ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
+    left_ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
+    walk_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
+    allow_player_overhang: bool = True,
+    allow_player_cap: bool = True,
+) -> Tuple[str, Tuple[str, ...]]:
+    cell_q = quarter_tags.get(cell, {})
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    cell_imgs = (quarter_images or {}).get(cell, {})
+    cell_tag_set = set(cell_q.values())
+    raw_tags = tuple(sorted(cell_tag_set))
+    if is_east_cliff_barrier_cell(
+        cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=allow_player_cap
+    ):
+        return BLOCKED, raw_tags
+    if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions):
+        tags = tuple(sorted({cell_q[q] for q in ("bottom_left", "bottom_right") if q in cell_q})) or ("ground",)
+        return WALKABLE, tags
+    if (
+        allow_player_overhang and is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+    ) or is_npc_head_overhang_floor_cell(cell, quarter_tags):
+        tags = tuple(sorted({cell_q[q] for q in ("top_left", "top_right") if q in cell_q})) or ("ground",)
+        return WALKABLE, tags
+    in_patterned = (
+        cell in patterned_floor_cells
+        if patterned_floor_cells is not None
+        else is_patterned_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
+    )
+    if in_patterned:
+        tags = tuple(sorted({t for t in cell_q.values() if t in WALKABLE_TAGS})) or ("ground",)
+        return WALKABLE, tags
+    if is_south_ledge_cell(cell, quarter_tags, quarter_descriptions):
+        tags = tuple(sorted({cell_q[q] for q in ("top_left", "top_right") if q in cell_q} | {"ledge"}))
+        return LEDGE, tags
+    if is_west_ledge_cell(cell, quarter_tags, quarter_descriptions):
+        tags = tuple(sorted({cell_q[q] for q in ("top_right", "bottom_right") if q in cell_q} | {"ledge"}))
+        return LEDGE_LEFT, tags
+    if "npc" in cell_tag_set:
+        return "occupied", raw_tags
+    if cell_tag_set <= WALKABLE_TAGS:
+        return WALKABLE, raw_tags
+    if cell_tag_set <= WALKABLE_TAGS | LEDGE_TAGS:
+        return LEDGE, raw_tags
+    if "unknown" in cell_tag_set and (cell_tag_set - {"unknown"}) <= WALKABLE_TAGS | LEDGE_TAGS:
+        return "unknown", raw_tags
+    if hashes is not None and ledge_patterns and hashes in ledge_patterns:
+        return LEDGE, raw_tags
+    if hashes is not None and left_ledge_patterns and hashes in left_ledge_patterns:
+        return LEDGE_LEFT, raw_tags
+    if (
+        hashes is not None
+        and walk_patterns
+        and hashes in walk_patterns
+        and is_walkable_pattern_learnable(
+            cell_tag_set,
+            hashes=hashes,
+            quarter_tags=cell_q,
+            quarter_descriptions=cell_d,
+            quarter_images=cell_imgs,
+        )
+    ):
+        return WALKABLE, raw_tags
+    return BLOCKED, raw_tags
+
+
 def cell_kinds(
     identified,
     ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
@@ -453,46 +557,29 @@ def cell_kinds(
         pattern = tuple(hashes[cell].get(q) for q in QUARTERS)
         if cell in confirmed_occupied:
             kinds[cell] = BLOCKED
-        elif cell != (0, 0) and cell in empirical_blocked and not (cell_tags & WARP_TAGS):
+            continue
+        if cell != (0, 0) and cell in empirical_blocked and not (cell_tags & WARP_TAGS):
             kinds[cell] = BLOCKED
-        elif is_east_cliff_barrier_cell(
+            continue
+        if cell_tags & WARP_TAGS and not is_east_cliff_barrier_cell(
             cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
         ):
-            kinds[cell] = BLOCKED
-        elif (
-            cell_tags & WARP_TAGS
-            or cell_tags <= WALKABLE_TAGS
-            or is_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-            or cell in patterned_floor_cells
-        ):
             kinds[cell] = WALKABLE
-        elif is_south_ledge_cell(cell, quarter_tags, quarter_descriptions) or (
-            cell_tags <= WALKABLE_TAGS | LEDGE_TAGS
-        ):
-            kinds[cell] = LEDGE
-        elif is_west_ledge_cell(cell, quarter_tags, quarter_descriptions):
-            kinds[cell] = LEDGE_LEFT
-        elif ledge_patterns and pattern in ledge_patterns:
-            kinds[cell] = LEDGE
-        elif left_ledge_patterns and pattern in left_ledge_patterns:
-            kinds[cell] = LEDGE_LEFT
-        elif (
-            walk_patterns
-            and pattern in walk_patterns
-            and "npc" not in cell_tags
-            and "unknown" not in cell_tags
-            and "water" not in cell_tags
-            and (
-                cell_tags <= WALKABLE_TAGS
-                or is_patterned_floor_cell(
-                    cell, quarter_tags, quarter_descriptions, quarter_images, min_ground_quarters=1
-                )
-                or (len(pattern) == 4 and len(set(pattern)) == 1 and pattern[0] is not None)
-            )
-        ):
-            kinds[cell] = WALKABLE
-        else:
-            kinds[cell] = BLOCKED
+            continue
+        kind, _ = classify_cell_from_quarters(
+            cell,
+            quarter_tags,
+            quarter_descriptions,
+            quarter_images,
+            hashes=pattern,
+            patterned_floor_cells=patterned_floor_cells,
+            ledge_patterns=ledge_patterns,
+            left_ledge_patterns=left_ledge_patterns,
+            walk_patterns=walk_patterns,
+            allow_player_overhang=True,
+            allow_player_cap=True,
+        )
+        kinds[cell] = BLOCKED if kind in ("occupied", "unknown") else kind
     for cell, cell_q in quarter_tags.items():
         if (
             len(cell_q) == 4
