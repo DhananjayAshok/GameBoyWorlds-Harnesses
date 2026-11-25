@@ -439,8 +439,6 @@ class GlobalMap(StrategistArtifact):
             target = cell
         if target == self.pos:
             return None
-        if self.visits[self.segment].get(target, 0) > 0:
-            return None
         seg = self.segments[self.segment]
         c = seg.get(target)
         if c is not None and (is_door(c) or c.kind in (LEDGE, LEDGE_LEFT)):
@@ -454,6 +452,16 @@ class GlobalMap(StrategistArtifact):
             and c.hashes in self.walk_patterns
         ):
             return None
+        if self.visits[self.segment].get(target, 0) > 0:
+            if (
+                c is None
+                or not c.hashes
+                or len(c.hashes) != 4
+                or len(set(c.hashes)) == 1
+                or c.hashes in self.walk_patterns
+            ):
+                return None
+            self.visits[self.segment].pop(target, None)
         self.blocked_cells[self.segment].add(target)
         if c is not None and c.kind == WALKABLE:
             c.kind = BLOCKED

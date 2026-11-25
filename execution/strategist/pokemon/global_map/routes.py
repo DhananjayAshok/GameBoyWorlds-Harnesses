@@ -48,12 +48,44 @@ def _snap(gmap: GlobalMap, segment: int, cell: Cell, walked: set) -> Optional[Ce
     return next((q for _, _, q in sorted(near) if usable(q)), None)
 
 
-def path_in_segment(gmap: GlobalMap, segment: int, start: Cell,
-                    goal: Cell, walked: Optional[set] = None) -> Optional[Tuple[int, List[Tuple[str, str]]]]:
+def blocked_target_cells(
+    gmap: GlobalMap,
+    segment: int,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> set:
+    if not blocked_moves:
+        return set()
+    seg = gmap.segments[segment] if 0 <= segment < len(gmap.segments) else {}
+    cur_pos = gmap.pos if gmap.segment == segment else None
+    out = set()
+    for b_pos, dirs in blocked_moves.items():
+        for d in dirs:
+            if d not in DIRECTIONS:
+                continue
+            dx, dy = DIRECTIONS[d]
+            target = (b_pos[0] + dx, b_pos[1] + dy)
+            if target == cur_pos:
+                continue
+            c = seg.get(target)
+            if c is not None and (is_door(c) or c.kind in (LEDGE, LEDGE_LEFT, OCCUPIED)):
+                continue
+            out.add(target)
+    return out
+
+
+def path_in_segment(
+    gmap: GlobalMap,
+    segment: int,
+    start: Cell,
+    goal: Cell,
+    walked: Optional[set] = None,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> Optional[Tuple[int, List[Tuple[str, str]]]]:
     import heapq
 
     seg = gmap.segments[segment]
     walked = walked_squares(gmap, segment) if walked is None else walked
+    blocked_targets = blocked_target_cells(gmap, segment, blocked_moves)
     best: Dict[Cell, int] = {start: 0}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
     heap = [(0, start)]
@@ -68,8 +100,13 @@ def path_in_segment(gmap: GlobalMap, segment: int, start: Cell,
             return cost, moves[::-1]
         if cost > best[cell]:
             continue
+        cell_blocked_dirs = set(blocked_moves.get(cell, ())) if blocked_moves else set()
         for direction, (dx, dy) in DIRECTIONS.items():
+            if direction in cell_blocked_dirs:
+                continue
             nxt, move = (cell[0] + dx, cell[1] + dy), "walk"
+            if nxt in blocked_targets and nxt != goal:
+                continue
             c = seg.get(nxt)
             if nxt == goal or (nxt in walked and (c is None or c.kind not in (BLOCKED, LEDGE, LEDGE_LEFT))):
                 step = 1
@@ -77,6 +114,8 @@ def path_in_segment(gmap: GlobalMap, segment: int, start: Cell,
                 continue
             elif (c.kind == LEDGE and direction == "down") or (c.kind == LEDGE_LEFT and direction == "left"):
                 nxt, move, step = (nxt[0] + dx, nxt[1] + dy), "jump", 2
+                if nxt in blocked_targets and nxt != goal:
+                    continue
                 landing = seg.get(nxt)
                 if nxt != goal and nxt not in walked and (landing is None or landing.kind not in STEP_COSTS):
                     continue

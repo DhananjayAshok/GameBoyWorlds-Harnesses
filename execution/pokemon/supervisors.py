@@ -13,7 +13,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_cutscene_frame_changing)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      cell_kinds, compress_path, edge_cells, edge_runs,
-                                                     format_path_runs, parse_edge_direction, shortest_path,
+                                                     format_path_runs, in_bounds, parse_edge_direction, shortest_path,
                                                      verbalize_edges)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeExecutor,
@@ -35,7 +35,8 @@ from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUG
                                        PLAYTHROUGH_REMAINING_SUBGOALS_BLOCK, PLAYTHROUGH_REMAINING_SUBGOALS_LINE,
                                        PLAYTHROUGH_SUBGOAL_DECISION_PROMPT, PLAYTHROUGH_TASK_CHECK_PROMPT,
                                        PLAYTHROUGH_TEXT_BLOCK, PRIMITIVES)
-from execution.strategist.pokemon.global_map.model import UNKNOWN, is_door
+from execution.strategist.pokemon.global_map.model import OCCUPIED, UNKNOWN, is_door
+from execution.strategist.pokemon.global_map.routes import blocked_target_cells
 from execution.strategist.pokemon.global_map.text import LEGEND, ascii_window, door_lines, frontier_targets
 from execution.report import ExecutorReport
 from execution.supervisors.base import Supervisor
@@ -194,6 +195,38 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._leg_stops.append(place)
         return place
 
+    def _current_segment_blocked_moves(self) -> Dict[Tuple[int, int], set]:
+        gmap = self._global_map()
+        place = self._current_map_place()
+        if gmap is None or place is None or not self._blocked_moves:
+            return {}
+        cur_seg, _ = place
+        out: Dict[Tuple[int, int], set] = {}
+        for (b_seg, b_pos), by_dir in self._blocked_moves.items():
+            try:
+                r_seg, r_pos = gmap.resolve(b_seg, b_pos)
+            except Exception:  # noqa: BLE001
+                continue
+            if r_seg == cur_seg and by_dir:
+                out.setdefault(r_pos, set()).update(by_dir.keys())
+        return out
+
+    def _local_blocked_cells(self) -> set:
+        local_blocked = set(getattr(self._env, "blocked_cells", None) or ())
+        gmap = self._global_map()
+        place = self._current_map_place()
+        if gmap is None or place is None:
+            return local_blocked
+        cur_seg, (px, py) = place
+        seg_blocked_moves = self._current_segment_blocked_moves()
+        if not seg_blocked_moves:
+            return local_blocked
+        for target in blocked_target_cells(gmap, cur_seg, seg_blocked_moves):
+            rel = (target[0] - px, target[1] - py)
+            if rel != (0, 0) and in_bounds(rel):
+                local_blocked.add(rel)
+        return local_blocked
+
     def _run_pocket_bounds(
         self,
         direction: str,
@@ -204,7 +237,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if gmap is None or place is None or not run_cells:
             return None
         seg = gmap.current
-        px, py = place[1]
+        cur_seg, (px, py) = place
+        seg_blocked_moves = self._current_segment_blocked_moves()
+        blocked_targets = blocked_target_cells(gmap, cur_seg, seg_blocked_moves)
         gx_min, gx_max = px + min(X_RANGE), px + max(X_RANGE)
         gy_min, gy_max = py + min(Y_RANGE), py + max(Y_RANGE)
 
@@ -232,6 +267,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         seeds = []
         for lx, ly in run_cells:
             eg = (px + lx, py + ly)
+            if eg in blocked_targets:
+                continue
             c = seg.get(eg)
             if c is None or c.kind == UNKNOWN or is_door(c):
                 return None
@@ -253,8 +290,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if c is not None and is_door(c):
                 half_plane_open = True
                 break
-            for _, (nx_d, ny_d) in DIRECTIONS.items():
+            cur_blocked_dirs = seg_blocked_moves.get(cur, set())
+            for d_name, (nx_d, ny_d) in DIRECTIONS.items():
+                if d_name in cur_blocked_dirs:
+                    continue
                 nxt = (cur[0] + nx_d, cur[1] + ny_d)
+                if nxt in blocked_targets:
+                    continue
                 if in_screen(nxt):
                     if nxt not in seeds:
                         continue
@@ -301,9 +343,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if c is not None and is_door(c):
                     open2 = True
                     break
-                for _, (nx_d, ny_d) in DIRECTIONS.items():
+                cur_blocked_dirs = seg_blocked_moves.get(cur, set())
+                for d_name, (nx_d, ny_d) in DIRECTIONS.items():
+                    if d_name in cur_blocked_dirs:
+                        continue
                     nxt = (cur[0] + nx_d, cur[1] + ny_d)
-                    if not in_forward_offset(nxt):
+                    if nxt in blocked_targets or not in_forward_offset(nxt):
                         continue
                     nc = seg.get(nxt)
                     if nc is None or nc.kind == UNKNOWN or is_door(nc):
@@ -443,11 +488,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 f"Leg positions visited in this area during this episode: {trail_str} "
                 f"(x span [{min(xs)}, {max(xs)}], y span [{min(ys)}, {max(ys)}])."
             )
+        seg_blocked_moves = self._current_segment_blocked_moves()
         lines.append(
             "Map of what has been seen in this area around the player "
             "(@ is the player at (0, 0) on the current screen, north is up, one character per tile):"
         )
-        lines.append(ascii_window(gmap))
+        lines.append(ascii_window(gmap, blocked_moves=seg_blocked_moves))
         lines.append("Legend: " + LEGEND)
         blocked_lines = []
         for (b_seg, b_pos), by_dir in self._blocked_moves.items():
@@ -459,9 +505,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if blocked_lines:
             lines.append("Blocked movement directions recorded in this area during this episode (do NOT repeat these from the same coordinate):")
             lines.extend(blocked_lines)
-        lines += door_lines(gmap, local_kinds)
+        lines += door_lines(gmap, local_kinds, blocked_moves=seg_blocked_moves)
         frontier_count = len(gmap.frontier())
-        targets, _ = frontier_targets(gmap, local_kinds)
+        targets, _ = frontier_targets(gmap, local_kinds, blocked_moves=seg_blocked_moves)
         if targets:
             lines.append(
                 f"Nearest unexplored map edges in this area ({frontier_count} reachable unexplored edge square(s) "
@@ -530,7 +576,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), people,
                            getattr(self._env, "left_ledge_patterns", None),
-                           getattr(self._env, "blocked_cells", None))
+                           self._local_blocked_cells())
         banner_note = (
             "\nNote: The thin 2-tile-tall bordered box at the bottom of the screen is a non-blocking area/location "
             "name popup banner (NOT a dialogue box). The player is already in free roam and can walk normally right "
@@ -568,7 +614,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 getattr(self._env, "walk_patterns", None),
                 self._people_now(),
                 getattr(self._env, "left_ledge_patterns", None),
-                getattr(self._env, "blocked_cells", None),
+                self._local_blocked_cells(),
             )
         return None
 
@@ -590,7 +636,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         frontier_cells = gmap.frontier()
         if not (1 <= len(frontier_cells) <= 16):
             return None
-        targets, _ = frontier_targets(gmap, local_kinds)
+        targets, _ = frontier_targets(gmap, local_kinds, blocked_moves=self._current_segment_blocked_moves())
         if not targets:
             return None
         nearest = targets[0]
@@ -837,7 +883,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None),
                                      getattr(self._env, "walk_patterns", None), after_people,
                                      getattr(self._env, "left_ledge_patterns", None),
-                                     getattr(self._env, "blocked_cells", None))
+                                     self._local_blocked_cells())
             after_banner_note = (
                 "\nNote: The thin 2-tile-tall bordered box at the bottom of the screen is a non-blocking area/location "
                 "name popup banner (NOT a dialogue box); the player is in free roam."
@@ -960,7 +1006,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 for (lx, ly), kind in local_kinds.items():
                     if abs(lx) + abs(ly) <= 6 and kind == "item":
                         return None
-        targets, _ = frontier_targets(gmap, local_kinds)
+        targets, _ = frontier_targets(gmap, local_kinds, blocked_moves=self._current_segment_blocked_moves())
         doors_here = gmap.reachable_door_list()
         unentered_doors = [d for d in doors_here if d["leads_to"] is None]
         if not targets and not unentered_doors:
@@ -1094,7 +1140,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                                getattr(self._env, "walk_patterns", None), self._people_now(),
                                getattr(self._env, "left_ledge_patterns", None),
-                               getattr(self._env, "blocked_cells", None))
+                               self._local_blocked_cells())
             result = self.call_executor(tag, task, identified=self._identified,
                                         cell_kinds=kinds, people_fn=self._people_now)
         elif tag == "menu":
@@ -1114,7 +1160,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), self._people_now(),
                            getattr(self._env, "left_ledge_patterns", None),
-                           getattr(self._env, "blocked_cells", None))
+                           self._local_blocked_cells())
         return self.call_executor(tag, task, counted=counted, screen_tiles=self._screen_tiles,
                                   cell_kinds=kinds,
                                   identified=self._identified,
@@ -1399,6 +1445,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             after_place = self._record_map_stop()
             move_tag = self._format_leg_movement(before_place, after_place, prior_stops, is_move_action=is_move_action)
             request = f"{action}({task})"
+            exec_blocked = getattr(self.last_executor, "_blocked_at_place", None) or {}
+            for b_place, b_dirs in exec_blocked.items():
+                for b_dir in b_dirs:
+                    detail = f"{request} -> blocked moving {b_dir}"
+                    dir_list = self._blocked_moves.setdefault(b_place, {}).setdefault(b_dir, [])
+                    if detail not in dir_list:
+                        dir_list.append(detail)
             if self._battles_lost():
                 note = f"{request}: the player lost a battle and blacked out"
                 self._note(note)
@@ -1501,13 +1554,6 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if is_move_action and not result["report"].steps and self._calls > 0:
                     self._calls -= 1
                 if result["reason"] in ("move_blocked", "out_of_steps"):
-                    exec_blocked = getattr(self.last_executor, "_blocked_at_place", None) or {}
-                    for b_place, b_dirs in exec_blocked.items():
-                        for b_dir in b_dirs:
-                            detail = f"{request} -> blocked moving {b_dir}"
-                            dir_list = self._blocked_moves.setdefault(b_place, {}).setdefault(b_dir, [])
-                            if detail not in dir_list:
-                                dir_list.append(detail)
                     if not exec_blocked:
                         move_dir = None
                         if result.get("notes"):

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from .model import BLOCKED, LEDGE, LEDGE_LEFT, OCCUPIED, UNKNOWN, WALKABLE, is_door
 from .render import segment_bounds
-from .routes import plan_route, render_plan
+from .routes import blocked_target_cells, plan_route, render_plan
 
 if TYPE_CHECKING:
     from .model import Cell, GlobalMap, MapCell
@@ -64,15 +64,21 @@ def window_bounds(gmap: GlobalMap, rx: int = 12, ry: int = 7) -> Tuple[int, int,
     return x0, x1, y0, y1
 
 
-def ascii_window(gmap: GlobalMap, rx: int = 12, ry: int = 7) -> str:
+def ascii_window(
+    gmap: GlobalMap,
+    rx: int = 12,
+    ry: int = 7,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> str:
     seg, (px, py) = gmap.current, gmap.pos
     visits = gmap.visits[gmap.segment] if 0 <= gmap.segment < len(gmap.visits) else {}
+    blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
     x0, x1, y0, y1 = window_bounds(gmap, rx, ry)
     rows = []
     for y in range(y1, y0 - 1, -1):
         rows.append("".join(
             "@" if (x, y) == (px, py)
-            else glyph(seg.get((x, y)), visited=visits.get((x, y), 0) > 0)
+            else ("#" if (x, y) in blocked_targets else glyph(seg.get((x, y)), visited=visits.get((x, y), 0) > 0))
             for x in range(x0, x1 + 1)
         ))
     return "\n".join(rows)
@@ -83,13 +89,17 @@ def sector(dx: int, dy: int) -> str:
     return SECTORS[int(round(math.atan2(dy, dx) / (math.pi / 4))) % 8]
 
 
-def _mapped_paths_from_start(gmap: GlobalMap) -> Dict[Cell, Optional[Tuple[Cell, str, str]]]:
+def _mapped_paths_from_start(
+    gmap: GlobalMap,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> Dict[Cell, Optional[Tuple[Cell, str, str]]]:
     import heapq
     from .model import DIRECTIONS
     from .routes import STEP_COSTS
 
     seg = gmap.current
     start = gmap.pos
+    blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
     best: Dict[Cell, int] = {start: 0}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
     heap = [(0, start)]
@@ -97,13 +107,20 @@ def _mapped_paths_from_start(gmap: GlobalMap) -> Dict[Cell, Optional[Tuple[Cell,
         cost, cell = heapq.heappop(heap)
         if cost > best[cell]:
             continue
+        cell_blocked_dirs = set(blocked_moves.get(cell, ())) if blocked_moves else set()
         for direction, (dx, dy) in DIRECTIONS.items():
+            if direction in cell_blocked_dirs:
+                continue
             nxt, move = (cell[0] + dx, cell[1] + dy), "walk"
+            if nxt in blocked_targets:
+                continue
             c = seg.get(nxt)
             if c is None:
                 continue
             if (c.kind == LEDGE and direction == "down") or (c.kind == LEDGE_LEFT and direction == "left"):
                 nxt, move, step = (nxt[0] + dx, nxt[1] + dy), "jump", 2
+                if nxt in blocked_targets:
+                    continue
                 landing = seg.get(nxt)
                 if landing is None or landing.kind not in STEP_COSTS:
                     continue
@@ -132,14 +149,18 @@ def _reconstruct_moves(
     return moves[::-1]
 
 
-def frontier_targets(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None,
-                     limit: int = 8) -> Tuple[List[Dict[str, Any]], Counter]:
+def frontier_targets(
+    gmap: GlobalMap,
+    local_kinds: Optional[Dict[Cell, str]] = None,
+    limit: int = 8,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> Tuple[List[Dict[str, Any]], Counter]:
     # dx, dy are relative to the player: x right, y up
     from execution.perception.pokemon.navigation import shortest_path, in_bounds
     from .routes import compress_moves
 
     px, py = gmap.pos
-    previous = _mapped_paths_from_start(gmap)
+    previous = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves)
     mass: Counter = Counter()
     nearest: Dict[str, Dict[str, Any]] = {}
     for g in gmap.frontier():
@@ -219,6 +240,7 @@ def _obstacle_detour_info(
     goal_cell: Cell,
     local_kinds: Optional[Dict[Cell, str]] = None,
     reached: Optional[Dict[Cell, Optional[Tuple[Cell, str, str]]]] = None,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
 ) -> Optional[Dict[str, Any]]:
     from collections import deque
     import heapq
@@ -232,7 +254,8 @@ def _obstacle_detour_info(
     if not seg or start == goal_cell:
         return None
     if reached is None:
-        reached = _mapped_paths_from_start(gmap)
+        reached = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves)
+    blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
 
     on_screen_reached = {start}
     if local_kinds is not None:
@@ -249,6 +272,8 @@ def _obstacle_detour_info(
     effective_reached = set(reached) | on_screen_reached
 
     def kind_at(g: Cell) -> str:
+        if g in blocked_targets and g != goal_cell:
+            return BLOCKED
         if local_kinds is not None:
             lx, ly = g[0] - px, g[1] - py
             if in_bounds((lx, ly)):
@@ -321,7 +346,10 @@ def _obstacle_detour_info(
             }
         if cost > best[cur]:
             continue
+        cur_blocked_dirs = set(blocked_moves.get(cur, ())) if blocked_moves else set()
         for d, (ox, oy) in DIRECTIONS.items():
+            if d in cur_blocked_dirs:
+                continue
             nxt = (cur[0] + ox, cur[1] + oy)
             if not (x_min <= nxt[0] <= x_max and y_min <= nxt[1] <= y_max):
                 continue
@@ -393,13 +421,17 @@ def _leads_to_description(gmap: GlobalMap, leads_to: int) -> str:
     return f"leads to {label}"
 
 
-def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -> List[str]:
+def door_lines(
+    gmap: GlobalMap,
+    local_kinds: Optional[Dict[Cell, str]] = None,
+    blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
+) -> List[str]:
     from execution.perception.pokemon.navigation import approach_cells, in_bounds, shortest_path
     from .routes import _snap, compress_moves, path_in_segment, walked_squares
 
     px, py = gmap.pos
     walked = walked_squares(gmap, gmap.segment)
-    reached = _mapped_paths_from_start(gmap)
+    reached = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves)
     doors = []
     for door in gmap.reachable_door_list():
         leads_to = door["leads_to"]
@@ -408,7 +440,11 @@ def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -
         goal_cell = min(door["cells"], key=lambda g: abs(g[0] - px) + abs(g[1] - py))
         dx, dy = goal_cell[0] - px, goal_cell[1] - py
         snapped = _snap(gmap, gmap.segment, goal_cell, walked)
-        found = path_in_segment(gmap, gmap.segment, (px, py), snapped, walked) if snapped is not None else None
+        found = (
+            path_in_segment(gmap, gmap.segment, (px, py), snapped, walked, blocked_moves=blocked_moves)
+            if snapped is not None
+            else None
+        )
         path_moves = compress_moves(found[1]) if (found is not None and found[1]) else None
         path_steps = len(found[1]) if found is not None else None
         on_screen_blocked = False
@@ -417,7 +453,7 @@ def door_lines(gmap: GlobalMap, local_kinds: Optional[Dict[Cell, str]] = None) -
             if not goals or shortest_path(local_kinds, (0, 0), goals) is None:
                 on_screen_blocked = True
         detour_info = (
-            _obstacle_detour_info(gmap, goal_cell, local_kinds, reached=reached)
+            _obstacle_detour_info(gmap, goal_cell, local_kinds, reached=reached, blocked_moves=blocked_moves)
             if (path_moves is None or on_screen_blocked)
             else None
         )

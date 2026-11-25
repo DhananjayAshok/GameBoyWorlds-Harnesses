@@ -695,12 +695,38 @@ class GridMoveExecutor(PolicyExecutor):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _local_blocked_cells_from_history(self) -> set:
+        local_blocked = set(getattr(self._env, "blocked_cells", None) or ())
+        place = self._current_map_place()
+        gmap = getattr(self._env, "_map", None)
+        if place is None or gmap is None or not self._blocked_at_place:
+            return local_blocked
+        cur_seg, (px, py) = place
+        for b_place, dirs in self._blocked_at_place.items():
+            try:
+                r_seg, r_pos = gmap.resolve(b_place[0], b_place[1])
+            except Exception:  # noqa: BLE001
+                continue
+            if r_seg != cur_seg:
+                continue
+            for d in dirs:
+                if d not in DIRECTIONS:
+                    continue
+                dx, dy = DIRECTIONS[d]
+                rel = (r_pos[0] + dx - px, r_pos[1] + dy - py)
+                if rel != (0, 0) and in_bounds(rel):
+                    local_blocked.add(rel)
+        return local_blocked
+
     def _refresh_local_perception(self, blocked_neighbor: Optional[Tuple[int, int]] = None) -> bool:
         tiles = getattr(self._env, "_tiles", None)
         if tiles is None or not hasattr(tiles, "identify_tiles"):
-            if blocked_neighbor is not None and self.cell_kinds is not None:
+            if self.cell_kinds is not None:
                 self.cell_kinds = dict(self.cell_kinds)
-                self.cell_kinds[blocked_neighbor] = BLOCKED
+                for rel in self._local_blocked_cells_from_history():
+                    self.cell_kinds[rel] = BLOCKED
+                if blocked_neighbor is not None:
+                    self.cell_kinds[blocked_neighbor] = BLOCKED
             return False
         frame = self._get_state()["core"]["current_frame"]
         gmap = getattr(self._env, "_map", None)
@@ -717,7 +743,7 @@ class GridMoveExecutor(PolicyExecutor):
             getattr(self._env, "walk_patterns", None),
             people,
             getattr(self._env, "left_ledge_patterns", None),
-            getattr(self._env, "blocked_cells", None),
+            self._local_blocked_cells_from_history(),
         )
         if blocked_neighbor is not None:
             kinds[blocked_neighbor] = BLOCKED
