@@ -104,10 +104,19 @@ Cell: <(x, y) of the target, or None>
             return None
         return cell
 
-    def _execute(self, info, target: str, identified=None, **kwargs) -> Tuple[Dict[str, Any], int]:
-        from execution.perception.pokemon.navigation import parse_all_cells
+    def _execute(self, info, target: str, identified=None, cell_kinds=None, **kwargs) -> Tuple[Dict[str, Any], int]:
+        from execution.perception.pokemon.navigation import (
+            WALKABLE,
+            cell_kinds as compute_cell_kinds,
+            in_bounds,
+            is_counter_separator_cell,
+            neighbours,
+            parse_all_cells,
+            shortest_path,
+        )
 
         results: Dict[str, Any] = {"cell": None, "found_cells": [], "found_cells_str": coords_to_string([])}
+        kinds = cell_kinds if cell_kinds is not None else (compute_cell_kinds(identified) if identified is not None else None)
         explicit = [c for c in parse_all_cells(target) if c in self.cardinals.values() or c in self.counter_cardinals.values()]
         if len(explicit) == 1 and identified is not None:
             ec = explicit[0]
@@ -137,7 +146,21 @@ Cell: <(x, y) of the target, or None>
             results["direction"] = next(name for name, offset in self.cardinals.items() if offset == cell)
             return results, 0
         if cell in self.counter_cardinals.values():
-            results["direction"] = next(name for name, offset in self.counter_cardinals.items() if offset == cell)
-            results["across_counter"] = True
-            return results, 0
+            mid = (cell[0] // 2, cell[1] // 2)
+            direct_goals = (
+                [nb for _, nb in neighbours(cell) if in_bounds(nb) and kinds.get(nb) == WALKABLE]
+                if kinds is not None
+                else []
+            )
+            if kinds is None or (
+                kinds.get(mid) != WALKABLE
+                and (
+                    is_counter_separator_cell(mid, kinds, identified)
+                    or not direct_goals
+                    or shortest_path(kinds, (0, 0), direct_goals) is None
+                )
+            ):
+                results["direction"] = next(name for name, offset in self.counter_cardinals.items() if offset == cell)
+                results["across_counter"] = True
+                return results, 0
         return results, 1

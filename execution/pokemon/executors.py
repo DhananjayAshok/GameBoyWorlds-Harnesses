@@ -30,6 +30,7 @@ from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE,
                                                      parse_all_cells, parse_avoided_cells,
                                                      parse_cell, parse_edge_direction, shortest_path, verbalize_edges,
                                                      warp_cells)
+from execution.executor_action import coords_to_string
 from execution.pokemon.executor_actions import CheckInteractionAction
 from execution.report import EnvironmentStepRecord, ExecutorVLMCallRecord
 from utils import log_error, ocr, parse_int, parse_key_value, parse_yes_no
@@ -441,13 +442,13 @@ class InteractionExecutor(PolicyExecutor):
 
         records = []
         explicit_coords = [c for c in parse_all_cells(self._task) if in_bounds(c) and c != (0, 0)]
+        target_cell: Optional[Tuple[int, int]] = explicit_coords[0] if len(explicit_coords) == 1 else None
         direction = None
         if (
-            len(explicit_coords) == 1
-            and explicit_coords[0] not in CheckInteractionAction.cardinals.values()
-            and explicit_coords[0] not in CheckInteractionAction.counter_cardinals.values()
+            target_cell is not None
+            and target_cell not in CheckInteractionAction.cardinals.values()
         ):
-            direction = self._align_to_target(explicit_coords[0], records)
+            direction = self._align_to_target(target_cell, records)
             if self._last_terminated or self._last_truncated:
                 return self._finish(records)
             if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay():
@@ -461,12 +462,19 @@ class InteractionExecutor(PolicyExecutor):
 
         if direction is None:
             check = CheckInteractionAction(self._vlm_call, self._parameters)
-            result, code = check.execute(info, target=self._task, identified=self.identified)
+            result, code = check.execute(
+                info,
+                target=self._task,
+                identified=self.identified,
+                cell_kinds=self.cell_kinds,
+            )
             self.check_result = result
             if code is None:
                 return self._fail("invalid_check", result["invalid"])
             if code == -1:
                 return self._fail("target_not_found")
+            if result.get("cell") is not None:
+                target_cell = result.get("cell")
             if code == 1:
                 cell = result.get("cell")
                 if cell is not None:
@@ -487,6 +495,7 @@ class InteractionExecutor(PolicyExecutor):
             else:
                 direction = result["direction"]
 
+        aligned_walked = bool(records)
         self._begin_scripted(f"face {direction} and interact with {self._task}")
         if getattr(self._env, "facing", None) != direction:
             turn = self._take_action(MoveStepsAction, direction=direction, steps=1)
@@ -498,9 +507,18 @@ class InteractionExecutor(PolicyExecutor):
                     self._clear_interaction_dialogue(records)
                 return self._finish(records)
             action_return = turn.transition_states[-1]["core"].get("action_return") or {}
-            if action_return.get("n_steps_taken"):
+            steps_taken = action_return.get("n_steps_taken", 0)
+            if steps_taken and not (
+                not aligned_walked
+                and steps_taken == 1
+                and target_cell in CheckInteractionAction.counter_cardinals.values()
+            ):
+                found_cells_str = (
+                    (self.check_result or {}).get("found_cells_str")
+                    or coords_to_string([target_cell] if target_cell is not None else [])
+                )
                 return self._fail("target_cell_walkable",
-                                  f"Pressed {direction} to face the target at {result['found_cells_str']}, "
+                                  f"Pressed {direction} to face the target at {found_cells_str}, "
                                   "but the player walked onto that cell instead, so nothing is there")
 
         interact = self._take_action(InteractAction)
