@@ -353,11 +353,11 @@ class GlobalMap(StrategistArtifact):
         pixels: Optional[np.ndarray] = None,
     ) -> bool:
         tag_set = set(tags)
-        if "npc" in tag_set or "unknown" in tag_set or "water" in tag_set:
+        if "npc" in tag_set or "unknown" in tag_set or "water" in tag_set or "obstacle" in tag_set:
             return False
         if bool(tag_set & WALKABLE_TAGS):
             return True
-        if hashes is not None and len(hashes) == 4 and None not in hashes:
+        if hashes is not None and len(hashes) == 4 and len(set(hashes)) == 1 and hashes[0] is not None:
             if pixels is not None and pixels.size > 0 and int(pixels.min()) == int(pixels.max()):
                 return False
             return True
@@ -2200,19 +2200,37 @@ class GlobalMap(StrategistArtifact):
 
     def refresh(self, tile_lookup: Dict[str, Any]) -> int:
         self.prune_transient_segments()
+        def _pattern_learnable(pattern: Tuple[Optional[str], ...], cell_pixels: Optional[np.ndarray] = None) -> bool:
+            if not pattern or len(pattern) != 4 or None in pattern:
+                return False
+            tiles = [tile_lookup.get(h) for h in pattern]
+            if not all(t is not None for t in tiles):
+                return True
+            raw_qtags = {
+                q: normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None))
+                for q, t in zip(QUARTERS, tiles)
+            }
+            qtags = filter_cell_warp_quarter_tags(raw_qtags)
+            qdescs = {q: t.description for q, t in zip(QUARTERS, tiles)}
+            qimgs = {q: getattr(t, "image", None) for q, t in zip(QUARTERS, tiles)}
+            tag_set = set(qtags.values())
+            if "npc" in tag_set or "unknown" in tag_set or "water" in tag_set:
+                return False
+            if is_top_overhang_floor_cell((0, 0), {(0, 0): qtags}, {(0, 0): qdescs}):
+                return True
+            if is_patterned_floor_cell((0, 0), {(0, 0): qtags}, {(0, 0): qdescs}, {(0, 0): qimgs}, min_ground_quarters=1):
+                return True
+            t_img = cell_pixels if cell_pixels is not None else getattr(tiles[0], "image", None)
+            if len(set(pattern)) == 1:
+                if t_img is not None and t_img.size > 0 and int(t_img.min()) == int(t_img.max()):
+                    return False
+                return True
+            return self._can_learn_walkable(tag_set, pattern, t_img)
+
         if self.walk_patterns:
-            cleaned_patterns = set()
-            for pattern in self.walk_patterns:
-                tiles = [tile_lookup.get(h) for h in pattern]
-                if all(t is not None for t in tiles):
-                    qtags = {
-                        normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None)) for t in tiles
-                    }
-                    t_img = getattr(tiles[0], "image", None)
-                    if not self._can_learn_walkable(qtags, pattern, t_img):
-                        continue
-                cleaned_patterns.add(pattern)
-            self.walk_patterns = cleaned_patterns
+            self.walk_patterns = {
+                pattern for pattern in self.walk_patterns if _pattern_learnable(pattern)
+            }
         for si, seg in enumerate(self.segments):
             if not seg or si >= len(self.visits) or not self.visits[si]:
                 continue
@@ -2229,8 +2247,8 @@ class GlobalMap(StrategistArtifact):
                     and None not in c.hashes
                 ):
                     visited_by_pattern[c.hashes].append(c)
-            for cells_for_pat in visited_by_pattern.values():
-                if len(cells_for_pat) >= 2:
+            for pat, cells_for_pat in visited_by_pattern.items():
+                if len(cells_for_pat) >= 2 and _pattern_learnable(pat, cells_for_pat[0].pixels):
                     self._learn_walkable(cells_for_pat[0])
         while len(self.blocked_cells) < len(self.segments):
             self.blocked_cells.append(set())

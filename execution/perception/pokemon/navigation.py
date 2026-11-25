@@ -483,8 +483,11 @@ def cell_kinds(
             and "unknown" not in cell_tags
             and "water" not in cell_tags
             and (
-                bool(cell_tags & WALKABLE_TAGS)
-                or (len(pattern) == 4 and None not in pattern)
+                cell_tags <= WALKABLE_TAGS
+                or is_patterned_floor_cell(
+                    cell, quarter_tags, quarter_descriptions, quarter_images, min_ground_quarters=1
+                )
+                or (len(pattern) == 4 and len(set(pattern)) == 1 and pattern[0] is not None)
             )
         ):
             kinds[cell] = WALKABLE
