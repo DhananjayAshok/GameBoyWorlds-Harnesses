@@ -18,8 +18,10 @@ from execution.perception.pokemon.battle import (
 )
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import (LEDGE_LEFT, LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
+                                                     infer_spatial_patterned_floor_cells,
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
-                                                     is_overhang_floor_cell, is_player_overhang_floor_cell,
+                                                     is_overhang_floor_cell, is_patterned_floor_cell,
+                                                     is_player_overhang_floor_cell,
                                                      is_player_overhang_ledge_cell, is_south_ledge_cell,
                                                      is_top_overhang_floor_cell, is_west_ledge_cell)
 from execution.perception.pokemon.tiles import (TileRecognizer, filter_cell_warp_quarter_tags,
@@ -355,7 +357,7 @@ class GlobalMap(StrategistArtifact):
             return False
         if bool(tag_set & WALKABLE_TAGS):
             return True
-        if hashes is not None and len(hashes) == 4 and len(set(hashes)) == 1 and hashes[0] is not None:
+        if hashes is not None and len(hashes) == 4 and None not in hashes:
             if pixels is not None and pixels.size > 0 and int(pixels.min()) == int(pixels.max()):
                 return False
             return True
@@ -621,6 +623,13 @@ class GlobalMap(StrategistArtifact):
                 cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
             )
         }
+        local_hashes_by_cell = {
+            cell: {q: getattr(identified.get((cell[0], cell[1], q)), "hash", None) for q in QUARTERS}
+            for cell in quarter_tags
+        }
+        patterned_floor_cells = infer_spatial_patterned_floor_cells(
+            quarter_tags, quarter_descriptions, quarter_images, local_hashes_by_cell
+        )
         for (x, y), piece in _local_cells(a, shift):
             if (x, y) in masked_cells and (x, y) != (0, 0):
                 continue
@@ -640,6 +649,11 @@ class GlobalMap(StrategistArtifact):
                 tags = tuple(sorted({
                     quarter_tags[(x, y)][q] for q in ("top_left", "top_right") if q in quarter_tags[(x, y)]
                 }))
+                kind = WALKABLE
+            elif (x, y) in patterned_floor_cells and (x, y) not in east_cliff_cells:
+                tags = tuple(sorted({
+                    t for t in quarter_tags[(x, y)].values() if t in WALKABLE_TAGS
+                })) or ("ground",)
                 kind = WALKABLE
             elif (x, y) in south_ledge_cells:
                 tags = tuple(sorted(
@@ -2203,7 +2217,7 @@ class GlobalMap(StrategistArtifact):
             if not seg or si >= len(self.visits) or not self.visits[si]:
                 continue
             seg_blocked = self.blocked_cells[si] if si < len(self.blocked_cells) else set()
-            uniform_visited: Dict[Tuple[Optional[str], ...], List[MapCell]] = defaultdict(list)
+            visited_by_pattern: Dict[Tuple[Optional[str], ...], List[MapCell]] = defaultdict(list)
             for g, cnt in self.visits[si].items():
                 if cnt <= 0 or g in seg_blocked:
                     continue
@@ -2212,11 +2226,10 @@ class GlobalMap(StrategistArtifact):
                     c is not None
                     and c.hashes
                     and len(c.hashes) == 4
-                    and len(set(c.hashes)) == 1
-                    and c.hashes[0] is not None
+                    and None not in c.hashes
                 ):
-                    uniform_visited[c.hashes].append(c)
-            for cells_for_pat in uniform_visited.values():
+                    visited_by_pattern[c.hashes].append(c)
+            for cells_for_pat in visited_by_pattern.values():
                 if len(cells_for_pat) >= 2:
                     self._learn_walkable(cells_for_pat[0])
         while len(self.blocked_cells) < len(self.segments):
@@ -2259,6 +2272,13 @@ class GlobalMap(StrategistArtifact):
                     quarter_images[g] = {
                         q: (getattr(t, "image", None) if t is not None else None) for q, t in zip(QUARTERS, tiles)
                     }
+            seg_hashes_by_cell = {
+                g: {q: h for q, h in zip(QUARTERS, seg[g].hashes or ())}
+                for g in quarter_tags
+            }
+            seg_patterned_floor_cells = infer_spatial_patterned_floor_cells(
+                quarter_tags, quarter_descriptions, quarter_images, seg_hashes_by_cell
+            )
             for g, c in seg.items():
                 if g not in quarter_tags or c.kind == OCCUPIED:
                     continue
@@ -2267,6 +2287,13 @@ class GlobalMap(StrategistArtifact):
                     new_kind = WALKABLE
                 elif is_npc_head_overhang_floor_cell(g, quarter_tags):
                     new_tags = tuple(sorted({quarter_tags[g]["top_left"], quarter_tags[g]["top_right"]}))
+                    new_kind = WALKABLE
+                elif g in seg_patterned_floor_cells and not is_east_cliff_barrier_cell(
+                    g, quarter_tags, quarter_descriptions, quarter_images
+                ):
+                    new_tags = tuple(sorted({
+                        t for t in quarter_tags[g].values() if t in WALKABLE_TAGS
+                    })) or ("ground",)
                     new_kind = WALKABLE
                 elif is_south_ledge_cell(g, quarter_tags, quarter_descriptions):
                     new_tags = tuple(sorted({quarter_tags[g]["top_left"], quarter_tags[g]["top_right"], "ledge"}))

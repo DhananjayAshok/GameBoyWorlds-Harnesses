@@ -2174,12 +2174,33 @@ class NPCRegistry(StrategistArtifact):
         people = dict(self.on_screen(gmap))
         remembered = set()
         segment = gmap.resolve(gmap.segment, gmap.pos)[0]
+        seg_cells = gmap.segments[segment] if 0 <= segment < len(gmap.segments) else {}
         for mark in self.map_people(gmap, segment):
             cell = (mark.square[0] - gmap.pos[0], mark.square[1] - gmap.pos[1])
-            if (not mark.on_screen and self.in_view(gmap, mark.square) and not mark.earlier and cell not in people
-                    and self._episode - mark.last_seen[0] <= STALE_MARK_EPISODES):
-                people[cell] = mark.npc_id
-                remembered.add(cell)
+            if not mark.on_screen and not mark.earlier and cell not in people:
+                if self.in_view(gmap, mark.square) and self._episode - mark.last_seen[0] <= STALE_MARK_EPISODES:
+                    people[cell] = mark.npc_id
+                    remembered.add(cell)
+                elif not (LEFT_COL <= cell[0] <= LEFT_COL + 9 and TOP_ROW - 8 <= cell[1] <= TOP_ROW):
+                    for dx, dy in ((0, 1), (0, -1), (-1, 0), (1, 0)):
+                        mid_rel = (cell[0] + dx, cell[1] + dy)
+                        far_rel = (cell[0] + 2 * dx, cell[1] + 2 * dy)
+                        if (
+                            LEFT_COL <= mid_rel[0] <= LEFT_COL + 9
+                            and TOP_ROW - 8 <= mid_rel[1] <= TOP_ROW
+                            and LEFT_COL <= far_rel[0] <= LEFT_COL + 9
+                            and TOP_ROW - 8 <= far_rel[1] <= TOP_ROW
+                        ):
+                            mid_c = seg_cells.get((mark.square[0] + dx, mark.square[1] + dy))
+                            far_c = seg_cells.get((mark.square[0] + 2 * dx, mark.square[1] + 2 * dy))
+                            if (
+                                mid_c is not None
+                                and getattr(mid_c, "kind", None) == "blocked"
+                                and far_c is not None
+                                and getattr(far_c, "kind", None) == "walkable"
+                            ):
+                                people[cell] = mark.npc_id
+                                break
         for cell, npc_id in people.items():
             npc = self.get(npc_id)
             if self.look_of(npc).kind_hint == "object":

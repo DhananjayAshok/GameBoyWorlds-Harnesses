@@ -299,6 +299,104 @@ def is_npc_head_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[st
     return "npc" in below_top
 
 
+PATTERNED_FLOOR_OBSTACLE_REJECT_DESC_PATTERN = re.compile(
+    r"\b(?:ledge|cliff|ridge|fence|tree|bush|plant|table|desk|counter|chair|stool|bed|shelf|bookshelf|cabinet|water|shoreline|sign|signpost|house|building|roof|door|window|porthole|rock|boulder)\b",
+    re.IGNORECASE,
+)
+
+
+def is_patterned_floor_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    min_ground_quarters: int = 2,
+) -> bool:
+    if quarter_images is None:
+        return False
+    cell_q = quarter_tags.get(cell, {})
+    cell_imgs = quarter_images.get(cell, {})
+    if len(cell_q) < 4 or len(cell_imgs) < 4:
+        return False
+    tag_set = set(cell_q.values())
+    if not ("obstacle" in tag_set and bool(tag_set & {"ground", "ground decoration"})):
+        return False
+    if not (tag_set <= {"ground", "ground decoration", "obstacle"}):
+        return False
+    ground_qs = [q for q in QUARTERS if cell_q.get(q) in ("ground", "ground decoration")]
+    obst_qs = [q for q in QUARTERS if cell_q.get(q) == "obstacle"]
+    if len(ground_qs) < min_ground_quarters or not obst_qs:
+        return False
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    for q in QUARTERS:
+        desc = cell_d.get(q) or ""
+        if PATTERNED_FLOOR_OBSTACLE_REJECT_DESC_PATTERN.search(desc):
+            return False
+    ground_shades: set = set()
+    ground_means: List[float] = []
+    for q in ground_qs:
+        img = cell_imgs.get(q)
+        if img is None or getattr(img, "size", 0) == 0:
+            return False
+        arr = np.squeeze(np.asarray(img))
+        if arr.shape != (8, 8):
+            return False
+        vals = np.unique(arr)
+        if int(arr.min()) < 56:
+            return False
+        ground_shades.update(int(v) for v in vals)
+        ground_means.append(float(arr.mean()))
+    if len(ground_shades) < 2 or (max(ground_shades) - min(ground_shades)) > 96:
+        return False
+    mean_ground = sum(ground_means) / len(ground_means)
+    for q in obst_qs:
+        img = cell_imgs.get(q)
+        if img is None or getattr(img, "size", 0) == 0:
+            return False
+        arr = np.squeeze(np.asarray(img))
+        if arr.shape != (8, 8):
+            return False
+        vals, counts = np.unique(arr, return_counts=True)
+        shades = {int(v) for v in vals}
+        if shades != ground_shades:
+            return False
+        if int(counts[0]) > 12:
+            return False
+        if abs(float(arr.mean()) - mean_ground) > 12.0:
+            return False
+    return True
+
+
+def infer_spatial_patterned_floor_cells(
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    hashes: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> set:
+    inferred: set = set()
+    for cell in quarter_tags:
+        if is_patterned_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images, min_ground_quarters=2):
+            inferred.add(cell)
+    if not hashes or quarter_images is None:
+        return inferred
+    by_pattern: Dict[Tuple[Optional[str], ...], List[Cell]] = {}
+    for cell in quarter_tags:
+        if cell in inferred:
+            continue
+        pat = tuple(hashes.get(cell, {}).get(q) for q in QUARTERS)
+        if len(pat) == 4 and None not in pat:
+            if is_patterned_floor_cell(
+                cell, quarter_tags, quarter_descriptions, quarter_images, min_ground_quarters=1
+            ):
+                by_pattern.setdefault(pat, []).append(cell)
+    for pat, cells in by_pattern.items():
+        xs = {c[0] for c in cells}
+        ys = {c[1] for c in cells}
+        if len(cells) >= 4 and len(xs) >= 2 and len(ys) >= 2:
+            inferred.update(cells)
+    return inferred
+
+
 def is_overhang_floor_cell(
     cell: Cell,
     quarter_tags: Dict[Cell, Dict[str, str]],
@@ -338,6 +436,9 @@ def cell_kinds(
     for cell in list(quarter_tags):
         quarter_tags[cell] = filter_cell_warp_quarter_tags(quarter_tags[cell])
         tags[cell] = set(quarter_tags[cell].values())
+    patterned_floor_cells = infer_spatial_patterned_floor_cells(
+        quarter_tags, quarter_descriptions, quarter_images, hashes
+    )
     confirmed_occupied: set = set()
     for cell, label in (people or {}).items():
         if cell == (0, 0):
@@ -362,6 +463,7 @@ def cell_kinds(
             cell_tags & WARP_TAGS
             or cell_tags <= WALKABLE_TAGS
             or is_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+            or cell in patterned_floor_cells
         ):
             kinds[cell] = WALKABLE
         elif is_south_ledge_cell(cell, quarter_tags, quarter_descriptions) or (
@@ -382,7 +484,7 @@ def cell_kinds(
             and "water" not in cell_tags
             and (
                 bool(cell_tags & WALKABLE_TAGS)
-                or (len(pattern) == 4 and len(set(pattern)) == 1 and pattern[0] is not None)
+                or (len(pattern) == 4 and None not in pattern)
             )
         ):
             kinds[cell] = WALKABLE
@@ -604,6 +706,33 @@ COUNTER_SEPARATOR_DESC_PATTERN = re.compile(
 )
 
 
+def _cell_has_counter_desc(
+    cell: Cell,
+    kinds: Dict[Cell, str],
+    identified: Dict[Tuple[int, int, str], Any],
+) -> Tuple[bool, bool, set]:
+    if not in_bounds(cell) or kinds.get(cell) != BLOCKED:
+        return False, True, set()
+    from execution.perception.pokemon.tiles import normalize_tabletop_tag
+
+    has_counter_desc = False
+    cell_hashes: set = set()
+    for q in QUARTERS:
+        tile = identified.get((cell[0], cell[1], q))
+        if tile is None:
+            continue
+        desc = getattr(tile, "description", None) or ""
+        tag = normalize_tabletop_tag(tile.tag, desc, getattr(tile, "image", None))
+        if tag in ("npc", "sign", "water", "tall grass", "entrance", "staircase"):
+            return False, True, set()
+        h = getattr(tile, "hash", None)
+        if h:
+            cell_hashes.add(h)
+        if COUNTER_SEPARATOR_DESC_PATTERN.search(desc):
+            has_counter_desc = True
+    return has_counter_desc, False, cell_hashes
+
+
 def is_counter_separator_cell(
     cell: Cell,
     kinds: Dict[Cell, str],
@@ -613,20 +742,22 @@ def is_counter_separator_cell(
         return False
     if identified is None:
         return True
-    from execution.perception.pokemon.tiles import normalize_tabletop_tag
-
-    has_counter_desc = False
-    for q in QUARTERS:
-        tile = identified.get((cell[0], cell[1], q))
-        if tile is None:
-            continue
-        desc = getattr(tile, "description", None) or ""
-        tag = normalize_tabletop_tag(tile.tag, desc, getattr(tile, "image", None))
-        if tag in ("npc", "sign"):
-            return False
-        if COUNTER_SEPARATOR_DESC_PATTERN.search(desc):
-            has_counter_desc = True
-    return has_counter_desc
+    has_desc, disqualified, cell_hashes = _cell_has_counter_desc(cell, kinds, identified)
+    if disqualified:
+        return False
+    if has_desc:
+        return True
+    for axis_nbs in (
+        ((cell[0] - 1, cell[1]), (cell[0] + 1, cell[1])),
+        ((cell[0], cell[1] - 1), (cell[0], cell[1] + 1)),
+    ):
+        nb_results = [_cell_has_counter_desc(nb, kinds, identified) for nb in axis_nbs]
+        if all(r[0] and not r[1] for r in nb_results):
+            return True
+        for nb_has_desc, nb_disq, nb_hashes in nb_results:
+            if nb_has_desc and not nb_disq and (cell == (0, 1) or bool(cell_hashes & nb_hashes)):
+                return True
+    return False
 
 
 def _is_npc_target_cell(
@@ -1474,7 +1605,9 @@ def describe_target_reachability(
                 return " [adjacent across counter]"
             return " [adjacent to player]"
         runs_text = format_path_runs(compress_path(path))
-        return f" [on-screen path: {runs_text}]"
+        end_cell = path[-1][2]
+        across_note = " (across counter)" if abs(target[0] - end_cell[0]) + abs(target[1] - end_cell[1]) == 2 else ""
+        return f" [on-screen path: {runs_text}{across_note}]"
     pinches = diagonal_barrier_pairs(kinds, goals)
     if pinches:
         b1, b2 = pinches[0]

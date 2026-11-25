@@ -441,7 +441,34 @@ class InteractionExecutor(PolicyExecutor):
             return self._fail("not_free_roam")
 
         records = []
-        explicit_coords = [c for c in parse_all_cells(self._task) if in_bounds(c) and c != (0, 0)]
+        people = None
+        if callable(self.people_fn):
+            try:
+                people = self.people_fn()
+            except Exception:  # noqa: BLE001
+                people = None
+        kinds = self.cell_kinds
+        if kinds is None and self.identified is not None:
+            kinds = cell_kinds(
+                self.identified,
+                getattr(self._env, "ledge_patterns", None),
+                getattr(self._env, "walk_patterns", None),
+                people,
+                getattr(self._env, "left_ledge_patterns", None),
+                getattr(self._env, "blocked_cells", None),
+            )
+        explicit_coords = [
+            c
+            for c in parse_all_cells(self._task)
+            if c != (0, 0)
+            and (
+                in_bounds(c)
+                or (
+                    kinds is not None
+                    and bool(approach_cells(kinds, c, identified=self.identified, people=people))
+                )
+            )
+        ]
         target_cell: Optional[Tuple[int, int]] = explicit_coords[0] if len(explicit_coords) == 1 else None
         direction = None
         if (
@@ -1037,14 +1064,23 @@ Location: <(x, y), Ambiguous, or Not Found>
 Candidates: <if Ambiguous, each candidate with its coordinates and what sets it apart from the others; otherwise None>
 [STOP]"""
 
+    def _is_usable_target_cell(self, cell: Optional[Tuple[int, int]], people=None) -> bool:
+        if cell is None:
+            return False
+        if in_bounds(cell):
+            return True
+        if self.cell_kinds is None:
+            return False
+        return bool(approach_cells(self.cell_kinds, cell, identified=self.identified, people=people))
+
     def _resolve_explicit_target(self) -> Optional[Tuple[int, int]]:
-        coords = [c for c in parse_all_cells(self._task) if in_bounds(c)]
+        people = self._people_now()
+        coords = [c for c in parse_all_cells(self._task) if self._is_usable_target_cell(c, people=people)]
         if len(coords) != 1:
             return None
         target = coords[0]
         if target == (0, 0):
             return target
-        people = self._people_now()
         if self.cell_kinds.get(target) == WALKABLE:
             if shortest_path(self.cell_kinds, (0, 0), [target], people=people) is not None:
                 return target
@@ -1071,7 +1107,7 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
             if "not found" in lowered:
                 return self._fail(MOVE_TARGET_NOT_FOUND, "target_not_found", parse_key_value(output, "Reasoning"))
             target = parse_cell(location)
-            if target is None or not in_bounds(target):
+            if not self._is_usable_target_cell(target, people=self._people_now()):
                 return self._fail(MOVE_BAD_LOCATION, "bad_location", f"Unusable location {location!r}")
         self.target_cell = target
         if target == (0, 0):

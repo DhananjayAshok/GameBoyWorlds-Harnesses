@@ -10,9 +10,14 @@ from execution.perception.pokemon.battle import (BANNER_TOP, TILE_SIZE, find_mod
                                                  has_bottom_dialogue_box, has_bottom_location_banner)
 from execution.perception.pokemon.grid import GRID_SKIP, cell_box, draw_box, split_grid
 from execution.perception.pokemon.navigation import (FURNITURE_OVERHANG_TOP_TAGS, OVERHANG_TOP_TAGS,
+                                                     WALKABLE, Y_RANGE,
+                                                     approach_cells,
                                                      describe_target_reachability,
+                                                     in_bounds,
+                                                     is_counter_separator_cell,
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
-                                                     is_overhang_floor_cell, is_player_overhang_floor_cell,
+                                                     is_overhang_floor_cell, is_patterned_floor_cell,
+                                                     is_player_overhang_floor_cell,
                                                      is_south_ledge_cell, is_top_overhang_floor_cell,
                                                      is_west_ledge_cell, trainer_los_ray)
 from execution.perception.pokemon.prompts import PLAYER_SIDES, TILE_IN_CELL_PROMPT, TILE_TAGS, fill_player_note
@@ -343,6 +348,10 @@ def verbalize_tiles(
         if desc and desc not in entry["descriptions"]:
             entry["descriptions"].append(desc)
     for cell, label in (people or {}).items():
+        if not in_bounds(cell) and (
+            kinds is None or not approach_cells(kinds, cell, identified=identified, people=people)
+        ):
+            continue
         if isinstance(label, str) and label.startswith("sign:"):
             sign_note = label[len("sign:"):].strip()
             cell_entries = by_cell.setdefault(cell, {})
@@ -360,6 +369,29 @@ def verbalize_tiles(
         if ((cell[0], cell[1] + 1) not in people and "npc" in above
                 and above["npc"]["quarters"] <= {"bottom_left", "bottom_right"}):
             del above["npc"]  # the top of that person's sprite, drawn above its square
+    top_counter_cell = (0, max(Y_RANGE))
+    behind_top_counter_cell = (0, max(Y_RANGE) + 1)
+    if (
+        kinds is not None
+        and top_counter_cell not in by_cell
+        and behind_top_counter_cell not in by_cell
+        and kinds.get((0, max(Y_RANGE) - 1)) == WALKABLE
+        and is_counter_separator_cell(top_counter_cell, kinds, identified)
+    ):
+        counter_descs: List[str] = []
+        counter_qs: set = set()
+        for q in QUARTER_OFFSETS:
+            t = identified.get((top_counter_cell[0], top_counter_cell[1], q))
+            if t is not None and t.description and TABLETOP_SURFACE_DESC_PATTERN.search(t.description):
+                counter_qs.add(q)
+                if t.description not in counter_descs:
+                    counter_descs.append(t.description)
+        by_cell[top_counter_cell] = {
+            "interactable object": {
+                "quarters": counter_qs or set(QUARTER_OFFSETS),
+                "descriptions": counter_descs or ["reception counter"],
+            }
+        }
     lines = ["You are at (0, 0). x increases to the right, y increases upward. Each (x, y) is one grid cell; "
              "ground and obstacles are not listed."]
     if not by_cell:
@@ -437,6 +469,7 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
     is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     is_npc_head_overhang = is_npc_head_overhang_floor_cell(cell, quarter_tags)
+    is_patterned_floor = is_patterned_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
     groups: Dict[Tuple[str, Optional[str]], set] = {}
     for quarter in QUARTER_OFFSETS:
         tile = identified.get((cell[0], cell[1], quarter))
@@ -450,6 +483,8 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
                 continue
             if is_npc_head_overhang and quarter in ("bottom_left", "bottom_right") and tag == "npc":
                 continue
+            if is_patterned_floor and tag == "obstacle":
+                tag = "ground"
             desc = (
                 "Poke Ball on the ground"
                 if tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description))
@@ -517,7 +552,11 @@ class TileRecognizer(StrategistArtifact):
         misses = self._shade_misses.setdefault((min_shades, ordered), set())
         if tile_hash in misses:
             return None
-        candidates = [self.tiles[i] for i in shade_candidates(self._shade_bank, piece, min_shades, ordered)]
+        candidates = [
+            self.tiles[i]
+            for i in shade_candidates(self._shade_bank, piece, min_shades, ordered)
+            if self.tiles[i].tag != "unknown"
+        ]
         if not candidates or len({tile.tag for tile in candidates}) != 1:
             misses.add(tile_hash)
             return None
