@@ -106,20 +106,33 @@ def is_door(c: "MapCell") -> bool:
     return True
 
 
+_QUARTER_RANK_CACHE: Dict[bytes, bytes] = {}
+_QUARTER_RECOLOUR_CACHE: Dict[Tuple[bytes, bytes], bool] = {}
+_MAX_QUARTER_CACHE = 32768
+
+
 def _quarter_rank_signature(pixels: Optional[np.ndarray]) -> Optional[Tuple[bytes, ...]]:
     if pixels is None or pixels.size != GRID_SKIP * GRID_SKIP:
         return None
     p = np.squeeze(pixels)
     if int(p.min()) == int(p.max()):
         return None
+    if len(_QUARTER_RANK_CACHE) > _MAX_QUARTER_CACHE:
+        _QUARTER_RANK_CACHE.clear()
+    quarters = split_quarters(p)
     sigs = []
     for q in QUARTERS:
-        qp = split_quarters(p)[q].reshape(-1)
-        u, idx = np.unique(qp, return_inverse=True)
-        if len(u) == 1:
-            sigs.append(b"D" if int(u[0]) <= BLACK_LEVEL else b"L")
-        else:
-            sigs.append(bytes([len(u)]) + idx.astype(np.uint8).tobytes())
+        qp = quarters[q]
+        key = qp.tobytes()
+        sig = _QUARTER_RANK_CACHE.get(key)
+        if sig is None:
+            u, idx = np.unique(qp.reshape(-1), return_inverse=True)
+            if len(u) == 1:
+                sig = b"D" if int(u[0]) <= BLACK_LEVEL else b"L"
+            else:
+                sig = bytes([len(u)]) + idx.astype(np.uint8).tobytes()
+            _QUARTER_RANK_CACHE[key] = sig
+        sigs.append(sig)
     return tuple(sigs)
 
 
@@ -130,17 +143,31 @@ def _quarter_recolour_matches(
         return True
     if p1 is None or p2 is None:
         return False
+    b1 = np.asarray(p1).tobytes()
+    b2 = np.asarray(p2).tobytes()
+    if b1 == b2:
+        return True
+    key = (b1, b2)
+    cached = _QUARTER_RECOLOUR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_QUARTER_RECOLOUR_CACHE) > _MAX_QUARTER_CACHE:
+        _QUARTER_RECOLOUR_CACHE.clear()
     a, b = np.asarray(p1).reshape(-1), np.asarray(p2).reshape(-1)
     u1, idx1 = np.unique(a, return_inverse=True)
     u2, idx2 = np.unique(b, return_inverse=True)
     if len(u1) == 1 and len(u2) == 1:
-        return (int(u1[0]) <= BLACK_LEVEL) == (int(u2[0]) <= BLACK_LEVEL)
-    if len(u1) < 2 or len(u2) < 2:
-        return False
-    if len(u1) == len(u2) and np.array_equal(idx1, idx2):
-        return True
-    bank = shade_bank([p2])
-    return len(shade_candidates(bank, p1, min_shades=2, ordered=True)) > 0
+        res = (int(u1[0]) <= BLACK_LEVEL) == (int(u2[0]) <= BLACK_LEVEL)
+    elif len(u1) < 2 or len(u2) < 2:
+        res = False
+    elif len(u1) == len(u2) and np.array_equal(idx1, idx2):
+        res = True
+    else:
+        bank = shade_bank([p2])
+        res = len(shade_candidates(bank, p1, min_shades=2, ordered=True)) > 0
+    _QUARTER_RECOLOUR_CACHE[key] = res
+    _QUARTER_RECOLOUR_CACHE[(b2, b1)] = res
+    return res
 
 
 def _cells_match(
@@ -199,7 +226,7 @@ class GlobalMap(StrategistArtifact):
     """Segments of global grid, the player's place on them, and the bookkeeping to explain both."""
 
     # Set by MappingEnvironment to the tile recognizer's palette-independent hash; not saved.
-    _TRANSIENT = ("canonical_hash",)
+    _TRANSIENT = ("canonical_hash", "_seg_index_cache", "_overlap_cache")
     canonical_hash: Optional[Callable[[np.ndarray], Optional[str]]] = None
 
     def _cell_hashes(self, quarters: Dict[str, np.ndarray]) -> Tuple[Optional[str], ...]:
@@ -898,12 +925,28 @@ class GlobalMap(StrategistArtifact):
                 return candidate
         return self.pos
 
+    def _snap_warp_door_endpoint(self, segment: int, pos: Cell) -> Cell:
+        seg = self.segments[segment] if 0 <= segment < len(self.segments) else {}
+        if not seg:
+            return pos
+        c = seg.get(pos)
+        if c is not None and is_door(c):
+            return pos
+        d = self._door_at(segment, pos)
+        if d != pos and d in seg and is_door(seg[d]) and max(abs(d[0] - pos[0]), abs(d[1] - pos[1])) <= DOOR_REACH:
+            return d
+        return pos
+
     def _link(self, segment: int, pos: Cell, departure_pos: Optional[Cell] = None) -> None:
         if not self.faded or self.in_battle or not self.since_battle_moved or segment == self.segment:
             return
         dep = self.pos if departure_pos is None else departure_pos
+        move = self.fade_direction if self.fade_direction in DIRECTIONS else None
+        if not self._is_scripted_cutscene_warp(self.segment, dep, segment, pos, move):
+            dep = self._snap_warp_door_endpoint(self.segment, dep)
+            pos = self._snap_warp_door_endpoint(segment, pos)
         self.warps.append((self.step, self.segment, dep, segment, pos))
-        self.warp_moves.append(self.fade_direction if self.fade_direction in DIRECTIONS else None)
+        self.warp_moves.append(move)
         left = self.segment
         if (self.info(left).name is None and self._has_min_observations(left)
                 and all(entry["segment"] != left for entry in self.naming_queue)):
@@ -1133,7 +1176,10 @@ class GlobalMap(StrategistArtifact):
                 return targets
             cur_seg, cur_pos = self.resolve(self.segment, self.pos)
             dep_pos = self._warp_departure_pos(direction, max_steps, reported)
-            for _, a, pa, b, pb in self.warps:
+            for idx, (_, a, pa, b, pb) in enumerate(self.warps):
+                m = self.warp_moves[idx] if idx < len(self.warp_moves) else None
+                if self._is_scripted_cutscene_warp(a, pa, b, pb, m):
+                    continue
                 ra, rpa = self.resolve(a, pa)
                 rb, rpb = self.resolve(b, pb)
                 if ra == rb:
@@ -1148,12 +1194,18 @@ class GlobalMap(StrategistArtifact):
                     targets.add((ra, self._door_at(ra, rpa)))
             return targets
         cur_seg = self.segment
-        for _, a, pa, b, pb in self.warps:
+        for idx, (_, a, pa, b, pb) in enumerate(self.warps):
+            m = self.warp_moves[idx] if idx < len(self.warp_moves) else None
+            if self._is_scripted_cutscene_warp(a, pa, b, pb, m):
+                continue
             ra, rpa = self.resolve(a, pa)
             rb, rpb = self.resolve(b, pb)
             if rb != cur_seg or ra == cur_seg:
                 continue
-            for _, a2, pa2, b2, pb2 in self.warps:
+            for idx2, (_, a2, pa2, b2, pb2) in enumerate(self.warps):
+                m2 = self.warp_moves[idx2] if idx2 < len(self.warp_moves) else None
+                if self._is_scripted_cutscene_warp(a2, pa2, b2, pb2, m2):
+                    continue
                 ra2, rpa2 = self.resolve(a2, pa2)
                 rb2, rpb2 = self.resolve(b2, pb2)
                 if ra2 == rb2 or cur_seg in (ra2, rb2):
@@ -1261,6 +1313,9 @@ class GlobalMap(StrategistArtifact):
             rb, rpb = self.resolve(b, pb)
             if ra == rb:
                 continue
+            if not self._is_scripted_cutscene_warp(ra, rpa, rb, rpb, m):
+                rpa = self._snap_warp_door_endpoint(ra, rpa)
+                rpb = self._snap_warp_door_endpoint(rb, rpb)
             new_warps.append((t, ra, rpa, rb, rpb))
             new_moves.append(m)
         self.warps, self.warp_moves = new_warps, new_moves
@@ -1391,47 +1446,100 @@ class GlobalMap(StrategistArtifact):
         self._clean_warps()
         return changed
 
-    def overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
-        def is_uniform(c: MapCell) -> bool:
-            return c.pixels is not None and int(c.pixels.min()) == int(c.pixels.max())
+    def _segment_version(self, si: int) -> Tuple[int, int, int]:
+        seg = self.segments[si] if 0 <= si < len(self.segments) else {}
+        if not seg:
+            return (0, 0, 0)
+        return (
+            len(seg),
+            sum(c.last_seen for c in seg.values()),
+            sum(1 for c in seg.values() if c.kind == OCCUPIED),
+        )
 
-        def content(seg):
-            return {g: c for g, c in seg.items() if c.kind != OCCUPIED and not is_uniform(c)}
-
-        seg_src, seg_dst = self.segments[source], self.segments[target]
-        src, dst = content(seg_src), content(seg_dst)
+    def _segment_index(self, si: int) -> Tuple[
+        Dict[Cell, Tuple[Optional[str], ...]],
+        Dict[Cell, Tuple[bytes, ...]],
+        Dict[Cell, bool],
+        Dict[Tuple[Any, ...], List[Cell]],
+        Dict[Tuple[Any, ...], List[Cell]],
+        Tuple[int, int, int],
+    ]:
+        seg = self.segments[si] if 0 <= si < len(self.segments) else {}
+        ver = self._segment_version(si)
+        cache = getattr(self, "_seg_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._seg_index_cache = cache
+        entry = cache.get(si)
+        if entry is not None and entry[5] == ver:
+            return entry
+        content_hashes: Dict[Cell, Tuple[Optional[str], ...]] = {}
+        content_ranks: Dict[Cell, Tuple[bytes, ...]] = {}
+        uniform: Dict[Cell, bool] = {}
         index: Dict[Tuple[Any, ...], List[Cell]] = defaultdict(list)
-        for g, c in dst.items():
-            index[c.hashes].append(g)
-            rank_sig = _quarter_rank_signature(c.pixels)
-            if rank_sig is not None:
-                index[rank_sig].append(g)
-        block_index = self._block_index(dst)
-        src_hashes = {g: c.hashes for g, c in src.items()}
+        for g, c in seg.items():
+            if c.kind == OCCUPIED:
+                continue
+            is_u = c.pixels is not None and int(c.pixels.min()) == int(c.pixels.max())
+            uniform[g] = is_u
+            if not is_u:
+                content_hashes[g] = c.hashes
+                index[c.hashes].append(g)
+                rank_sig = _quarter_rank_signature(c.pixels)
+                if rank_sig is not None:
+                    content_ranks[g] = rank_sig
+                    index[rank_sig].append(g)
+        block_index: Dict[Tuple[Any, ...], List[Cell]] = defaultdict(list)
+        for (x, y), h in content_hashes.items():
+            h1 = content_hashes.get((x + 1, y))
+            h2 = content_hashes.get((x, y + 1))
+            h3 = content_hashes.get((x + 1, y + 1))
+            if h1 is not None and h2 is not None and h3 is not None:
+                block_index[(h, h1, h2, h3)].append((x, y))
+        entry = (content_hashes, content_ranks, uniform, index, block_index, ver)
+        cache[si] = entry
+        return entry
+
+    def overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
+        seg_src = self.segments[source] if 0 <= source < len(self.segments) else {}
+        seg_dst = self.segments[target] if 0 <= target < len(self.segments) else {}
+        if not seg_src or not seg_dst:
+            return None
+        src_hashes, src_rank, src_uniform, _, _, ver_src = self._segment_index(source)
+        _, _, dst_uniform, index, block_index, ver_dst = self._segment_index(target)
+        ov_cache = getattr(self, "_overlap_cache", None)
+        if ov_cache is None:
+            ov_cache = {}
+            self._overlap_cache = ov_cache
+        cache_key = (source, target, ver_src, ver_dst)
+        if cache_key in ov_cache:
+            return ov_cache[cache_key]
         votes = self._collect_offset_votes(src_hashes, index, block_index)
-        src_rank = {g: s for g, c in src.items() if (s := _quarter_rank_signature(c.pixels)) is not None}
         if src_rank:
             rank_votes = self._collect_offset_votes(src_rank, index, {})
             for off, cnt in rank_votes.items():
                 if cnt > votes[off]:
                     votes[off] = cnt
         if not votes:
+            ov_cache[cache_key] = None
             return None
 
         def agreement(offset: Cell) -> Tuple[int, int]:
             matches = total = 0
-            for g, c in seg_src.items():
-                if c.kind == OCCUPIED:
+            ox, oy = offset
+            for g, u_src in src_uniform.items():
+                g_dst = (g[0] + ox, g[1] + oy)
+                u_dst = dst_uniform.get(g_dst)
+                if u_dst is None:
                     continue
-                c_dst = seg_dst.get((g[0] + offset[0], g[1] + offset[1]))
-                if c_dst is None or c_dst.kind == OCCUPIED:
-                    continue
-                u_src, u_dst = is_uniform(c), is_uniform(c_dst)
                 if u_src and u_dst:
                     continue
                 total += 1
-                if not u_src and not u_dst and _cells_match(c.hashes, c.pixels, c_dst):
-                    matches += 1
+                if not u_src and not u_dst:
+                    c = seg_src[g]
+                    c_dst = seg_dst[g_dst]
+                    if _cells_match(c.hashes, c.pixels, c_dst):
+                        matches += 1
             return matches, total
 
         ranked = sorted(
@@ -1443,10 +1551,12 @@ class GlobalMap(StrategistArtifact):
         rivals = [(n, o) for o, n in votes.items() if max(abs(o[0] - dx), abs(o[1] - dy)) > 2]
         rival, rival_offset = max(rivals, default=(0, None))
         rival_matches, rival_shared = agreement(rival_offset) if rival_offset is not None else (0, 0)
-        return {"offset": (dx, dy), "matches": matches, "shared": shared,
-                "agreement": matches / shared if shared else 0.0,
-                "votes": best_votes, "rival": rival,
-                "rival_agreement": rival_matches / rival_shared if rival_shared else 0.0}
+        res = {"offset": (dx, dy), "matches": matches, "shared": shared,
+               "agreement": matches / shared if shared else 0.0,
+               "votes": best_votes, "rival": rival,
+               "rival_agreement": rival_matches / rival_shared if rival_shared else 0.0}
+        ov_cache[cache_key] = res
+        return res
 
     def _judged_same(self, source: int, target: int, overlap: Dict[str, Any],
                      judge: Optional[Callable[[int, int, Dict[str, Any]], Optional[bool]]]) -> bool:
@@ -1487,7 +1597,10 @@ class GlobalMap(StrategistArtifact):
         dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
         if not src_seg or not dst_seg or self.info(source).name is not None:
             return None
-        for _, a, pa, b, pb in self.warps:
+        for idx, (_, a, pa, b, pb) in enumerate(self.warps):
+            m = self.warp_moves[idx] if idx < len(self.warp_moves) else None
+            if self._is_scripted_cutscene_warp(a, pa, b, pb, m):
+                continue
             ra, rpa = self.resolve(a, pa)
             rb, rpb = self.resolve(b, pb)
             if rb == source and ra != source:
@@ -1498,7 +1611,10 @@ class GlobalMap(StrategistArtifact):
                 dep_seg, dep_door = rb, self._door_at(rb, rpb)
             else:
                 continue
-            for _, a2, pa2, b2, pb2 in self.warps:
+            for idx2, (_, a2, pa2, b2, pb2) in enumerate(self.warps):
+                m2 = self.warp_moves[idx2] if idx2 < len(self.warp_moves) else None
+                if self._is_scripted_cutscene_warp(a2, pa2, b2, pb2, m2):
+                    continue
                 ra2, rpa2 = self.resolve(a2, pa2)
                 rb2, rpb2 = self.resolve(b2, pb2)
                 if ra2 == dep_seg and rb2 == target and self._same_door(dep_seg, dep_door, rpa2):
@@ -1693,14 +1809,7 @@ class GlobalMap(StrategistArtifact):
         for si, seg in enumerate(self.segments):
             if si == exclude or not seg:
                 continue
-            index: Dict[Tuple[Any, ...], List[Cell]] = defaultdict(list)
-            for g, c in seg.items():
-                if c.kind != OCCUPIED:
-                    index[c.hashes].append(g)
-                    rank_sig = _quarter_rank_signature(c.pixels)
-                    if rank_sig is not None:
-                        index[rank_sig].append(g)
-            block_index = self._block_index(seg)
+            _, _, _, index, block_index, _ = self._segment_index(si)
             votes = self._collect_offset_votes(local, index, block_index)
             if local_ranks:
                 rank_votes = self._collect_offset_votes(local_ranks, index, {})
@@ -2064,9 +2173,16 @@ class GlobalMap(StrategistArtifact):
                 for c in d["cells"]
             ):
                 return True
-        after = self.warps + [(self.step, self.segment, self.pos, segment, pos)]
-        return (self.door_conflicts(after, self.warp_moves + [move], self._same_door)
-                > self.door_conflicts(self.warps, self.warp_moves, self._same_door))
+        base_warps: List[Tuple[int, int, Cell, int, Cell]] = []
+        base_moves: List[Optional[str]] = []
+        for (t, a, pa, b, pb), m in zip(self.warps, self.warp_moves):
+            if self._is_scripted_cutscene_warp(a, pa, b, pb, m):
+                continue
+            base_warps.append((t, a, pa, b, pb))
+            base_moves.append(m)
+        after = base_warps + [(self.step, self.segment, self.pos, segment, pos)]
+        return (self.door_conflicts(after, base_moves + [move], self._same_door)
+                > self.door_conflicts(base_warps, base_moves, self._same_door))
 
     def refresh(self, tile_lookup: Dict[str, Any]) -> int:
         self.prune_transient_segments()
