@@ -1067,14 +1067,73 @@ def filter_forward_edge_cells(cells: Iterable[Cell], direction: str) -> List[Cel
 LOOKAHEAD_STEPS = 4
 
 
+def _gmap_blocked_sets(global_map: Optional[Any]) -> Tuple[set, Dict[Cell, set]]:
+    if global_map is None or getattr(global_map, "segment", None) is None:
+        return set(), {}
+    try:
+        si = global_map.segment
+        b_cells = (
+            set(global_map.blocked_cells[si])
+            if si < len(getattr(global_map, "blocked_cells", ()))
+            else set()
+        )
+        b_moves = (
+            {k: set(v) for k, v in global_map.segment_blocked_moves(si).items()}
+            if hasattr(global_map, "segment_blocked_moves")
+            else {}
+        )
+        for src, dirs in b_moves.items():
+            for d_name in dirs:
+                if d_name in DIRECTIONS:
+                    ox, oy = DIRECTIONS[d_name]
+                    b_cells.add((src[0] + ox, src[1] + oy))
+        return b_cells, b_moves
+    except Exception:  # noqa: BLE001
+        return set(), {}
+
+
+def has_offscreen_continuation(
+    global_map: Optional[Any],
+    cell: Cell,
+    direction: str,
+) -> bool:
+    if (
+        global_map is None
+        or not getattr(global_map, "current", None)
+        or getattr(global_map, "pos", None) is None
+        or direction not in DIRECTIONS
+    ):
+        return True
+    try:
+        _, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+        seg = global_map.current
+    except Exception:  # noqa: BLE001
+        return True
+    if not seg or (px, py) not in seg:
+        return True
+    b_cells, b_moves = _gmap_blocked_sets(global_map)
+    return (
+        _offscreen_continuation_depth(
+            seg,
+            (px + cell[0], py + cell[1]),
+            direction,
+            1,
+            blocked_cells=b_cells,
+            blocked_moves=b_moves,
+        )
+        > 0
+    )
+
+
 def _offscreen_continuation_depth(
     seg: Dict[Cell, Any],
     start: Cell,
     direction: str,
     max_depth: int = LOOKAHEAD_STEPS,
+    blocked_cells: Optional[set] = None,
+    blocked_moves: Optional[Dict[Cell, set]] = None,
 ) -> int:
     dx, dy = DIRECTIONS[direction]
-    gx_min, gx_max = start[0] - max(X_RANGE) + min(X_RANGE), start[0]
     if direction == "up":
         bound = start[1]
         in_forward = lambda g: g[1] >= bound
@@ -1092,7 +1151,11 @@ def _offscreen_continuation_depth(
         in_forward = lambda g: g[0] >= bound
         depth_of = lambda g: g[0] - bound
 
+    if blocked_moves and direction in blocked_moves.get(start, ()):
+        return 0
     first = (start[0] + dx, start[1] + dy)
+    if blocked_cells and first in blocked_cells:
+        return 0
     fc = seg.get(first)
     if fc is None or getattr(fc, "kind", None) == "unknown":
         return max_depth
@@ -1100,6 +1163,8 @@ def _offscreen_continuation_depth(
         getattr(fc, "kind", None) == LEDGE_LEFT and direction == "left"
     ):
         first = (start[0] + 2 * dx, start[1] + 2 * dy)
+        if blocked_cells and first in blocked_cells:
+            return 0
         fc = seg.get(first)
         if fc is None or getattr(fc, "kind", None) == "unknown":
             return max_depth
@@ -1118,9 +1183,12 @@ def _offscreen_continuation_depth(
             best_depth = d_cur
         if best_depth >= max_depth or steps >= max_depth + 2:
             return max_depth
+        cur_blocked_dirs = blocked_moves.get(cur, ()) if blocked_moves else ()
         for d_name, (nx_d, ny_d) in DIRECTIONS.items():
+            if d_name in cur_blocked_dirs:
+                continue
             nxt = (cur[0] + nx_d, cur[1] + ny_d)
-            if not in_forward(nxt):
+            if not in_forward(nxt) or (blocked_cells and nxt in blocked_cells):
                 continue
             nc = seg.get(nxt)
             if nc is None or getattr(nc, "kind", None) == "unknown":
@@ -1132,7 +1200,7 @@ def _offscreen_continuation_depth(
                 landing = nxt
             elif (nkind == LEDGE and d_name == "down") or (nkind == LEDGE_LEFT and d_name == "left"):
                 landing = (nxt[0] + nx_d, nxt[1] + ny_d)
-                if not in_forward(landing):
+                if not in_forward(landing) or (blocked_cells and landing in blocked_cells):
                     continue
                 lc = seg.get(landing)
                 if lc is None or getattr(lc, "kind", None) == "unknown":
@@ -1203,12 +1271,18 @@ def _straight_offscreen_depth(
     start: Cell,
     direction: str,
     max_depth: int = LOOKAHEAD_STEPS,
+    blocked_cells: Optional[set] = None,
+    blocked_moves: Optional[Dict[Cell, set]] = None,
 ) -> int:
     dx, dy = DIRECTIONS[direction]
     cur = start
     depth = 0
     while depth < max_depth:
+        if blocked_moves and direction in blocked_moves.get(cur, ()):
+            break
         nxt = (cur[0] + dx, cur[1] + dy)
+        if blocked_cells and nxt in blocked_cells:
+            break
         nc = seg.get(nxt)
         if nc is None or getattr(nc, "kind", None) == "unknown":
             return max_depth
@@ -1220,6 +1294,8 @@ def _straight_offscreen_depth(
             depth += 1
         elif (nkind == LEDGE and direction == "down") or (nkind == LEDGE_LEFT and direction == "left"):
             landing = (nxt[0] + dx, nxt[1] + dy)
+            if blocked_cells and landing in blocked_cells:
+                break
             lc = seg.get(landing)
             if lc is None or getattr(lc, "kind", None) == "unknown":
                 return max_depth
@@ -1436,17 +1512,26 @@ def filter_open_lane_edge_cells(
         if open_run_cells:
             cells_list = open_run_cells
 
+    b_cells, b_moves = _gmap_blocked_sets(global_map) if seg is not None else (set(), {})
     non_warp = [
         c for c in cells_list
         if not _is_warp_edge_cell(c, seg=seg, px=px, py=py, identified=identified)
-        and (seg is None or _offscreen_continuation_depth(seg, (px + c[0], py + c[1]), direction, 1) > 0)
+        and (
+            seg is None
+            or _offscreen_continuation_depth(
+                seg, (px + c[0], py + c[1]), direction, 1, blocked_cells=b_cells, blocked_moves=b_moves
+            )
+            > 0
+        )
     ]
     if non_warp:
         cells_list = non_warp
 
     if seg is not None:
         depths = {
-            c: _offscreen_continuation_depth(seg, (px + c[0], py + c[1]), direction, LOOKAHEAD_STEPS)
+            c: _offscreen_continuation_depth(
+                seg, (px + c[0], py + c[1]), direction, LOOKAHEAD_STEPS, blocked_cells=b_cells, blocked_moves=b_moves
+            )
             for c in cells_list
         }
         deep_clear = [c for c in cells_list if depths[c] >= LOOKAHEAD_STEPS]
@@ -1457,7 +1542,9 @@ def filter_open_lane_edge_cells(
             if max_d > 0:
                 cells_list = [c for c in cells_list if depths[c] == max_d]
         straight_depths = {
-            c: _straight_offscreen_depth(seg, (px + c[0], py + c[1]), direction, LOOKAHEAD_STEPS)
+            c: _straight_offscreen_depth(
+                seg, (px + c[0], py + c[1]), direction, LOOKAHEAD_STEPS, blocked_cells=b_cells, blocked_moves=b_moves
+            )
             for c in cells_list
         }
         straight_deep = [c for c in cells_list if straight_depths[c] >= LOOKAHEAD_STEPS]

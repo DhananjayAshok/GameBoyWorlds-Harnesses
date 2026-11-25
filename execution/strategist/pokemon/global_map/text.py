@@ -202,6 +202,56 @@ def _reconstruct_moves(
     return moves[::-1]
 
 
+def project_route_next_leg(
+    gmap: GlobalMap,
+    moves: Optional[List[Tuple[str, str]]],
+    local_kinds: Optional[Dict[Cell, str]] = None,
+    goal_rel: Optional[Cell] = None,
+) -> Optional[str]:
+    if not moves:
+        return None
+    from execution.perception.pokemon.navigation import (
+        DIRECTIONS,
+         edge_cells,
+        filter_forward_edge_cells,
+        filter_open_lane_edge_cells,
+        in_bounds,
+        shortest_path,
+    )
+
+    cur: Cell = (0, 0)
+    for d, m in moves:
+        if d not in DIRECTIONS:
+            break
+        dx, dy = DIRECTIONS[d]
+        step = 2 if m == "jump" else 1
+        nxt = (cur[0] + dx * step, cur[1] + dy * step)
+        if not in_bounds(nxt):
+            exit_cell = cur
+            if local_kinds is not None:
+                d_edge = edge_cells(local_kinds, d)
+                if d_edge and (
+                    exit_cell not in d_edge
+                    or shortest_path(local_kinds, (0, 0), [exit_cell]) is None
+                ):
+                    open_c = filter_open_lane_edge_cells(
+                        filter_forward_edge_cells(d_edge, d), d, local_kinds, gmap
+                    ) or d_edge
+                    reachable_c = [
+                        c for c in open_c if shortest_path(local_kinds, (0, 0), [c]) is not None
+                    ] or open_c
+                    axis = 0 if d in ("up", "down") else 1
+                    exit_cell = min(reachable_c, key=lambda c: (abs(c[axis] - cur[axis]), abs(c[axis])))
+            return f"MoveOff({d} via ({exit_cell[0]}, {exit_cell[1]}))"
+        if local_kinds is not None and local_kinds.get(nxt) == BLOCKED:
+            break
+        cur = nxt
+    target = goal_rel if (goal_rel is not None and in_bounds(goal_rel)) else cur
+    if target != (0, 0) and in_bounds(target):
+        return f"MoveTo(({target[0]}, {target[1]}))"
+    return None
+
+
 def frontier_targets(
     gmap: GlobalMap,
     local_kinds: Optional[Dict[Cell, str]] = None,
@@ -232,6 +282,7 @@ def frontier_targets(
             "on_screen": on_screen,
             "path_steps": len(moves) if moves is not None else None,
             "path_moves": compress_moves(moves) if moves else None,
+            "next_leg": project_route_next_leg(gmap, moves, local_kinds=local_kinds, goal_rel=(dx, dy)) if moves else None,
         }
         mass[t["sector"]] += 1
         cur = nearest.get(t["sector"])
@@ -510,24 +561,37 @@ def door_lines(
             goals = [(dx, dy)] if local_kinds.get((dx, dy)) == WALKABLE else list(approach_cells(local_kinds, (dx, dy)))
             if not goals or shortest_path(local_kinds, (0, 0), goals) is None:
                 on_screen_blocked = True
+        next_leg = (
+            project_route_next_leg(
+                gmap,
+                found[1],
+                local_kinds=local_kinds,
+                goal_rel=None if on_screen_blocked else (dx, dy),
+            )
+            if (found is not None and found[1])
+            else None
+        )
+        if on_screen_blocked and next_leg and next_leg.startswith("MoveTo("):
+            next_leg = None
         detour_info = (
             _obstacle_detour_info(gmap, goal_cell, local_kinds, reached=reached, blocked_moves=blocked_moves)
             if (path_moves is None or on_screen_blocked)
             else None
         )
         cues = _unentered_door_cues(gmap, door["cells"]) if leads_to is None else ""
-        doors.append((abs(dx) + abs(dy), dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_info, cues))
+        doors.append((abs(dx) + abs(dy), dx, dy, leads_to, path_steps, path_moves, next_leg, on_screen_blocked, detour_info, cues))
     if not doors:
         return []
     lines = ["Doors and stairs in this area (x = steps to the right, y = steps up, measured from you):"]
-    for steps, dx, dy, leads_to, path_steps, path_moves, on_screen_blocked, detour_info, cues in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
+    for steps, dx, dy, leads_to, path_steps, path_moves, next_leg, on_screen_blocked, detour_info, cues in sorted(doors, key=lambda d: d[:3])[:MAX_DOOR_LINES]:
         behind = (_leads_to_description(gmap, leads_to)
                   if leads_to is not None else f"NOT entered yet{cues}")
+        leg_note = f" [next on-screen leg: {next_leg}]" if next_leg else ""
         if path_moves:
             if on_screen_blocked:
-                route_suffix = f" (separated by obstacle barrier on current screen — must route off screen first; mapped route, {path_steps} moves: {path_moves})"
+                route_suffix = f" (separated by obstacle barrier on current screen — must route off screen first; mapped route, {path_steps} moves: {path_moves}{leg_note})"
             else:
-                route_suffix = f" (mapped route, {path_steps} moves: {path_moves})"
+                route_suffix = f" (mapped route, {path_steps} moves: {path_moves}{leg_note})"
         elif detour_info is not None:
             prefix = "separated by obstacle barrier on current screen — " if on_screen_blocked else ""
             parts = [f"{prefix}no direct mapped path yet"]

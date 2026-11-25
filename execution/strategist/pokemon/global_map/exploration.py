@@ -62,7 +62,8 @@ def explore_text(
         targets, mass = frontier_targets(gmap, local_kinds, blocked_moves=blocked_moves)
         if targets:
             for t in targets:
-                route_note = f" (mapped route, {t['path_steps']} moves: {t['path_moves']})" if t.get("path_moves") else ""
+                leg_note = f" [next on-screen leg: {t['next_leg']}]" if t.get("next_leg") else ""
+                route_note = f" (mapped route, {t['path_steps']} moves: {t['path_moves']}{leg_note})" if t.get("path_moves") else ""
                 lines.append(f"  - nearest unexplored edge {t['sector']} at ({t['dx']}, {t['dy']}), {t['steps']} steps{route_note}")
             lines.append("  - most unexplored edge lies: " + ", ".join(f"{s} ({n} squares)" for s, n in mass.most_common(3)) + ".")
     if unentered:
@@ -134,8 +135,9 @@ def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
                      "(x = steps to the right, y = steps up, measured from you):")
         for t in targets:
             where = "on screen, reachable" if t["on_screen"] else "off screen"
+            leg_note = f" [next on-screen leg: {t['next_leg']}]" if t.get("next_leg") else ""
             if t.get("path_moves"):
-                route_note = f"{where}; mapped route ({t['path_steps']} moves): {t['path_moves']}"
+                route_note = f"{where}; mapped route ({t['path_steps']} moves): {t['path_moves']}{leg_note}"
             elif t.get("path_steps") is None:
                 route_note = f"{where}; no direct mapped path yet"
             else:

@@ -603,8 +603,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
             )
             for t in targets[:6]:
                 where = "on screen, reachable" if t["on_screen"] else "off screen"
+                leg_note = f" [next on-screen leg: {t['next_leg']}]" if t.get("next_leg") else ""
                 if t.get("path_moves"):
-                    route_note = f"{where}; mapped route ({t['path_steps']} moves): {t['path_moves']}"
+                    route_note = f"{where}; mapped route ({t['path_steps']} moves): {t['path_moves']}{leg_note}"
                 elif t.get("path_steps") is None:
                     route_note = f"{where}; no direct mapped path yet"
                 else:
@@ -731,7 +732,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         dist = nearest.get("path_steps") if nearest.get("path_steps") is not None else nearest.get("steps")
         if dist is None or dist > 15:
             return None
-        route_str = f"; mapped route ({nearest['path_steps']} moves): {nearest['path_moves']}" if nearest.get("path_moves") else ""
+        leg_str = f" [next on-screen leg: {nearest['next_leg']}]" if nearest.get("next_leg") else ""
+        route_str = f"; mapped route ({nearest['path_steps']} moves): {nearest['path_moves']}{leg_str}" if nearest.get("path_moves") else ""
         return (
             f"{len(frontier_cells)} reachable unexplored edge square(s) still remain in this room "
             f"(nearest at ({nearest['dx']}, {nearest['dy']}), {nearest['steps']} steps {nearest['sector']}{route_str}) "
@@ -1253,9 +1255,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
             dist = nearest.get("path_steps") if nearest.get("path_steps") is not None else nearest.get("steps")
             if dist is not None and dist <= 6 and nearest.get("on_screen"):
                 return None
+            leg_str = f" [next on-screen leg: {nearest['next_leg']}]" if nearest.get("next_leg") else ""
             route_info = (
                 f"nearest unexplored edge is at ({nearest['dx']}, {nearest['dy']}), {nearest['steps']} steps {nearest['sector']}"
-                + (f" (mapped route, {nearest['path_steps']} moves: {nearest['path_moves']})" if nearest.get("path_moves") else "")
+                + (f" (mapped route, {nearest['path_steps']} moves: {nearest['path_moves']}{leg_str})" if nearest.get("path_moves") else "")
             )
         else:
             route_info = f"{len(unentered_doors)} unentered door(s)/stairs remain in this area"

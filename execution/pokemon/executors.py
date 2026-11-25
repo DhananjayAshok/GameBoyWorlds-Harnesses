@@ -1360,7 +1360,12 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 _, (px, py) = gmap.resolve(gmap.segment, gmap.pos)
             except Exception:  # noqa: BLE001
                 seg = None
-        from execution.perception.pokemon.navigation import LOOKAHEAD_STEPS, _offscreen_continuation_depth
+        from execution.perception.pokemon.navigation import (
+            LOOKAHEAD_STEPS,
+            _gmap_blocked_sets,
+            _offscreen_continuation_depth,
+        )
+        b_cells, b_moves = _gmap_blocked_sets(gmap) if seg is not None else (set(), {})
         for d in candidate_dirs:
             d_cells = edge_cells(self.cell_kinds, d)
             matching = [c for c in coords if c in d_cells]
@@ -1374,7 +1379,9 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             depth = 0
             if seg is not None:
                 depth = max(
-                    _offscreen_continuation_depth(seg, (px + c[0], py + c[1]), d, LOOKAHEAD_STEPS)
+                    _offscreen_continuation_depth(
+                        seg, (px + c[0], py + c[1]), d, LOOKAHEAD_STEPS, blocked_cells=b_cells, blocked_moves=b_moves
+                    )
                     for c in matching
                 )
             else:
@@ -1423,6 +1430,8 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         unroofed_open_exists = any(not _is_ledge_trap_cell(oc) for oc in open_cells)
         task_allows_ledge = bool(re.search(r"\b(?:ledge|jump)\b", self._task, re.IGNORECASE))
 
+        from execution.perception.pokemon.navigation import has_offscreen_continuation
+
         on_edge_coords = [c for c in coords if c in cells]
         if on_edge_coords:
             preferred = [c for c in on_edge_coords if c in open_cells]
@@ -1438,12 +1447,17 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                     nearest = min(same_run_open, key=lambda c: (abs(c[axis] - ref[axis]), abs(c[axis])))
                     preferred = [nearest]
             if not preferred:
-                candidate_explicit = [c for c in on_edge_coords if c in forward_cells] or on_edge_coords
-                if unroofed_open_exists and not task_allows_ledge:
-                    safe_explicit = [c for c in candidate_explicit if not _is_ledge_trap_cell(c)]
+                candidate_explicit = [
+                    c for c in ([c for c in on_edge_coords if c in forward_cells] or on_edge_coords)
+                    if has_offscreen_continuation(gmap, c, direction)
+                ]
+                if not candidate_explicit and open_cells:
+                    preferred = open_cells
+                elif unroofed_open_exists and not task_allows_ledge:
+                    safe_explicit = [c for c in (candidate_explicit or on_edge_coords) if not _is_ledge_trap_cell(c)]
                     preferred = safe_explicit or open_cells
                 else:
-                    preferred = candidate_explicit
+                    preferred = candidate_explicit or open_cells or on_edge_coords
             path = shortest_path(self.cell_kinds, (0, 0), preferred, avoid_cells=path_avoid, people=people)
             if path is None and open_cells:
                 path = shortest_path(self.cell_kinds, (0, 0), open_cells, avoid_cells=path_avoid, people=people)
@@ -1578,12 +1592,20 @@ Location: <(x, y) or Not Found>
                 non_avoided_open = [c for c in open_cells if c not in avoided_set]
                 if non_avoided_open:
                     open_cells = non_avoided_open
+            from execution.perception.pokemon.navigation import has_offscreen_continuation
+
             if target not in open_cells and open_cells:
                 axis = 0 if direction in ("up", "down") else 1
                 adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= 2]
                 if adjacent_open:
                     target = min(adjacent_open, key=lambda c: (abs(c[axis] - target[axis]), abs(c[axis])))
-                elif not re.search(r"\b(?:ledge|jump)\b", self._task, re.IGNORECASE):
+                elif not has_offscreen_continuation(gmap, target, direction):
+                    safe_open_path = shortest_path(self.cell_kinds, (0, 0), open_cells, people=people)
+                    if safe_open_path:
+                        target = safe_open_path[-1][2]
+                    else:
+                        target = min(open_cells, key=lambda c: (abs(c[axis] - target[axis]), abs(c[axis])))
+                elif not re.search(r"(?:ledge|jump)", self._task, re.IGNORECASE):
                     target_path = shortest_path(self.cell_kinds, (0, 0), [target], people=people)
                     target_is_trap = is_ledge_roofed_edge_cell(target, direction, self.cell_kinds) or bool(
                         target_path and any(m == "jump" for _, m, _ in target_path)
@@ -1592,7 +1614,6 @@ Location: <(x, y) or Not Found>
                         safe_open_path = shortest_path(self.cell_kinds, (0, 0), open_cells, people=people)
                         if safe_open_path:
                             target = safe_open_path[-1][2]
-
         initial_cells = edge_cells(self.cell_kinds, direction)
         initial_forward = filter_forward_edge_cells(initial_cells, direction)
         initial_open = filter_open_lane_edge_cells(
