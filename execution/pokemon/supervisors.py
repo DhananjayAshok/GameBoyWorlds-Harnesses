@@ -531,9 +531,18 @@ class PokemonPlayThroughSupervisor(Supervisor):
                            getattr(self._env, "walk_patterns", None), people,
                            getattr(self._env, "left_ledge_patterns", None),
                            getattr(self._env, "blocked_cells", None))
+        banner_note = (
+            "\nNote: The thin 2-tile-tall bordered box at the bottom of the screen is a non-blocking area/location "
+            "name popup banner (NOT a dialogue box). The player is already in free roam and can walk normally right "
+            "now (the banner disappears automatically as you walk)—do NOT plan a dialogue-clearing subgoal or call "
+            "Dialogue() or Free() to dismiss it; proceed directly with MoveTo, MoveOff, or Interact."
+            if has_bottom_location_banner(frame) and not has_bottom_dialogue_box(frame)
+            else ""
+        )
         self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                               + "\nWalkable cells on each edge of the screen:\n"
-                              + self._describe_edges(kinds, identified=self._identified, people=people))
+                              + self._describe_edges(kinds, identified=self._identified, people=people)
+                              + banner_note)
         return self._screen_tiles
 
     def _people_now(self) -> Optional[Dict[Tuple[int, int], str]]:
@@ -829,9 +838,16 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                      getattr(self._env, "walk_patterns", None), after_people,
                                      getattr(self._env, "left_ledge_patterns", None),
                                      getattr(self._env, "blocked_cells", None))
+            after_banner_note = (
+                "\nNote: The thin 2-tile-tall bordered box at the bottom of the screen is a non-blocking area/location "
+                "name popup banner (NOT a dialogue box); the player is in free roam."
+                if has_bottom_location_banner(after) and not has_bottom_dialogue_box(after)
+                else ""
+            )
             after_tiles = (verbalize_tiles(after_identified, after_people, after_kinds)
                            + "\nWalkable cells on each edge of the screen:\n"
-                           + self._describe_edges(after_kinds, identified=after_identified, people=after_people))
+                           + self._describe_edges(after_kinds, identified=after_identified, people=after_people)
+                           + after_banner_note)
             if move_tag:
                 after_tiles += f"\n{move_tag}"
             after_block = PLAYTHROUGH_AFTER_BLOCK.replace("[AFTER_TILES]", after_tiles)
