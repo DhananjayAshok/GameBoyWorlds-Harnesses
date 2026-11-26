@@ -791,7 +791,7 @@ def compress_path(path: List[Tuple[str, str, Cell]]) -> List[Tuple[str, int, str
 
 
 COUNTER_SEPARATOR_DESC_PATTERN = re.compile(
-    r"\b(?:counter|desk|table|window|booth)\b",
+    r"\b(?:counter|desk|table|window|booth|chair|stool|bench|seat|cushion)\b",
     re.IGNORECASE,
 )
 
@@ -1279,11 +1279,14 @@ def _is_warp_edge_cell(
     px: int = 0,
     py: int = 0,
     identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    global_map: Optional[Any] = None,
 ) -> bool:
     if seg is not None:
         sc = seg.get((px + cell[0], py + cell[1]))
         if sc is not None and any(t in WARP_TAGS for t in getattr(sc, "tags", ())):
             return True
+    if global_map is not None and _is_known_map_exit_cell(global_map, cell)[0]:
+        return True
     if identified is not None:
         from execution.perception.pokemon.tiles import filter_cell_warp_quarter_tags, normalize_tabletop_tag
 
@@ -1319,7 +1322,7 @@ def warp_cells(
     for x in X_RANGE:
         for y in Y_RANGE:
             c = (x, y)
-            if _is_warp_edge_cell(c, seg=seg, px=px, py=py, identified=identified):
+            if _is_warp_edge_cell(c, seg=seg, px=px, py=py, identified=identified, global_map=global_map):
                 warps.add(c)
     return warps
 
@@ -1680,27 +1683,77 @@ def is_boundary_exit_direction(kinds: Dict[Cell, str], cell: Cell, direction: st
     return True
 
 
-def boundary_exit_direction(kinds: Dict[Cell, str], identified: Optional[Dict[Tuple[int, int, str], object]],
-                            cell: Cell, preferred: Optional[str] = None) -> Optional[str]:
+def _is_known_map_exit_cell(global_map: Optional[Any], cell: Cell) -> Tuple[bool, Optional[str]]:
+    if global_map is None or not getattr(global_map, "current", None) or getattr(global_map, "pos", None) is None:
+        return False, None
+    try:
+        si, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+        info = global_map.info(si)
+        if getattr(info, "kind", None) == "outdoors":
+            return False, None
+        seg = global_map.segments[si]
+        abs_cell = (px + cell[0], py + cell[1])
+        labels = {p: b for (s, p), b in global_map.door_labels().items() if s == si and b != si}
+        if not labels:
+            return False, None
+        matched_warp = abs_cell in labels
+        if not matched_warp:
+            mc = seg.get(abs_cell)
+            mc_hashes = getattr(mc, "hashes", None)
+            if mc_hashes and None not in mc_hashes:
+                for p in labels:
+                    if abs(p[0] - abs_cell[0]) + abs(p[1] - abs_cell[1]) == 1:
+                        pc = seg.get(p)
+                        if pc is not None and getattr(pc, "hashes", None) == mc_hashes:
+                            matched_warp = True
+                            break
+        if not matched_warp:
+            return False, None
+        pref_dir = None
+        from execution.strategist.pokemon.global_map.routes import OPPOSITE
+        for (_, a, pa, b, pb), w_dir in zip(getattr(global_map, "warps", ()), getattr(global_map, "warp_moves", ())):
+            ra, rpa = global_map.resolve(a, pa)
+            rb, rpb = global_map.resolve(b, pb)
+            if ra == si and rb != si and abs(rpa[0] - abs_cell[0]) + abs(rpa[1] - abs_cell[1]) <= 1 and w_dir in DIRECTIONS:
+                pref_dir = w_dir
+                break
+            if rb == si and ra != si and abs(rpb[0] - abs_cell[0]) + abs(rpb[1] - abs_cell[1]) <= 1 and w_dir in OPPOSITE:
+                pref_dir = OPPOSITE[w_dir]
+                break
+        return True, pref_dir
+    except Exception:  # noqa: BLE001
+        return False, None
+
+
+def boundary_exit_direction(
+    kinds: Dict[Cell, str],
+    identified: Optional[Dict[Tuple[int, int, str], object]],
+    cell: Cell,
+    preferred: Optional[str] = None,
+    global_map: Optional[Any] = None,
+) -> Optional[str]:
     from execution.perception.pokemon.tiles import filter_cell_warp_quarter_tags, normalize_tabletop_tag
 
-    if identified is None:
+    has_entrance_tag = False
+    if identified is not None:
+        cell_q = {
+            q: normalize_tabletop_tag(
+                identified[(cell[0], cell[1], q)].tag,
+                getattr(identified[(cell[0], cell[1], q)], "description", None),
+                getattr(identified[(cell[0], cell[1], q)], "image", None),
+            )
+            for q in QUARTERS
+            if (cell[0], cell[1], q) in identified and hasattr(identified[(cell[0], cell[1], q)], "tag")
+        }
+        tags = set(filter_cell_warp_quarter_tags(cell_q).values())
+        has_entrance_tag = "entrance" in tags
+    is_map_exit, map_pref_dir = _is_known_map_exit_cell(global_map, cell)
+    if not has_entrance_tag and not is_map_exit:
         return None
-    cell_q = {
-        q: normalize_tabletop_tag(
-            identified[(cell[0], cell[1], q)].tag,
-            getattr(identified[(cell[0], cell[1], q)], "description", None),
-            getattr(identified[(cell[0], cell[1], q)], "image", None),
-        )
-        for q in QUARTERS
-        if (cell[0], cell[1], q) in identified and hasattr(identified[(cell[0], cell[1], q)], "tag")
-    }
-    tags = set(filter_cell_warp_quarter_tags(cell_q).values())
-    if "entrance" not in tags:
-        return None
+    eff_preferred = preferred if preferred in DIRECTIONS else map_pref_dir
     order = ("down", "up", "left", "right")
-    if preferred in DIRECTIONS:
-        order = (preferred,) + tuple(d for d in order if d != preferred)
+    if eff_preferred in DIRECTIONS:
+        order = (eff_preferred,) + tuple(d for d in order if d != eff_preferred)
     for direction in order:
         if is_boundary_exit_direction(kinds, cell, direction):
             return direction

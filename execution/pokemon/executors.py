@@ -540,6 +540,57 @@ class InteractionExecutor(PolicyExecutor):
             self._wait_for_interaction(records)
         return facing
 
+    def _refresh_live_perception(self) -> Tuple[dict, Optional[Dict[Tuple[int, int], str]], Optional[Dict[Tuple[int, int], str]]]:
+        info = self._get_state()
+        frame = info["core"]["current_frame"]
+        people = None
+        if callable(self.people_fn):
+            try:
+                people = self.people_fn()
+            except Exception:  # noqa: BLE001
+                people = None
+        tiles = getattr(self._env, "_tiles", None)
+        gmap = getattr(self._env, "_map", None)
+        if tiles is not None and hasattr(tiles, "identify_tiles"):
+            if hasattr(tiles, "record_tiles") and getattr(tiles, "vlm_call", None) is not None:
+                ep = getattr(self._env, "_episode", 0)
+                try:
+                    tiles.record_tiles(frame, ep)
+                    if gmap is not None and hasattr(gmap, "refresh"):
+                        gmap.refresh(tiles._by_hash)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self.identified = tiles.identify_tiles(frame, global_map=gmap)
+            except Exception:  # noqa: BLE001
+                pass
+        if self.identified is not None:
+            self.cell_kinds = cell_kinds(
+                self.identified,
+                getattr(self._env, "ledge_patterns", None),
+                getattr(self._env, "walk_patterns", None),
+                people,
+                getattr(self._env, "left_ledge_patterns", None),
+                getattr(self._env, "blocked_cells", None),
+            )
+        return info, self.cell_kinds, people
+
+    def _resolve_post_walk_direction(
+        self,
+        shifted_target: Optional[Tuple[int, int]],
+        kinds: Optional[Dict[Tuple[int, int], str]],
+        people: Optional[Dict[Tuple[int, int], str]],
+    ) -> Optional[str]:
+        if shifted_target is None or shifted_target == (0, 0):
+            return None
+        if shifted_target in self.CARDINAL_DIRECTIONS:
+            return self.CARDINAL_DIRECTIONS[shifted_target]
+        if kinds is not None:
+            goals = approach_cells(kinds, shifted_target, identified=self.identified, people=people)
+            if (0, 0) in goals:
+                return goals[(0, 0)]
+        return None
+
     def _execute(self) -> int:
         self._last_terminated = False
         self._last_truncated = False
@@ -582,6 +633,7 @@ class InteractionExecutor(PolicyExecutor):
             target_cell is not None
             and target_cell not in CheckInteractionAction.cardinals.values()
         ):
+            before_place = self._current_map_place()
             direction = self._align_to_target(target_cell, records)
             if self._last_terminated or self._last_truncated:
                 return self._finish(records)
@@ -593,12 +645,34 @@ class InteractionExecutor(PolicyExecutor):
                 if self._agent_state() == AgentState.IN_DIALOGUE:
                     self._clear_interaction_dialogue(records)
                 return self._finish(records)
+            if records:
+                after_place = self._current_map_place()
+                if (
+                    before_place is not None
+                    and after_place is not None
+                    and before_place[0] == after_place[0]
+                ):
+                    dx = after_place[1][0] - before_place[1][0]
+                    dy = after_place[1][1] - before_place[1][1]
+                    target_cell = (target_cell[0] - dx, target_cell[1] - dy)
+                info, kinds, people = self._refresh_live_perception()
+                if direction is None:
+                    direction = self._resolve_post_walk_direction(target_cell, kinds, people)
 
         if direction is None:
+            if records:
+                info, kinds, people = self._refresh_live_perception()
+            check_target = self._task
+            if records and target_cell is not None:
+                check_target = re.sub(
+                    r"\(\s*-?\d+\s*,\s*-?\d+\s*\)",
+                    f"({target_cell[0]}, {target_cell[1]})",
+                    self._task,
+                )
             check = CheckInteractionAction(self._vlm_call, self._parameters)
             result, code = check.execute(
                 info,
-                target=self._task,
+                target=check_target,
                 identified=self.identified,
                 cell_kinds=self.cell_kinds,
             )
@@ -612,6 +686,8 @@ class InteractionExecutor(PolicyExecutor):
             if code == 1:
                 cell = result.get("cell")
                 if cell is not None:
+                    before_place = self._current_map_place()
+                    rec_before = len(records)
                     direction = self._align_to_target(cell, records)
                     if self._last_terminated or self._last_truncated:
                         return self._finish(records)
@@ -623,37 +699,79 @@ class InteractionExecutor(PolicyExecutor):
                         if self._agent_state() == AgentState.IN_DIALOGUE:
                             self._clear_interaction_dialogue(records)
                         return self._finish(records)
+                    if len(records) > rec_before:
+                        after_place = self._current_map_place()
+                        if (
+                            before_place is not None
+                            and after_place is not None
+                            and before_place[0] == after_place[0]
+                        ):
+                            dx = after_place[1][0] - before_place[1][0]
+                            dy = after_place[1][1] - before_place[1][1]
+                            target_cell = (cell[0] - dx, cell[1] - dy)
+                        info, kinds, people = self._refresh_live_perception()
+                        if direction is None:
+                            direction = self._resolve_post_walk_direction(target_cell, kinds, people)
                 if direction is None:
                     return self._fail("target_only_diagonal",
                                       f"Target found at {result['found_cells_str']}, which cannot be faced")
             else:
                 direction = result["direction"]
+                if records and result.get("cell") is not None:
+                    target_cell = result.get("cell")
 
         aligned_walked = bool(records)
+        if aligned_walked:
+            info, kinds, people = self._refresh_live_perception()
         self._begin_scripted(f"face {direction} and interact with {self._task}")
         if getattr(self._env, "facing", None) != direction:
-            turn = self._take_action(MoveStepsAction, direction=direction, steps=1)
-            records.append(turn)
-            if self._last_terminated or self._last_truncated:
-                return self._finish(records)
-            if self._agent_state() != AgentState.FREE_ROAM:
-                if self._agent_state() == AgentState.IN_DIALOGUE:
-                    self._clear_interaction_dialogue(records)
-                return self._finish(records)
-            action_return = turn.transition_states[-1]["core"].get("action_return") or {}
-            steps_taken = action_return.get("n_steps_taken", 0)
-            if steps_taken and not (
-                not aligned_walked
-                and steps_taken == 1
-                and target_cell in CheckInteractionAction.counter_cardinals.values()
+            adj_cell = DIRECTIONS.get(direction)
+            if (
+                aligned_walked
+                and adj_cell is not None
+                and kinds is not None
+                and kinds.get(adj_cell) == WALKABLE
+                and target_cell != adj_cell
+                and target_cell not in CheckInteractionAction.counter_cardinals.values()
             ):
-                found_cells_str = (
-                    (self.check_result or {}).get("found_cells_str")
-                    or coords_to_string([target_cell] if target_cell is not None else [])
-                )
-                return self._fail("target_cell_walkable",
-                                  f"Pressed {direction} to face the target at {found_cells_str}, "
-                                  "but the player walked onto that cell instead, so nothing is there")
+                pre_taken = self._pre_turn_align(direction, records)
+                if self._last_terminated or self._last_truncated:
+                    return self._finish(records)
+                if self._agent_state() != AgentState.FREE_ROAM:
+                    if self._agent_state() == AgentState.IN_DIALOGUE:
+                        self._clear_interaction_dialogue(records)
+                    return self._finish(records)
+                if pre_taken:
+                    found_cells_str = (
+                        (self.check_result or {}).get("found_cells_str")
+                        or coords_to_string([target_cell] if target_cell is not None else [])
+                    )
+                    return self._fail("target_cell_walkable",
+                                      f"Pressed {direction} to face the target at {found_cells_str}, "
+                                      "but the player walked onto that cell instead, so nothing is there")
+            else:
+                turn = self._take_action(MoveStepsAction, direction=direction, steps=1)
+                records.append(turn)
+                if self._last_terminated or self._last_truncated:
+                    return self._finish(records)
+                if self._agent_state() != AgentState.FREE_ROAM:
+                    if self._agent_state() == AgentState.IN_DIALOGUE:
+                        self._clear_interaction_dialogue(records)
+                    return self._finish(records)
+                action_return = turn.transition_states[-1]["core"].get("action_return") or {}
+                steps_taken = action_return.get("n_steps_taken", 0)
+                if steps_taken and not (
+                    not aligned_walked
+                    and steps_taken == 1
+                    and target_cell in CheckInteractionAction.counter_cardinals.values()
+                ):
+                    found_cells_str = (
+                        (self.check_result or {}).get("found_cells_str")
+                        or coords_to_string([target_cell] if target_cell is not None else [])
+                    )
+                    return self._fail("target_cell_walkable",
+                                      f"Pressed {direction} to face the target at {found_cells_str}, "
+                                      "but the player walked onto that cell instead, so nothing is there")
 
         interact = self._take_action(InteractAction)
         records.append(interact)
@@ -1228,14 +1346,28 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
         self.target_cell = target
         if target == (0, 0):
             return MOVE_OK
+        gmap = getattr(self._env, "_map", None)
+        side_door_dir = None
+        if gmap is not None and getattr(gmap, "pos", None) is not None and hasattr(gmap, "side_gatehouse_step_direction"):
+            try:
+                si, (px, py) = gmap.resolve(gmap.segment, gmap.pos)
+                side_door_dir = gmap.side_gatehouse_step_direction((px + target[0], py + target[1]), si)
+            except Exception:  # noqa: BLE001
+                side_door_dir = None
         exit_dir = None
         if self.cell_kinds.get(target) == WALKABLE:
-            exit_dir = boundary_exit_direction(self.cell_kinds, self.identified, target)
+            exit_dir = boundary_exit_direction(
+                self.cell_kinds, self.identified, target, global_map=gmap
+            )
+            if exit_dir is None and side_door_dir is not None:
+                exit_dir = side_door_dir
             goals = {target: None}
         else:
             goals = approach_cells(self.cell_kinds, target, identified=self.identified, people=self._people_now())
             if not goals:
                 return self._fail(MOVE_NO_PATH, "no_path", f"Nothing walkable next to the target at {target}")
+            if side_door_dir is not None:
+                exit_dir = side_door_dir
         code = self._walk(goals)
         if code is not None:
             return code

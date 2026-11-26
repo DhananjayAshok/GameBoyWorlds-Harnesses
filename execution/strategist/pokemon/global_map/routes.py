@@ -10,7 +10,9 @@ if TYPE_CHECKING:
 
 
 # Cost of stepping onto a square of each kind; walls and squares never seen cannot be crossed.
-STEP_COSTS = {WALKABLE: 1, UNKNOWN: 3, OCCUPIED: 5}
+# OCCUPIED cells (stationary NPCs and trainers) cost more than any intra-segment walkable detour
+# so routes and [next on-screen leg] projections always route around NPCs whenever a walkable path exists.
+STEP_COSTS = {WALKABLE: 1, UNKNOWN: 3, OCCUPIED: 500}
 # A door the player cannot reach over mapped squares is costed at this many times its straight-line distance.
 UNMAPPED_PENALTY = 2
 # A straight line between two consecutive recorded positions counts as walked, up to this many squares long.
@@ -35,10 +37,15 @@ def walked_squares(gmap: GlobalMap, segment: int) -> set:
         if (a[0] == b[0]) != (a[1] == b[1]) and abs(a[0] - b[0]) + abs(a[1] - b[1]) <= MAX_WALK_FILL:
             sx, sy = (b[0] > a[0]) - (b[0] < a[0]), (b[1] > a[1]) - (b[1] < a[1])
             walked |= {(a[0] + sx * i, a[1] + sy * i) for i in range(abs(b[0] - a[0]) + abs(b[1] - a[1]))}
+    cur_pos = gmap.pos if gmap.segment == segment else None
     return {
         g for g in walked
         if g not in emp_blocked
-        and (g not in seg or seg[g].kind not in (BLOCKED, LEDGE, LEDGE_LEFT))
+        and (
+            g == cur_pos
+            or g not in seg
+            or seg[g].kind not in (BLOCKED, LEDGE, LEDGE_LEFT, OCCUPIED)
+        )
     }
 
 

@@ -355,17 +355,68 @@ def _interacted_with(reg, npc) -> bool:
     return False
 
 
+OBJECT_DESC_PATTERN = re.compile(
+    r"\b(?:ride\s+car|statue|doll|machine|boulder|rock|sign(?:post)?|tree|plant|cushion|pillow|table|chair|stool)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_character_conversation(reg, npc) -> bool:
+    look = reg.look_of(npc)
+    peers = [n for n in reg.live_npcs() if reg.look_of(n).id == look.id]
+    for peer in peers:
+        if peer.kind in ("trainer", "person", "pokemon"):
+            if peer.kind == "trainer" or (peer.real_name and peer.name_type == "personal"):
+                return True
+        for cid in peer.conversations:
+            c = reg.conversations.get(cid)
+            if c is None or c.trigger == "battle_start" or c.sign:
+                continue
+            if (
+                c.led_to == "battle"
+                or c.outcome in ("battle", "gift")
+                or (c.speaker_name and c.name_type == "personal")
+                or (c.text and c.text.strip())
+            ):
+                return True
+    return False
+
+
+def sanitize_character_looks(reg) -> None:
+    for npc in reg.live_npcs():
+        convs = [reg.conversations[cid] for cid in npc.conversations
+                 if cid in reg.conversations and reg.conversations[cid].trigger != "battle_start"]
+        if convs:
+            if any(c.led_to == "battle" or c.outcome == "battle" for c in convs):
+                if npc.kind in ("unknown", "person", "object"):
+                    npc.kind = "trainer"
+            elif any(is_routine_service_text(c.text) for c in convs) and npc.kind in ("unknown", "object"):
+                npc.kind = "person"
+        if _has_character_conversation(reg, npc):
+            look = reg.look_of(npc)
+            if look.kind_hint == "object":
+                look.kind_hint = None
+            if npc.kind == "object":
+                npc.kind = (
+                    "trainer"
+                    if any(
+                        reg.conversations[cid].led_to == "battle" or reg.conversations[cid].outcome == "battle"
+                        for cid in npc.conversations
+                        if cid in reg.conversations
+                    )
+                    else "person"
+                )
+            if npc.description and OBJECT_DESC_PATTERN.search(npc.description):
+                npc.description = None
+
+
 def _settle_routine_npc_needs(reg) -> None:
+    sanitize_character_looks(reg)
     for npc in reg.live_npcs():
         convs = [reg.conversations[cid] for cid in npc.conversations
                  if cid in reg.conversations and reg.conversations[cid].trigger != "battle_start"]
         if not convs:
             continue
-        if any(c.led_to == "battle" or c.outcome == "battle" for c in convs):
-            if npc.kind in ("unknown", "person"):
-                npc.kind = "trainer"
-        elif any(is_routine_service_text(c.text) for c in convs) and npc.kind == "unknown":
-            npc.kind = "person"
         if all(is_routine_conversation(reg, c) for c in convs):
             npc.needs = None
 
@@ -424,12 +475,27 @@ def _cards(reg, people, vlm_call, game: str, gmap) -> None:
 
 def _apply_card(reg, npc, card: Dict[str, Any]) -> None:
     look = reg.look_of(npc)
+    has_char_conv = _has_character_conversation(reg, npc)
     if card["kind"] == "object":
-        look.kind_hint = "object"
-    if npc.kind in ("unknown", "person") or card["kind"] == "pokemon":
-        npc.kind = card["kind"]
-    if card["description"]:
-        npc.description = card["description"]
+        if not has_char_conv:
+            look.kind_hint = "object"
+            if npc.kind in ("unknown", "person"):
+                npc.kind = "object"
+            if card["description"]:
+                npc.description = card["description"]
+        else:
+            if look.kind_hint == "object":
+                look.kind_hint = None
+            if npc.kind == "unknown":
+                npc.kind = "person"
+    else:
+        if look.kind_hint == "object" and has_char_conv:
+            look.kind_hint = None
+        if npc.kind in ("unknown", "person", "object") or card["kind"] == "pokemon":
+            if not (npc.kind == "trainer" and card["kind"] == "person"):
+                npc.kind = card["kind"]
+        if card["description"] and not (has_char_conv and OBJECT_DESC_PATTERN.search(card["description"])):
+            npc.description = card["description"]
     if card["facing"] and npc.sightings:
         from execution.perception.pokemon import sprites as S
         view = look.views[min(npc.sightings[0].view, len(look.views) - 1)]

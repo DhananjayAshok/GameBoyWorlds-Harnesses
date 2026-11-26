@@ -272,6 +272,11 @@ class NPCRegistry(StrategistArtifact):
                               ("maybe_squares", dict), ("interrupted", lambda: None),
                               ("pending_press", lambda: None), ("last_facing", lambda: None)):
             self.__dict__.setdefault(name, default())
+        try:
+            from execution.strategist.pokemon.npc_model import sanitize_character_looks
+            sanitize_character_looks(self)
+        except Exception:  # noqa: BLE001
+            pass
 
     @property
     def _p(self) -> Dict[str, Any]:

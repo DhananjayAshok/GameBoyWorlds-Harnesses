@@ -2552,12 +2552,61 @@ class GlobalMap(StrategistArtifact):
         name = self.info(segment).name
         return name if name else f"area #{segment} (not named yet)"
 
+    def side_gatehouse_doorways(self, segment: Optional[int] = None) -> List[Dict[str, Any]]:
+        si = self.segment if segment is None else segment
+        if not (0 <= si < len(self.segments)):
+            return []
+        seg = self.segments[si]
+        if not seg or self.info(si).kind != OUTDOORS:
+            return []
+        blocked_targets = set(self.blocked_cells[si]) if si < len(self.blocked_cells) else set()
+        seg_moves = self.segment_blocked_moves(si)
+        doorways: List[Dict[str, Any]] = []
+        for x0, y0 in sorted(seg):
+            block = [(x0 + dx, y0 + dy) for dx in range(4) for dy in range(4)]
+            if not all(b in seg and seg[b].kind == BLOCKED and seg[b].tags == ("obstacle",) for b in block):
+                continue
+            if any(len(seg[b].hashes) != 4 or None in seg[b].hashes or len(set(seg[b].hashes)) == 1 for b in block):
+                continue
+            if not all(seg[(x0 + 1, y0 + dy)].hashes == seg[(x0 + 2, y0 + dy)].hashes for dy in (0, 2, 3)):
+                continue
+            if len({seg[(x0 + 1, y0 + dy)].hashes for dy in range(4)}) != 4:
+                continue
+            if any(seg[(x0, y0 + dy)].hashes == seg[(x0 + 1, y0 + dy)].hashes for dy in range(4)):
+                continue
+            if any(seg[(x0 + 3, y0 + dy)].hashes == seg[(x0 + 1, y0 + dy)].hashes for dy in range(4)):
+                continue
+            for wall_x, road_x, step_dir in ((x0 + 3, x0 + 4, "left"), (x0, x0 - 1, "right")):
+                road_cells = [(road_x, y0), (road_x, y0 + 1)]
+                wall_cells = [(wall_x, y0), (wall_x, y0 + 1)]
+                if not all(rc in seg and seg[rc].kind == WALKABLE and rc not in blocked_targets for rc in road_cells):
+                    continue
+                if all(step_dir in seg_moves.get(rc, ()) for rc in road_cells):
+                    continue
+                doorways.append({
+                    "road_cells": road_cells,
+                    "wall_cells": wall_cells,
+                    "direction": step_dir,
+                })
+        return doorways
+
+    def side_gatehouse_step_direction(self, cell: Cell, segment: Optional[int] = None) -> Optional[str]:
+        si = self.segment if segment is None else segment
+        for dw in self.side_gatehouse_doorways(si):
+            if cell in dw["road_cells"] or cell in dw["wall_cells"]:
+                return dw["direction"]
+        return None
+
     def door_list(self, segment: Optional[int] = None) -> List[Dict[str, Any]]:
         si = self.segment if segment is None else segment
         seg = self.segments[si]
         labels = {p: b for (s, p), b in self.door_labels().items() if s == si}
         order = {key: i for i, key in enumerate(labels)}
-        cells = {g for g, c in seg.items() if is_door(c)} | set(labels)
+        side_door_cells: set = set()
+        for dw in self.side_gatehouse_doorways(si):
+            if not any(rc in labels or wc in labels for rc in dw["road_cells"] for wc in dw["wall_cells"]):
+                side_door_cells.update(dw["road_cells"])
+        cells = {g for g, c in seg.items() if is_door(c)} | set(labels) | side_door_cells
         out, seen = [], set()
         for g in sorted(cells):
             if g in seen:

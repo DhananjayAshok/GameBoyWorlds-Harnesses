@@ -219,6 +219,8 @@ def project_route_next_leg(
         shortest_path,
     )
 
+    seg = gmap.current if gmap is not None else {}
+    px, py = (gmap.pos if (gmap is not None and getattr(gmap, "pos", None) is not None) else (0, 0))
     cur: Cell = (0, 0)
     for d, m in moves:
         if d not in DIRECTIONS:
@@ -245,6 +247,10 @@ def project_route_next_leg(
             return f"MoveOff({d} via ({exit_cell[0]}, {exit_cell[1]}))"
         if local_kinds is not None and local_kinds.get(nxt) == BLOCKED:
             break
+        if seg:
+            mc = seg.get((px + nxt[0], py + nxt[1]))
+            if mc is not None and mc.kind == OCCUPIED and nxt != goal_rel:
+                break
         cur = nxt
     target = goal_rel if (goal_rel is not None and in_bounds(goal_rel)) else cur
     if target != (0, 0) and in_bounds(target):

@@ -999,7 +999,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         local_kinds = self._current_local_kinds()
         if not local_kinds:
             return None
-        if boundary_exit_direction(local_kinds, self._identified, (0, 0)) is not None:
+        if boundary_exit_direction(
+            local_kinds, self._identified, (0, 0), global_map=self._global_map()
+        ) is not None:
             return None
         legs = parse_free_directional_legs(instruction)
         if not legs:
