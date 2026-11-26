@@ -935,13 +935,14 @@ class PokemonStrategist:
             log_info(f"Global map: merged segment {m['source']} into {m['target']} at {m['offset']} "
                      f"({m['matches']} of {m['shared']} squares match).", self._parameters)
 
-    def _name_segments(self, report: SupervisorReport, n: int) -> None:
+    def _name_segments(self, report: SupervisorReport, n: int) -> bool:
         gmap = self.global_map
         self._consolidate()
         gmap.queue_grown()
         queue = gmap.take_naming_queue()
         tasks = self._episode_lines()
         done = set()
+        named_changed = False
         for entry in queue:
             left = entry.get("reason", "door") == "door"
             if left:
@@ -960,12 +961,15 @@ class PokemonStrategist:
                 continue
             changed, name, description = answer
             if before is None:
+                named_changed = True
                 log_info(f"Global map: named segment {segment} '{name}': {description}", self._parameters)
             elif changed:
+                named_changed = True
                 log_info(f"Global map: renamed segment {segment} '{before}' -> '{name}': {description}",
                          self._parameters)
             else:
                 log_info(f"Global map: kept the name of segment {segment} '{name}'.", self._parameters)
+        return named_changed
 
     def _global_map_block(self) -> str:
         if not self.global_map.current:
@@ -1038,14 +1042,23 @@ class PokemonStrategist:
                          self.MAX_DISPATCH_ATTEMPTS, self._parameters, images=[frame])
         return dispatched if dispatched is not None else (None, None)
 
-    def _review(self, digest: str) -> Tuple[str, Optional[str]]:
+    def _review(self, digest: str, fallback_summary: Optional[str] = None) -> Tuple[str, Optional[str]]:
         new_doors = self.global_map.new_entrances(self.guide.towns)
+        cleaned_fallback = (fallback_summary or "").strip()
+        if not cleaned_fallback and digest:
+            for line in digest.splitlines():
+                if line.startswith("Final check:"):
+                    cleaned_fallback = line[len("Final check:"):].strip()
+                    break
+        if not new_doors and cleaned_fallback:
+            self.global_map.mark_entrances_seen()
+            return cleaned_fallback, None
         question, answer = town_question(self.guide) if new_doors else ("", "")
         prompt = (self._fill(P.REVIEW_PROMPT).replace("[DIGEST]", digest)
                   .replace("[TOWN_QUESTION]", question).replace("[TOWN_FORMAT]", answer))
         output = self._vlm_call("review", texts=prompt)
         self.global_map.mark_entrances_seen()
-        summary = clean_value(parse_key_value(output, "Summary")) or ""
+        summary = clean_value(parse_key_value(output, "Summary")) or cleaned_fallback
         town = clean_value(parse_key_value(output, "Town")) if new_doors else None
         if new_doors:
             log_info(f"Strategy guide: {new_doors} new door square(s) on the map; asked about a new town, "
@@ -1155,6 +1168,33 @@ class PokemonStrategist:
             lines.append(exp)
         return "\n".join(lines) or "(none)"
 
+    def _update_notepad_deterministically(self, summary: str, n: int) -> None:
+        notes = self.notepad.text.strip()
+        if self.global_map.current and notes:
+            notes = sanitize_stale_notepad_routes(
+                notes,
+                self.global_map,
+                self._current_segment_blocked_moves(),
+            )
+        frontier = self.goals.frontier()
+        goal_line = goal_path_text(self.goals.path_to(frontier)) if frontier is not None else "(every goal is finished)"
+        place = self._current_place()
+        clean_summary = " ".join((summary or "").split()) or "completed routine step."
+        latest_line = f"- Latest (episode {n} at {place}): {clean_summary}"
+        lines = [
+            ln for ln in (notes.splitlines() if notes else [])
+            if not re.match(r"^\s*-\s*Latest\s*\(episode\s+\d+\b", ln, re.IGNORECASE)
+        ]
+        replaced_goal = False
+        for idx, ln in enumerate(lines):
+            if re.match(r"^\s*-\s*Current\s+Goal\s*:", ln, re.IGNORECASE):
+                lines[idx] = f"- Current Goal: {goal_line}."
+                replaced_goal = True
+                break
+        if not replaced_goal and not lines:
+            lines.append(f"- Current Goal: {goal_line}.")
+        lines.append(latest_line)
+        self.notepad.update("\n".join(lines), episode_number=n)
     def _update_notepad(self, digest: str, summary: str, n: int) -> None:
         prompt = (self._fill(P.NOTEPAD_UPDATE_PROMPT)
                   .replace("[DIGEST]", digest)
@@ -1334,10 +1374,12 @@ class PokemonStrategist:
         supervisor._on_event_logged = record_so_far
         result = supervisor.evaluate()
         report = result["report"]
+        supervisor_summary = str(result.get("summary") or "").strip()
         record.supervisor_report = report
         record.status = str(result.get("status", "unknown"))
         self.report.event_log.append(report)
         record_so_far()
+        new_blocked_moves = False
         for b_place, by_dir in (getattr(supervisor, "_blocked_moves", None) or {}).items():
             dst_by_dir = self._blocked_moves.setdefault(b_place, {})
             for b_dir, notes in by_dir.items():
@@ -1345,7 +1387,10 @@ class PokemonStrategist:
                 for note in notes:
                     if note not in dst_list:
                         dst_list.append(note)
+                        new_blocked_moves = True
         if report is not None and report.narrative:
+            if extract_blocked_moves_from_narrative(report.narrative, end_pos=self.global_map.pos):
+                new_blocked_moves = True
             self._ingest_narrative_blocked_moves(
                 report.narrative,
                 segment=self.global_map.segment,
@@ -1353,7 +1398,7 @@ class PokemonStrategist:
             )
         # Let a mid-door-warp black screen clear, so the next task starts from the new place.
         settle_screen(self._env)
-        self._name_segments(report, n)
+        named_new_segment = self._name_segments(report, n)
         self._read_conversations()
         new_warps = [w for w in self.global_map.warps if w[0] > step_from]
         events = record_events(self.guide, self.global_map, new_warps, n, self._parameters)
@@ -1370,7 +1415,7 @@ class PokemonStrategist:
                                  current=self._current_place(), parameters=self._parameters,
                                  episode_status=record.status, subgoal_every=self._subgoal_every,
                                  explore=self._explore_context_block())
-        summary, town = self._review(report.digest)
+        summary, town = self._review(report.digest, fallback_summary=supervisor_summary)
         record.summary = summary or record.summary
         town_event = record_new_town(self.guide, town, self._current_place(), n, self._parameters)
         if town_event is not None:
@@ -1385,7 +1430,17 @@ class PokemonStrategist:
                 self.guide.mark_goal_completed(self.global_map, episode_number=n)
             if extracted or any(len(path) <= 3 for path, _ in closed):
                 self.notepad.clear(episode_number=n)
-        self._update_notepad(report.digest, summary, n)
+        if (
+            record.status == "completed"
+            and not extracted
+            and not named_new_segment
+            and not new_blocked_moves
+            and not any(len(path) <= 3 for path, _ in closed)
+            and self.notepad.text.strip()
+        ):
+            self._update_notepad_deterministically(record.summary, n)
+        else:
+            self._update_notepad(report.digest, summary, n)
         if events and self._should_update_guide(events, record.status):
             update_guide(self.guide, events, report.digest, self._vlm_caller("guide_update"), self._game, n,
                          self._parameters)

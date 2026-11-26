@@ -1273,12 +1273,25 @@ class PokemonPlayThroughSupervisor(Supervisor):
             f"corridor edge continues open and {route_info} — continue advancing along the corridor/route in this episode"
         )
 
+    def _continuation_unfinished_note(
+        self,
+        local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
+        *,
+        can_continue: bool = True,
+    ) -> Optional[str]:
+        if not can_continue:
+            return None
+        if local_kinds is None:
+            local_kinds = self._current_local_kinds()
+        unfinished_note = self._unfinished_room_exploration_note(self._task, local_kinds)
+        if unfinished_note is None:
+            unfinished_note = self._unfinished_corridor_traversal_note(local_kinds)
+        return unfinished_note
+
     def _task_check(self, frame, *, can_continue: bool = True) -> Tuple[bool, str]:
         remaining_calls = max(0, self._max_steps - self._calls)
         local_kinds = self._current_local_kinds()
-        unfinished_note = self._unfinished_room_exploration_note(self._task, local_kinds) if can_continue else None
-        if unfinished_note is None and can_continue:
-            unfinished_note = self._unfinished_corridor_traversal_note(local_kinds)
+        unfinished_note = self._continuation_unfinished_note(local_kinds, can_continue=can_continue)
         if can_continue and remaining_calls > 0:
             extra = f" ({unfinished_note}.)" if unfinished_note else ""
             continuation_note = (
@@ -2112,12 +2125,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
         replans = 0
         continuation_replans = 0
         calls_at_plan_start = self._calls
+        all_subgoals_judged = True
         index = 0
         while index < len(self.plan):
             subgoal = self.plan[index]
             outcome, attempts, reached_index = self._pursue(subgoal, index)
 
             if outcome == "complete":
+                if reached_index > index:
+                    all_subgoals_judged = False
                 index = max(index, reached_index) + 1
                 if index < len(self.plan):
                     if not self._out_of_calls() and not self._env_done():
@@ -2145,6 +2161,21 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     and not self._env_done()
                     and self._calls > calls_at_plan_start
                 )
+                local_kinds = self._current_local_kinds()
+                unfinished_note = self._continuation_unfinished_note(local_kinds, can_continue=can_continue)
+                if (
+                    unfinished_note is None
+                    and (len(self.plan) == 1 or all_subgoals_judged)
+                    and self._effective_state(frame) == AgentState.FREE_ROAM
+                    and not self._is_in_dialogue(frame)
+                    and self.report.narrative
+                ):
+                    judge_summary = re.sub(
+                        r"^\[Area coordinate:[^\]]*\]\s*",
+                        "",
+                        self.report.narrative[-1],
+                    ).strip() or self.report.narrative[-1]
+                    return self._finish("completed", None, judge_summary)
                 complete, summary = self._task_check(frame, can_continue=can_continue)
                 if complete:
                     return self._finish("completed", None, summary)
@@ -2156,6 +2187,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 calls_at_plan_start = self._calls
                 self.plan = self._plan_subgoals(frame)
                 continuation_replans += 1
+                all_subgoals_judged = True
                 if not self.plan:
                     return self._finish("plan_done_task_incomplete",
                                         "Worked through the plan without finishing the task.",
