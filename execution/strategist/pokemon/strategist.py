@@ -626,19 +626,17 @@ class PokemonStrategist:
         if not self.global_map.current:
             return {}
         cur_seg, _ = self.global_map.resolve(self.global_map.segment, self.global_map.pos)
-        out: Dict[Tuple[int, int], set] = {}
-        if hasattr(self.global_map, "segment_blocked_moves"):
-            for r_pos, dirs in self.global_map.segment_blocked_moves(cur_seg).items():
-                if dirs:
-                    out.setdefault(r_pos, set()).update(dirs)
+        extra: Dict[Tuple[int, int], set] = {}
         for (b_seg, b_pos), by_dir in self._blocked_moves.items():
             try:
                 r_seg, r_pos = self.global_map.resolve(b_seg, b_pos)
             except Exception:  # noqa: BLE001
                 continue
             if r_seg == cur_seg and by_dir:
-                out.setdefault(r_pos, set()).update(by_dir.keys())
-        return out
+                extra.setdefault(r_pos, set()).update(by_dir.keys())
+        if hasattr(self.global_map, "segment_blocked_moves"):
+            return self.global_map.segment_blocked_moves(cur_seg, extra)
+        return extra
 
     def _local_blocked_cells(self) -> set:
         from execution.perception.pokemon.navigation import in_bounds

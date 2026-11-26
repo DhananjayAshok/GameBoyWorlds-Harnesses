@@ -272,19 +272,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if gmap is None or place is None:
             return {}
         cur_seg, _ = place
-        out: Dict[Tuple[int, int], set] = {}
-        if hasattr(gmap, "segment_blocked_moves"):
-            for r_pos, dirs in gmap.segment_blocked_moves(cur_seg).items():
-                if dirs:
-                    out.setdefault(r_pos, set()).update(dirs)
+        extra: Dict[Tuple[int, int], set] = {}
         for (b_seg, b_pos), by_dir in self._blocked_moves.items():
             try:
                 r_seg, r_pos = gmap.resolve(b_seg, b_pos)
             except Exception:  # noqa: BLE001
                 continue
             if r_seg == cur_seg and by_dir:
-                out.setdefault(r_pos, set()).update(by_dir.keys())
-        return out
+                extra.setdefault(r_pos, set()).update(by_dir.keys())
+        if hasattr(gmap, "segment_blocked_moves"):
+            return gmap.segment_blocked_moves(cur_seg, extra)
+        return extra
 
     def _local_blocked_cells(self) -> set:
         local_blocked = set(getattr(self._env, "blocked_cells", None) or ())

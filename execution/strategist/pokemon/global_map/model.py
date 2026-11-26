@@ -30,7 +30,7 @@ from execution.perception.pokemon.tiles import (TileRecognizer, filter_cell_warp
                                                 normalize_tabletop_tag)
 
 from .registration import (BLACK_LEVEL, _local_cells, _screen, _still_lit, grid_offset, grid_residual, has_structure,
-                           register)
+                           pixel_diff, register)
 
 Cell = Tuple[int, int]
 
@@ -329,6 +329,20 @@ class GlobalMap(StrategistArtifact):
                 c.kind = WALKABLE
                 c.tags = ("ground",)
                 restored += 1
+        if 0 <= si < len(getattr(self, "blocked_moves", ())):
+            seg_moves = self.blocked_moves[si]
+            for b_pos in list(seg_moves):
+                kept_dirs = {
+                    d for d in seg_moves[b_pos]
+                    if d in DIRECTIONS
+                    and not self._is_uniform_walk_pattern_cell(
+                        seg.get((b_pos[0] + DIRECTIONS[d][0], b_pos[1] + DIRECTIONS[d][1]))
+                    )
+                }
+                if kept_dirs:
+                    seg_moves[b_pos] = kept_dirs
+                else:
+                    seg_moves.pop(b_pos, None)
         if self.info(si).kind != OUTDOORS:
             return restored
         seen_box = {
@@ -465,19 +479,10 @@ class GlobalMap(StrategistArtifact):
         c = seg.get(target)
         if c is not None and (is_door(c) or c.kind in (LEDGE, LEDGE_LEFT)):
             return None
+        if self._is_uniform_walk_pattern_cell(c):
+            return None
         if direction in DIRECTIONS and src is not None and (c is None or c.kind != OCCUPIED):
             self.blocked_moves[self.segment].setdefault(src, set()).add(direction)
-        is_uniform_walk_pattern = (
-            c is not None
-            and c.hashes
-            and len(c.hashes) == 4
-            and len(set(c.hashes)) == 1
-            and c.hashes[0] is not None
-            and c.hashes in self.walk_patterns
-            and self._can_learn_walkable(c.tags, c.hashes, c.pixels)
-        )
-        if is_uniform_walk_pattern:
-            return None
         if self.visits[self.segment].get(target, 0) > 0:
             if (
                 c is None
@@ -519,21 +524,45 @@ class GlobalMap(StrategistArtifact):
             if seg_blocked is not None:
                 seg_blocked.discard(cur)
 
+    def _is_uniform_walk_pattern_cell(self, c: Optional["MapCell"]) -> bool:
+        return bool(
+            c is not None
+            and c.hashes
+            and len(c.hashes) == 4
+            and len(set(c.hashes)) == 1
+            and c.hashes[0] is not None
+            and c.hashes in self.walk_patterns
+            and self._can_learn_walkable(c.tags, c.hashes, c.pixels)
+        )
+
     def segment_blocked_moves(
         self,
         segment: Optional[int] = None,
         extra_blocked_moves: Optional[Dict[Cell, Iterable[str]]] = None,
     ) -> Dict[Cell, set]:
         si = self.segment if segment is None else segment
+        seg = self.segments[si] if 0 <= si < len(self.segments) else {}
         out: Dict[Cell, set] = {}
         if 0 <= si < len(getattr(self, "blocked_moves", ())):
             for b_pos, dirs in self.blocked_moves[si].items():
-                valid_dirs = {d for d in dirs if d in DIRECTIONS}
+                valid_dirs = {
+                    d for d in dirs
+                    if d in DIRECTIONS
+                    and not self._is_uniform_walk_pattern_cell(
+                        seg.get((b_pos[0] + DIRECTIONS[d][0], b_pos[1] + DIRECTIONS[d][1]))
+                    )
+                }
                 if valid_dirs:
                     out.setdefault(b_pos, set()).update(valid_dirs)
         if extra_blocked_moves:
             for b_pos, dirs in extra_blocked_moves.items():
-                valid_dirs = {d for d in dirs if d in DIRECTIONS}
+                valid_dirs = {
+                    d for d in dirs
+                    if d in DIRECTIONS
+                    and not self._is_uniform_walk_pattern_cell(
+                        seg.get((b_pos[0] + DIRECTIONS[d][0], b_pos[1] + DIRECTIONS[d][1]))
+                    )
+                }
                 if valid_dirs:
                     out.setdefault(b_pos, set()).update(valid_dirs)
         return out
@@ -854,17 +883,29 @@ class GlobalMap(StrategistArtifact):
         if self.anchor is None:
             shift = self._grid_shift(frame)
             self.anchor, self.residual = _screen(frame), grid_residual(shift)
+            self._anchor_place = (self.segment, self.pos)
+            self._anchor_pending = None
             self.in_battle = False
             self.observe(frame, identified, shift)
             return "start"
+        anchor_place = getattr(self, "_anchor_place", None)
+        anchor_pending = getattr(self, "_anchor_pending", None)
         if self.pending is not None and direction not in DIRECTIONS:
             direction, max_steps, reported = self.pending
+        elif anchor_pending is not None and direction not in DIRECTIONS and anchor_place is not None and anchor_place[0] == self.segment and anchor_place[1] != self.pos:
+            direction, max_steps, reported = anchor_pending
+        base_pos = (
+            anchor_place[1]
+            if (anchor_place is not None and anchor_place[0] == self.segment and anchor_pending is not None)
+            else self.pos
+        )
         placed = None if self.faded else register(self.anchor, frame, direction, max_steps, reported,
                                                   self.residual)
         if placed is not None:
             delta, residual, structural = placed
             prev_pos = self.pos
-            pos = (self.pos[0] + delta[0], self.pos[1] + delta[1])
+            pos = (base_pos[0] + delta[0], base_pos[1] + delta[1])
+            step_delta = (pos[0] - prev_pos[0], pos[1] - prev_pos[1])
             shift = tuple((-r) % GRID_SKIP for r in residual)
             if self._blacks_out(frame, self.segment, pos, shift):
                 if direction in DIRECTIONS and self.pending is None:
@@ -872,12 +913,12 @@ class GlobalMap(StrategistArtifact):
                 self.stats["blackout_frames"] += 1
                 return "blank"
             if not structural:
-                self._learn_ledges(prev_pos, pos, direction)
+                self._learn_ledges(base_pos, pos, direction)
                 if (delta[0] == 0) != (delta[1] == 0) and 1 < abs(delta[0]) + abs(delta[1]) <= MAX_STEP_FILL:
                     sx = (delta[0] > 0) - (delta[0] < 0)
                     sy = (delta[1] > 0) - (delta[1] < 0)
                     for i in range(1, abs(delta[0]) + abs(delta[1])):
-                        mid = (prev_pos[0] + sx * i, prev_pos[1] + sy * i)
+                        mid = (base_pos[0] + sx * i, base_pos[1] + sy * i)
                         c_mid = self.segments[self.segment].get(mid)
                         if c_mid is None or c_mid.kind not in (BLOCKED, LEDGE, LEDGE_LEFT):
                             self.visits[self.segment][mid] += 1
@@ -890,19 +931,28 @@ class GlobalMap(StrategistArtifact):
                 snapped = self._snap_within_segment(frame, identified, was_off_grid=was_off_grid)
                 if snapped is not None and snapped != self.pos:
                     self.pos = snapped
-                    delta = (self.pos[0] - prev_pos[0], self.pos[1] - prev_pos[1])
-            if not structural and delta != (0, 0):
+                    step_delta = (self.pos[0] - prev_pos[0], self.pos[1] - prev_pos[1])
+            if not structural and step_delta != (0, 0):
                 self.clear_traversed_step(prev_pos, self.pos, self.segment)
             placed_steps = abs(delta[0]) + abs(delta[1])
-            if structural and direction in DIRECTIONS and reported is not None and placed_steps < reported:
-                rem_reported = reported - placed_steps
-                rem_max = max(rem_reported + 1, max_steps - placed_steps)
-                self.pending = (direction, rem_max, rem_reported)
+            if structural:
+                if direction in DIRECTIONS and delta != (0, 0):
+                    if anchor_place is None or anchor_place[0] != self.segment:
+                        self._anchor_place = (self.segment, prev_pos)
+                    self._anchor_pending = (direction, max_steps, reported)
+                if direction in DIRECTIONS and reported is not None and placed_steps < reported:
+                    rem_reported = reported - placed_steps
+                    rem_max = max(rem_reported + 1, max_steps - placed_steps)
+                    self.pending = (direction, rem_max, rem_reported)
+                else:
+                    self.pending = None
             else:
                 self.pending = None
+                self._anchor_pending = None
             self.lost = 0
             if not structural:
                 self.anchor = _screen(frame)
+                self._anchor_place = (self.segment, self.pos)
             if not structural:
                 self.in_battle = False
             self.stats["placed_by_edges" if structural else "placed"] += 1
@@ -910,20 +960,30 @@ class GlobalMap(StrategistArtifact):
                 # recoloured (a flash or fade): the position holds, the colours do not
                 self.stats["recoloured_frames"] += 1
             elif self.residual == (0, 0):
-                self.observe(frame, identified, can_learn_walkable=(delta != (0, 0)))
+                self.observe(frame, identified, can_learn_walkable=(step_delta != (0, 0)))
                 self._try_merge(frame)
             else:
                 self.observe(frame, identified, shift)
                 self.stats["off_grid_frames"] += 1
-            return "moved" if delta != (0, 0) else "stayed"
+            return "moved" if step_delta != (0, 0) else "stayed"
         shift = self._grid_shift(frame)
         warp_targets = self._known_warp_targets(direction, max_steps, reported) if self.faded else None
-        found = self.relocalise(
-            frame,
-            shift=shift,
-            allowed=lambda si, q: not self.arrival_breaks_doors(si, q),
-            warp_targets=warp_targets,
-        )
+        allow_fn = lambda si, q: not self.arrival_breaks_doors(si, q)
+        found = None
+        if not self.faded and 0 <= self.segment < len(self.segments) and self.segments[self.segment]:
+            found = self.relocalise(
+                frame,
+                shift=shift,
+                allowed=lambda si, q: si == self.segment and allow_fn(si, q),
+                warp_targets=warp_targets,
+            )
+        if found is None:
+            found = self.relocalise(
+                frame,
+                shift=shift,
+                allowed=allow_fn,
+                warp_targets=warp_targets,
+            )
         if found is not None and self._blacks_out(frame, *found, shift):
             if direction in DIRECTIONS and self.pending is None:
                 self.pending = (direction, max_steps, reported)
@@ -942,7 +1002,7 @@ class GlobalMap(StrategistArtifact):
                 seg = self.segments[self.segment]
                 seg_blocked = self.blocked_cells[self.segment] if self.segment < len(self.blocked_cells) else set()
                 adv_pos = self.pos
-                seg_moves = self.blocked_moves[self.segment] if self.segment < len(self.blocked_moves) else {}
+                seg_moves = self.segment_blocked_moves(self.segment)
                 for _ in range(reported):
                     if direction in seg_moves.get(adv_pos, ()):
                         break
@@ -951,12 +1011,34 @@ class GlobalMap(StrategistArtifact):
                     if nxt in seg_blocked or (c_nxt is not None and c_nxt.kind in (BLOCKED, LEDGE, LEDGE_LEFT)):
                         break
                     adv_pos = nxt
-                    self.visits[self.segment][adv_pos] += 1
-                found = (self.segment, adv_pos)
+                if adv_pos != self.pos:
+                    a_scr = _screen(frame)
+                    masked_adv = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
+                    local_adv: Dict[Cell, Tuple[Optional[str], ...]] = {}
+                    lp_adv: Dict[Cell, np.ndarray] = {}
+                    blank_adv: List[Cell] = []
+                    for (lx, ly), piece in _local_cells(a_scr, shift):
+                        if (lx, ly) == (0, 0) or (lx, ly) in masked_adv:
+                            continue
+                        if int(piece.min()) == int(piece.max()):
+                            blank_adv.append((lx, ly))
+                            continue
+                        local_adv[(lx, ly)] = self._cell_hashes(split_quarters(piece))
+                        lp_adv[(lx, ly)] = piece
+                    m_cur, _ = self._screen_agreement(seg, local_adv, self.pos, blank_adv, lp_adv)
+                    m_adv, ov_adv = self._screen_agreement(seg, local_adv, adv_pos, blank_adv, lp_adv)
+                    if ov_adv == 0 or (m_adv >= RELOCALISE_MIN_FRACTION * ov_adv and m_adv >= m_cur - 2):
+                        cur_step = self.pos
+                        while cur_step != adv_pos:
+                            cur_step = (cur_step[0] + dx, cur_step[1] + dy)
+                            self.visits[self.segment][cur_step] += 1
+                        found = (self.segment, adv_pos)
             if found != (self.segment, self.pos):
                 self._link(*found, departure_pos=self._warp_departure_pos(direction, max_steps, reported))
             self.segment, self.pos = found
             self.residual, self.pending, self.lost, self.anchor = grid_residual(shift), None, 0, _screen(frame)
+            self._anchor_place = (self.segment, self.pos)
+            self._anchor_pending = None
             self.faded = False
             self.in_battle = False
             self.stats["relocalised"] += 1
@@ -989,6 +1071,8 @@ class GlobalMap(StrategistArtifact):
         )
         self.segment, self.pos = len(self.segments) - 1, (0, 0)
         self.residual, self.pending, self.lost, self.anchor = grid_residual(shift), None, 0, _screen(frame)
+        self._anchor_place = (self.segment, self.pos)
+        self._anchor_pending = None
         self.faded = False
         self.in_battle = False
         self.segment_born = self.stats["placed"]
@@ -1181,6 +1265,9 @@ class GlobalMap(StrategistArtifact):
         cands = []
         for d, sc in scores.items():
             if d == (0, 0) or sc["ov"] < 20 or sc["on_blocked"]:
+                continue
+            self_per = pixel_diff(a, a, d[0] * GRID_SKIP, -d[1] * GRID_SKIP)
+            if self_per is not None and self_per <= 0.01:
                 continue
             dist = abs(d[0]) + abs(d[1])
             qualifies = False
@@ -2008,9 +2095,38 @@ class GlobalMap(StrategistArtifact):
                      for o, overlap, m in close),
                     reverse=True,
                 )
-                if distinctive[0][0] - distinctive[1][0] < DISTINCTIVE_LEAD:
-                    continue
-                close = [(distinctive[0][1], distinctive[0][2], distinctive[0][3])]
+                if distinctive[0][0] - distinctive[1][0] >= DISTINCTIVE_LEAD:
+                    close = [(distinctive[0][1], distinctive[0][2], distinctive[0][3])]
+                else:
+                    top_o, top_ov, top_m = close[0]
+                    second_m = ranked[1][0][0] if len(ranked) > 1 else 0
+                    lead_needed = max(6, int(0.08 * max(1, top_ov)))
+                    if (
+                        top_ov > 0
+                        and top_m >= 0.92 * top_ov
+                        and top_m - second_m >= lead_needed
+                    ):
+                        close = [(top_o, top_ov, top_m)]
+                    elif (
+                        not self.faded
+                        and si == self.segment
+                        and self.pos is not None
+                    ):
+                        near_cur = [
+                            (abs(o[0] - self.pos[0]) + abs(o[1] - self.pos[1]), -m, o, overlap, m)
+                            for o, overlap, m in close
+                            if overlap > 0
+                            and m >= 0.90 * overlap
+                            and abs(o[0] - self.pos[0]) + abs(o[1] - self.pos[1]) <= MAX_STEP_FILL
+                        ]
+                        if near_cur and (len(near_cur) == 1 or near_cur[0][1] < near_cur[1][1]):
+                            near_cur.sort()
+                            _, _, n_o, n_ov, n_m = near_cur[0]
+                            close = [(n_o, n_ov, n_m)]
+                        else:
+                            continue
+                    else:
+                        continue
             offset, overlap, n = close[0]
             # a small room shows few content cells: ask for most of them rather than the fixed minimum
             needed = min(RELOCALISE_MIN_CELLS, max(10, int(0.6 * len(local))))

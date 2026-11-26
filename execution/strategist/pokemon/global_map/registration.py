@@ -184,6 +184,34 @@ def _register_scripted(before: np.ndarray, after: np.ndarray, residual: Cell) ->
     return (k[0], -k[1]), new_residual
 
 
+def _sprite_turned(before: np.ndarray, after: np.ndarray) -> bool:
+    if before.shape != after.shape or before.shape[0] < 80 or before.shape[1] < 80:
+        return False
+    a = before[64:80, 64:80].astype(int)
+    b = after[64:80, 64:80].astype(int)
+    return int((np.abs(a - b) > 40).sum()) >= 20
+
+
+def _is_periodic_open_step(before: np.ndarray, after: np.ndarray, ux: int, uy: int) -> bool:
+    if (ux, uy) == (0, 0):
+        return False
+    self_diff = pixel_diff(before, before, ux * GRID_SKIP, uy * GRID_SKIP)
+    if self_diff is None or self_diff > 0.005:
+        return False
+    step_diff = pixel_diff(before, after, ux * GRID_SKIP, uy * GRID_SKIP)
+    if step_diff is None or step_diff > 0.005:
+        return False
+    r_ahead, c_ahead = (PLAYER_ROW + uy) * GRID_SKIP, (PLAYER_COL + ux) * GRID_SKIP
+    r_behind, c_behind = (PLAYER_ROW - uy) * GRID_SKIP, (PLAYER_COL - ux) * GRID_SKIP
+    ahead = before[r_ahead:r_ahead + GRID_SKIP, c_ahead:c_ahead + GRID_SKIP]
+    behind = before[r_behind:r_behind + GRID_SKIP, c_behind:c_behind + GRID_SKIP]
+    if ahead.shape != (GRID_SKIP, GRID_SKIP) or behind.shape != (GRID_SKIP, GRID_SKIP):
+        return False
+    if int(ahead.max()) <= int(ahead.min()):
+        return False
+    return float((ahead != behind).mean()) <= 0.05
+
+
 def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], max_steps: int,
               reported: Optional[int], residual: Cell, structural: bool) -> Optional[Tuple[int, Cell]]:
     if direction in SCREEN_UNIT:
@@ -216,7 +244,21 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
     diff, s = best_by_k[k_best]
     if diff > threshold or k_best < 0:
         return None
-    if reported is not None and reported in best_by_k and best_by_k[reported][0] <= threshold:
+    periodic_step = (
+        not structural
+        and residual == (0, 0)
+        and 1 in best_by_k
+        and _is_periodic_open_step(before, after, ux, uy)
+    )
+    if periodic_step and reported == 0:
+        k_best = 1
+        diff, s = best_by_k[1]
+    elif (
+        reported is not None
+        and reported in best_by_k
+        and best_by_k[reported][0] <= threshold
+        and (best_by_k[reported][0] <= diff + AMBIGUITY_MARGIN or k_best > 0)
+    ):
         k_best = reported
         diff, s = best_by_k[k_best]
     else:
@@ -226,7 +268,10 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
                 k_best = reported
                 s = best_by_k[k_best][1]
             elif reported is None and max_steps == 1 and 0 in tied:
-                if best_by_k[0][0] <= diff + 0.002:
+                if periodic_step and 1 in tied and not _sprite_turned(before, after):
+                    k_best = 1
+                    diff, s = best_by_k[1]
+                elif best_by_k[0][0] <= diff + 0.002:
                     k_best = 0
                     s = best_by_k[0][1]
                 elif not set(tied) <= {0, 1}:

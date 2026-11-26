@@ -1101,9 +1101,24 @@ class GridMoveExecutor(PolicyExecutor):
                 return self._fail(MOVE_TRUNCATED, "truncated")
             action_return = (record.transition_states[-1]["core"].get("action_return") or {}) if record.transition_states else {}
             taken = action_return.get("n_steps_taken", 0)
+            after_place = self._current_map_place()
+            warped_area = (
+                before_place is not None
+                and after_place is not None
+                and before_place[0] != after_place[0]
+            )
+            if taken == 0 and before_place is not None and after_place is not None:
+                if warped_area:
+                    taken = 1
+                else:
+                    along = (
+                        (after_place[1][0] - before_place[1][0]) * dx
+                        + (after_place[1][1] - before_place[1][1]) * dy
+                    )
+                    if along > 0:
+                        taken = along
             self._steps_taken += taken
             self._last_step_taken += taken
-            after_place = self._current_map_place()
             mult = 2 if (move_kind == "jump" and taken > 0) else 1
             if (
                 before_place is not None
@@ -1120,7 +1135,11 @@ class GridMoveExecutor(PolicyExecutor):
             if record.action_success == 2 or state != AgentState.FREE_ROAM:
                 return self._fail(MOVE_INTERRUPTED, "move_interrupted",
                                   f"Left free roam after {taken} steps {direction}: {state.name}")
-            remaining -= taken
+            if warped_area:
+                return None
+            remaining = max(0, remaining - taken)
+            if taken > 0 and remaining > 0 and self._n_moves < self._max_steps and attempts < steps + 2:
+                continue
             if (taken == 0 and not action_return.get("rotated")) or (
                     record.action_success in (-1, 1) and remaining > 0 and taken > 0):
                 step_moved_screen = (
@@ -1135,12 +1154,14 @@ class GridMoveExecutor(PolicyExecutor):
                 if state != AgentState.FREE_ROAM or has_bottom_dialogue_box(self._get_state()["core"]["current_frame"]):
                     return self._fail(MOVE_INTERRUPTED, "move_interrupted",
                                       f"Left free roam after {taken} steps {direction}: {state.name}")
+                settled_place = self._current_map_place()
+                if before_place is not None and settled_place is not None and settled_place[0] != before_place[0]:
+                    return None
                 if ((step_moved_screen or self._saw_cutscene_activity)
                         and not retried_after_cutscene
                         and self._n_moves < self._max_steps):
                     retried_after_cutscene = True
                     continue
-                settled_place = self._current_map_place()
                 if (
                     taken > 0
                     and before_place is not None
