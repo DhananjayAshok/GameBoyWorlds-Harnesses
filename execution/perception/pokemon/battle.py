@@ -223,7 +223,7 @@ def is_cutscene_frame_changing(
     a = _grey_frame(earlier).astype(int)
     b = _grey_frame(later).astype(int)
     diff = np.abs(a - b) > CUTSCENE_DIFF_THRESHOLD
-    diff[88:, 104:] = False
+    diff[96:, 104:] = False
     if ignore_player_box:
         diff[56:80, 64:80] = False
     raw_sum = int(diff.sum())
@@ -239,12 +239,12 @@ def is_cutscene_frame_changing(
         if d < n_cols:
             diff_l = np.ones_like(diff)
             diff_l[:, d:] = np.abs(b[:, d:] - a[:, :-d]) > CUTSCENE_DIFF_THRESHOLD
-            diff_l[88:, 104:] = False
+            diff_l[96:, 104:] = False
             if ignore_player_box:
                 diff_l[56:80, 64:80] = False
             diff_r = np.ones_like(diff)
             diff_r[:, :-d] = np.abs(b[:, :-d] - a[:, d:]) > CUTSCENE_DIFF_THRESHOLD
-            diff_r[88:, 104:] = False
+            diff_r[96:, 104:] = False
             if ignore_player_box:
                 diff_r[56:80, 64:80] = False
             tl = diff_l[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
@@ -253,12 +253,12 @@ def is_cutscene_frame_changing(
         if d < n_rows:
             diff_u = np.ones_like(diff)
             diff_u[d:, :] = np.abs(b[d:, :] - a[:-d, :]) > CUTSCENE_DIFF_THRESHOLD
-            diff_u[88:, 104:] = False
+            diff_u[96:, 104:] = False
             if ignore_player_box:
                 diff_u[56:80, 64:80] = False
             diff_d = np.ones_like(diff)
             diff_d[:-d, :] = np.abs(b[:-d, :] - a[d:, :]) > CUTSCENE_DIFF_THRESHOLD
-            diff_d[88:, 104:] = False
+            diff_d[96:, 104:] = False
             if ignore_player_box:
                 diff_d[56:80, 64:80] = False
             tu = diff_u[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
