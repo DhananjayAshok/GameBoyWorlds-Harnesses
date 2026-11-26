@@ -554,19 +554,24 @@ def is_pack_screen(frame: np.ndarray) -> bool:
     return True
 
 
+def _max_pack_action_box_border_tiles(img: np.ndarray) -> int:
+    """Return the maximum vertical border tile count across the Pack action sub-box columns."""
+    return max(
+        sum(
+            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+            for ty in range(3, 12)
+        )
+        for tx in range(10, 16)
+    )
+
+
 def is_pack_item_list_screen(frame: np.ndarray) -> bool:
     """Return True if the screen shows the Generation 2 Pack item list without an open action/quantity sub-box."""
     if not is_pack_screen(frame):
         return False
     img = _grey_frame(frame)
-    for tx in range(10, 16):
-        x0 = tx * TILE_SIZE
-        n_v = sum(
-            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, x0:x0 + TILE_SIZE])
-            for ty in range(3, 12)
-        )
-        if n_v >= 4:
-            return False
+    if _max_pack_action_box_border_tiles(img) >= 4:
+        return False
     if has_quantity_selector_box(img):
         return False
     return True
@@ -579,15 +584,7 @@ def is_overworld_pack_menu(frame: np.ndarray) -> bool:
     img = _grey_frame(frame)
     if has_quantity_selector_box(img):
         return True
-    for tx in range(10, 16):
-        x0 = tx * TILE_SIZE
-        n_v = sum(
-            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, x0:x0 + TILE_SIZE])
-            for ty in range(3, 12)
-        )
-        if n_v >= 6:
-            return True
-    return False
+    return _max_pack_action_box_border_tiles(img) >= 6
 
 
 def is_start_menu_screen(frame: np.ndarray) -> bool:
