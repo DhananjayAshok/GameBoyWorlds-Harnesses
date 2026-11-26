@@ -55,10 +55,50 @@ def in_bounds(cell: Cell) -> bool:
     return cell[0] in X_RANGE and cell[1] in Y_RANGE
 
 
+def _is_top_cliff_border_overhang_floor_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+) -> bool:
+    if quarter_images is None:
+        return False
+    cell_q = quarter_tags.get(cell, {})
+    cell_imgs = quarter_images.get(cell, {})
+    if len(cell_q) < 4 or len(cell_imgs) < 4:
+        return False
+    if cell_q.get("top_left") != "obstacle" or cell_q.get("top_right") != "obstacle":
+        return False
+    if (
+        cell_q.get("bottom_left") not in ("ground", "ground decoration")
+        or cell_q.get("bottom_right") not in ("ground", "ground decoration")
+    ):
+        return False
+    if any(cell_imgs.get(q) is None for q in QUARTERS):
+        return False
+    tl = np.squeeze(np.asarray(cell_imgs["top_left"]))
+    tr = np.squeeze(np.asarray(cell_imgs["top_right"]))
+    bl = np.squeeze(np.asarray(cell_imgs["bottom_left"]))
+    br = np.squeeze(np.asarray(cell_imgs["bottom_right"]))
+    if tl.shape != (8, 8) or tr.shape != (8, 8) or bl.shape != (8, 8) or br.shape != (8, 8):
+        return False
+    if not (np.array_equal(tl, tr) and np.array_equal(bl, br)):
+        return False
+    ground_shades = {int(v) for v in np.unique(bl)}
+    if 0 in ground_shades or len(ground_shades) < 2:
+        return False
+    top_lower_shades = {int(v) for v in np.unique(tl[4:, :])}
+    if not (top_lower_shades <= ground_shades) or 0 not in np.unique(tl[:2, :]):
+        return False
+    if abs(float(tl[4:, :].mean()) - float(bl.mean())) > 25.0:
+        return False
+    return True
+
+
 def is_top_overhang_floor_cell(
     cell: Cell,
     quarter_tags: Dict[Cell, Dict[str, str]],
     quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
 ) -> bool:
     cell_q = quarter_tags.get(cell, {})
     if len(cell_q) < 4:
@@ -69,7 +109,8 @@ def is_top_overhang_floor_cell(
         return False
     if not (top_tags <= WALKABLE_TAGS | FURNITURE_OVERHANG_TOP_TAGS):
         return False
-    if quarter_descriptions is not None:
+    is_cliff_overhang = _is_top_cliff_border_overhang_floor_cell(cell, quarter_tags, quarter_images)
+    if not is_cliff_overhang and quarter_descriptions is not None:
         cell_d = quarter_descriptions.get(cell, {})
         for q in ("top_left", "top_right"):
             if cell_q.get(q) in FURNITURE_OVERHANG_TOP_TAGS:
@@ -78,7 +119,7 @@ def is_top_overhang_floor_cell(
                     return False
     above_q = quarter_tags.get((cell[0], cell[1] + 1), {})
     above_bottom = {above_q[q] for q in ("bottom_left", "bottom_right") if q in above_q}
-    if above_bottom:
+    if above_bottom and not is_cliff_overhang:
         return bool(above_bottom & (FURNITURE_OVERHANG_TOP_TAGS | {"item"}))
     return True
 
@@ -401,9 +442,10 @@ def is_overhang_floor_cell(
     cell: Cell,
     quarter_tags: Dict[Cell, Dict[str, str]],
     quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
 ) -> bool:
     return (
-        is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+        is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
         or is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
         or is_npc_head_overhang_floor_cell(cell, quarter_tags)
     )
@@ -424,7 +466,7 @@ def is_walkable_pattern_learnable(
         q_map = {(0, 0): quarter_tags}
         d_map = {(0, 0): quarter_descriptions or {}} if quarter_descriptions is not None else None
         i_map = {(0, 0): quarter_images or {}} if quarter_images is not None else None
-        if is_top_overhang_floor_cell((0, 0), q_map, d_map):
+        if is_top_overhang_floor_cell((0, 0), q_map, d_map, i_map):
             return True
         if is_patterned_floor_cell((0, 0), q_map, d_map, i_map, min_ground_quarters=1):
             return True
@@ -463,7 +505,7 @@ def classify_cell_from_quarters(
         cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=allow_player_cap
     ):
         return BLOCKED, raw_tags
-    if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions):
+    if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images):
         tags = tuple(sorted({cell_q[q] for q in ("bottom_left", "bottom_right") if q in cell_q})) or ("ground",)
         return WALKABLE, tags
     if (

@@ -792,6 +792,20 @@ class GlobalMap(StrategistArtifact):
             ):
                 continue
             if (
+                old.kind == BLOCKED
+                and "obstacle" in old.tags
+                and kind == WALKABLE
+                and not bool(set(tags) & DOOR_TAGS)
+                and len(set(hashes)) == 1
+                and hashes[0] is not None
+                and self.visits[self.segment].get(g, 0) == 0
+                and not (abs(x) <= 2 and abs(y) <= 2)
+                and old.hashes != hashes
+                and old.pixels is not None
+                and int(old.pixels.min()) < int(old.pixels.max())
+            ):
+                continue
+            if (
                 kind == BLOCKED
                 and not cell_learnable
                 and "obstacle" in tags
@@ -1141,6 +1155,13 @@ class GlobalMap(StrategistArtifact):
                             lm_match += 1
                         else:
                             lm_mismatch += 1
+                cand_cell = seg.get(cand)
+                on_blocked = (
+                    cand_cell is not None
+                    and cand_cell.kind == BLOCKED
+                    and "obstacle" in cand_cell.tags
+                    and visits.get(cand, 0) == 0
+                )
                 scores[(dx, dy)] = {
                     "pos": cand,
                     "m": m,
@@ -1152,13 +1173,14 @@ class GlobalMap(StrategistArtifact):
                     "lm_mismatch": lm_mismatch,
                     "vis_blk": vis_blk,
                     "vis_wlk": vis_wlk,
+                    "on_blocked": on_blocked,
                 }
         s0 = scores.get((0, 0))
         if s0 is None:
             return None
         cands = []
         for d, sc in scores.items():
-            if d == (0, 0) or sc["ov"] < 20:
+            if d == (0, 0) or sc["ov"] < 20 or sc["on_blocked"]:
                 continue
             dist = abs(d[0]) + abs(d[1])
             qualifies = False
@@ -1166,6 +1188,7 @@ class GlobalMap(StrategistArtifact):
                 sc["frac"] - s0["frac"] >= 0.08
                 or (sc["lm_match"] > s0["lm_match"] and sc["lm_mismatch"] < s0["lm_mismatch"] and sc["frac"] - s0["frac"] >= 0.04)
                 or (sc["vis_total"] >= 4 and sc["vis_match"] == sc["vis_total"] and s0["vis_match"] < s0["vis_total"] and sc["frac"] - s0["frac"] >= 0.05)
+                or (s0["on_blocked"] and sc["vis_blk"] <= s0["vis_blk"] and sc["frac"] - s0["frac"] >= 0.04)
             ):
                 qualifies = True
             elif (

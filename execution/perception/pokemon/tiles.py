@@ -289,7 +289,9 @@ def verbalize_tiles(
 ) -> str:
     quarter_tags, quarter_descriptions, quarter_images = _quarter_tag_map(identified)
     top_overhang_cells = {
-        cell for cell in quarter_tags if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+        cell
+        for cell in quarter_tags
+        if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
     }
     player_overhang_cells = {
         cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
@@ -466,7 +468,7 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
         cell, quarter_tags, quarter_descriptions, quarter_images, allow_player_cap=True
     ):
         return "obstacle (vertical cliff wall; blocks moving left or right) in the right half"
-    is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
+    is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
     is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     is_npc_head_overhang = is_npc_head_overhang_floor_cell(cell, quarter_tags)
     is_patterned_floor = is_patterned_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
