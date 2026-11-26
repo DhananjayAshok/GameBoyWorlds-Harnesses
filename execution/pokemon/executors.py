@@ -114,9 +114,9 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
 
 
 INTERACT_SETTLE_WAIT = 2
-INTERACT_POST_DIALOGUE_SETTLE_WAIT = 2
+INTERACT_POST_DIALOGUE_SETTLE_WAIT = 4
 INTERACT_MAX_CUTSCENE_WAIT = 30
-INTERACT_POST_MOTION_WAIT = 2
+INTERACT_POST_MOTION_WAIT = 4
 INTERACT_POST_WARP_BANNER_WAIT = 6
 INTERACT_MODAL_MAX_PRESSES = 8
 MAX_INTERACT_DIALOGUE_STEPS = 10
@@ -195,7 +195,7 @@ class InteractionExecutor(PolicyExecutor):
             cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
             if cur_step is not None:
                 try:
-                    if waited >= 3:
+                    if waited >= max(3, settle_wait):
                         self._env._last_settled_step = cur_step
                     elif waited >= settle_wait:
                         self._env._last_dialogue_settled_step = cur_step
@@ -626,7 +626,7 @@ MOVE_OUT_OF_STEPS = -8
 LOCATION_FAIL_CODES = (MOVE_TARGET_NOT_FOUND, MOVE_TARGET_AMBIGUOUS, MOVE_BAD_LOCATION)
 MOVE_SETTLE_WAIT = 2
 MOVE_MAX_CUTSCENE_WAIT = 30
-MOVE_POST_MOTION_WAIT = 2
+MOVE_POST_MOTION_WAIT = 4
 MOVE_POST_WARP_BANNER_WAIT = 6
 
 GRID_DESCRIPTION = """The screen is a grid of cells. The player is at (0, 0). x increases to the right, from -4 at the left edge to 5 at the right edge. y increases upward, from 4 at the top edge to -4 at the bottom edge."""
@@ -2932,15 +2932,15 @@ DIALOGUE_LEFT_TO_BATTLE = 4
 DIALOGUE_NOT_IN_DIALOGUE = -1
 DIALOGUE_STUCK = -2
 
-DIALOGUE_SETTLE_WAIT = 2
+DIALOGUE_SETTLE_WAIT = 4
 DIALOGUE_MAX_CUTSCENE_WAIT = 30
-DIALOGUE_POST_MOTION_WAIT = 2
+DIALOGUE_POST_MOTION_WAIT = 4
 DIALOGUE_POST_WARP_BANNER_WAIT = 6
 DIALOGUE_FANFARE_RETRY_LIMIT = 4
 DIALOGUE_BUTTON_SETTLE_WAIT = 2
 DIALOGUE_TOP_BOX_PRESSES = 4
 DIALOGUE_TOP_BOX_SCROLL_WAITS = 3
-FREE_SETTLE_WAIT = 2
+FREE_SETTLE_WAIT = 4
 MENU_SETTLE_WAIT = 1
 
 LEFT_DIALOGUE_CODES = {
@@ -3008,7 +3008,7 @@ class _DialogueSettlingExecutor(PolicyExecutor):
             cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
             if cur_step is not None:
                 try:
-                    if waited >= 3:
+                    if waited >= max(3, settle_wait):
                         self._env._last_settled_step = cur_step
                     elif waited >= settle_wait:
                         self._env._last_dialogue_settled_step = cur_step

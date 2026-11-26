@@ -1630,7 +1630,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self,
         ticks: int = 2,
         max_cutscene_ticks: int = 30,
-        post_motion_ticks: int = 2,
+        post_motion_ticks: int = 4,
         post_warp_banner_ticks: int = 6,
     ) -> None:
         cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
