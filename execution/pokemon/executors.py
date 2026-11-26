@@ -18,8 +18,9 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_cutscene_frame_changing,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
                                                  is_move_selection_screen, is_overworld_pack_menu,
-                                                 is_pack_item_list_screen, is_pack_screen,
-                                                 is_party_menu_screen, is_same_battle_frame,
+                                                 is_pack_action_subbox_screen, is_pack_item_list_screen,
+                                                 is_pack_screen, is_party_menu_screen,
+                                                 is_party_menu_selection_screen, is_same_battle_frame,
                                                  is_start_menu_screen,
                                                  read_battle_hud_hp, read_party_menu_hp)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
@@ -122,6 +123,160 @@ INTERACT_MODAL_MAX_PRESSES = 8
 MAX_INTERACT_DIALOGUE_STEPS = 10
 
 
+def settle_overworld_menu_state(
+    *,
+    get_state_fn,
+    get_frame_fn,
+    is_done_fn,
+    step_wait_fn,
+    min_wait: int = 1,
+    settle_wait: int = 2,
+    max_cutscene_wait: int = INTERACT_MAX_CUTSCENE_WAIT,
+    post_motion_wait: int = INTERACT_POST_MOTION_WAIT,
+    require_waited_for_ready_check: bool = False,
+) -> AgentState:
+    """Shared overworld IN_MENU cutscene settling loop across executors and supervisor."""
+    state = get_state_fn()
+    waited = 0
+    post_motion_remaining = 0
+    while state == AgentState.IN_MENU and not is_done_fn() and waited < max_cutscene_wait:
+        frame = get_frame_fn()
+        ready = (
+            has_menu_cursor(frame)
+            or is_battle_screen(frame)
+            or (has_top_dialogue_box(frame) and not has_menu_cursor(frame))
+            or has_top_dialogue_box(frame)
+        )
+        if (not require_waited_for_ready_check or waited > 0) and ready:
+            break
+        if waited >= min_wait and post_motion_remaining <= 0:
+            if ready or waited >= settle_wait:
+                break
+        before_frame, after_frame = step_wait_fn()
+        waited += 1
+        state = get_state_fn()
+        if state != AgentState.IN_MENU or is_done_fn():
+            break
+        if has_menu_cursor(after_frame) or is_battle_screen(after_frame) or has_top_dialogue_box(after_frame):
+            break
+        if is_cutscene_frame_changing(before_frame, after_frame):
+            post_motion_remaining = post_motion_wait
+        elif post_motion_remaining > 0:
+            post_motion_remaining -= 1
+    return state
+
+
+def settle_overworld_free_roam(
+    *,
+    env,
+    get_state_fn,
+    get_frame_fn,
+    is_done_fn,
+    step_wait_fn,
+    settle_wait: int = 2,
+    max_cutscene_wait: int = INTERACT_MAX_CUTSCENE_WAIT,
+    post_motion_wait: int = INTERACT_POST_MOTION_WAIT,
+    post_warp_banner_wait: int = INTERACT_POST_WARP_BANNER_WAIT,
+    stop_on_overlay: bool = False,
+    include_top_box: bool = True,
+    record_dialogue_settled: bool = False,
+    respect_last_settled: bool = False,
+    settle_menu_fn=None,
+) -> Tuple[AgentState, int, bool]:
+    """Shared overworld FREE_ROAM cutscene and pre-battle settling state machine."""
+    state = get_state_fn()
+    cur_step = getattr(getattr(env, "_emulator", None), "step_count", None)
+    if respect_last_settled and state == AgentState.FREE_ROAM and cur_step is not None:
+        env_settled = getattr(env, "_last_settled_step", None)
+        if cur_step == env_settled:
+            before = get_frame_fn()
+            if not (
+                has_bottom_dialogue_box(before)
+                or has_emote_bubble(before)
+                or is_blank_or_fade_frame(before)
+                or (include_top_box and has_top_dialogue_box(before) and not has_menu_cursor(before))
+            ):
+                return state, 0, False
+        env_dialogue_settled = getattr(env, "_last_dialogue_settled_step", None)
+        if cur_step == env_dialogue_settled:
+            settle_wait = min(settle_wait, 1)
+
+    waited = 0
+    post_motion_remaining = 0
+    saw_fade = False
+    saw_activity = False
+
+    def _is_overlay(fr) -> bool:
+        return (
+            has_bottom_dialogue_box(fr)
+            or has_modal_preview_box(fr)
+            or (has_top_dialogue_box(fr) and not has_menu_cursor(fr))
+        )
+
+    while state == AgentState.FREE_ROAM and not is_done_fn() and waited < max_cutscene_wait:
+        frame = get_frame_fn()
+        if stop_on_overlay and waited > 0 and (_is_overlay(frame) or is_battle_screen(frame)):
+            break
+        fade_open = is_blank_or_fade_frame(frame)
+        if fade_open:
+            saw_fade = True
+        if stop_on_overlay:
+            box_open = has_emote_bubble(frame) or fade_open
+        else:
+            box_open = (
+                has_bottom_dialogue_box(frame)
+                or (include_top_box and has_top_dialogue_box(frame) and not has_menu_cursor(frame))
+                or has_emote_bubble(frame)
+                or fade_open
+            )
+        if box_open:
+            saw_activity = True
+        if waited >= settle_wait and not box_open and post_motion_remaining <= 0:
+            break
+        before_frame, after_frame = step_wait_fn()
+        waited += 1
+        state = get_state_fn()
+        if state != AgentState.FREE_ROAM or is_done_fn():
+            break
+        if stop_on_overlay and (_is_overlay(after_frame) or is_battle_screen(after_frame)):
+            break
+        fade_now = is_blank_or_fade_frame(before_frame) or is_blank_or_fade_frame(after_frame)
+        if fade_now:
+            saw_fade = True
+        active_now = (
+            is_cutscene_frame_changing(before_frame, after_frame)
+            or has_emote_bubble(after_frame)
+            or fade_now
+            or (not stop_on_overlay and has_bottom_dialogue_box(after_frame))
+            or (not stop_on_overlay and include_top_box and has_top_dialogue_box(after_frame) and not has_menu_cursor(after_frame))
+        )
+        if active_now:
+            saw_activity = True
+            if saw_fade and has_bottom_location_banner(after_frame):
+                post_motion_remaining = max(post_motion_remaining, post_warp_banner_wait)
+            else:
+                post_motion_remaining = max(post_motion_remaining, post_motion_wait)
+        elif post_motion_remaining > 0:
+            post_motion_remaining -= 1
+
+    if state == AgentState.IN_MENU and settle_menu_fn is not None and not is_done_fn():
+        state = settle_menu_fn()
+    if state == AgentState.FREE_ROAM and not is_done_fn():
+        end_step = getattr(getattr(env, "_emulator", None), "step_count", None)
+        if end_step is not None:
+            try:
+                if record_dialogue_settled:
+                    if waited > settle_wait:
+                        env._last_settled_step = end_step
+                    elif waited >= settle_wait:
+                        env._last_dialogue_settled_step = end_step
+                else:
+                    env._last_settled_step = end_step
+            except Exception:  # noqa: BLE001
+                pass
+    return state, waited, saw_activity
+
+
 class InteractionExecutor(PolicyExecutor):
     CARDINAL_DIRECTIONS = {cell: name for name, cell in CheckInteractionAction.cardinals.items()}
     MAX_ALIGN_STEPS = 10
@@ -153,86 +308,38 @@ class InteractionExecutor(PolicyExecutor):
                 or has_modal_preview_box(frame)
                 or (has_top_dialogue_box(frame) and not has_menu_cursor(frame)))
 
+    def _step_wait_record(self, records: List[EnvironmentStepRecord]) -> Tuple[np.ndarray, np.ndarray]:
+        wait_record = self._take_action(WaitAction)
+        records.append(wait_record)
+        return wait_record.frame_before, wait_record.frame_after
+
     def _wait_for_interaction(self, records: List[EnvironmentStepRecord], settle_wait: int = INTERACT_SETTLE_WAIT):
-        state = self._agent_state()
-        waited = 0
-        post_motion_remaining = 0
-        saw_fade = False
-        while (state == AgentState.FREE_ROAM
-               and not (self._last_terminated or self._last_truncated)
-               and waited < INTERACT_MAX_CUTSCENE_WAIT):
-            frame = self._current_frame()
-            if waited > 0 and (self._has_interaction_overlay(frame) or is_battle_screen(frame)):
-                break
-            fade_open = is_blank_or_fade_frame(frame)
-            if fade_open:
-                saw_fade = True
-            emote_open = has_emote_bubble(frame) or fade_open
-            if waited >= settle_wait and not emote_open and post_motion_remaining <= 0:
-                break
-            wait_record = self._take_action(WaitAction)
-            records.append(wait_record)
-            waited += 1
-            state = self._agent_state()
-            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
-                break
-            if (self._has_interaction_overlay(wait_record.frame_after)
-                    or is_battle_screen(wait_record.frame_after)):
-                break
-            fade_now = is_blank_or_fade_frame(wait_record.frame_before) or is_blank_or_fade_frame(wait_record.frame_after)
-            if fade_now:
-                saw_fade = True
-            if (is_cutscene_frame_changing(wait_record.frame_before, wait_record.frame_after)
-                    or has_emote_bubble(wait_record.frame_after)
-                    or fade_now):
-                if saw_fade and has_bottom_location_banner(wait_record.frame_after):
-                    post_motion_remaining = max(post_motion_remaining, INTERACT_POST_WARP_BANNER_WAIT)
-                else:
-                    post_motion_remaining = max(post_motion_remaining, INTERACT_POST_MOTION_WAIT)
-            elif post_motion_remaining > 0:
-                post_motion_remaining -= 1
-        if state == AgentState.FREE_ROAM and not (self._last_terminated or self._last_truncated):
-            cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
-            if cur_step is not None:
-                try:
-                    if waited > settle_wait:
-                        self._env._last_settled_step = cur_step
-                    elif waited >= settle_wait:
-                        self._env._last_dialogue_settled_step = cur_step
-                except Exception:  # noqa: BLE001
-                    pass
+        state, _, _ = settle_overworld_free_roam(
+            env=self._env,
+            get_state_fn=self._agent_state,
+            get_frame_fn=self._current_frame,
+            is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
+            step_wait_fn=lambda: self._step_wait_record(records),
+            settle_wait=settle_wait,
+            max_cutscene_wait=INTERACT_MAX_CUTSCENE_WAIT,
+            post_motion_wait=INTERACT_POST_MOTION_WAIT,
+            post_warp_banner_wait=INTERACT_POST_WARP_BANNER_WAIT,
+            stop_on_overlay=True,
+            record_dialogue_settled=True,
+        )
         return state
 
     def _settle_interaction_menu_state(self, records: List[EnvironmentStepRecord]):
-        state = self._agent_state()
-        waited = 0
-        post_motion_remaining = 0
-        while (state == AgentState.IN_MENU
-               and not (self._last_terminated or self._last_truncated)
-               and waited < INTERACT_MAX_CUTSCENE_WAIT):
-            frame = self._current_frame()
-            if has_menu_cursor(frame) or is_battle_screen(frame) or has_top_dialogue_box(frame):
-                break
-            if waited >= MENU_SETTLE_WAIT and post_motion_remaining <= 0:
-                if (has_menu_cursor(frame)
-                        or is_battle_screen(frame)
-                        or has_top_dialogue_box(frame)
-                        or waited >= INTERACT_POST_DIALOGUE_SETTLE_WAIT):
-                    break
-            wait_record = self._take_action(WaitAction)
-            records.append(wait_record)
-            waited += 1
-            state = self._agent_state()
-            if state != AgentState.IN_MENU or self._last_terminated or self._last_truncated:
-                break
-            after = wait_record.frame_after
-            if has_menu_cursor(after) or is_battle_screen(after) or has_top_dialogue_box(after):
-                break
-            if is_cutscene_frame_changing(wait_record.frame_before, after):
-                post_motion_remaining = INTERACT_POST_MOTION_WAIT
-            elif post_motion_remaining > 0:
-                post_motion_remaining -= 1
-        return state
+        return settle_overworld_menu_state(
+            get_state_fn=self._agent_state,
+            get_frame_fn=self._current_frame,
+            is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
+            step_wait_fn=lambda: self._step_wait_record(records),
+            min_wait=MENU_SETTLE_WAIT,
+            settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT,
+            max_cutscene_wait=INTERACT_MAX_CUTSCENE_WAIT,
+            post_motion_wait=INTERACT_POST_MOTION_WAIT,
+        )
 
     def _advance_interaction_overlay(self, records: List[EnvironmentStepRecord]):
         state = self._agent_state()
@@ -750,82 +857,40 @@ class GridMoveExecutor(PolicyExecutor):
         self.cell_kinds = kinds
         return True
 
+    def _step_wait_with_crops(self) -> Tuple[np.ndarray, np.ndarray]:
+        wait_record = self._take_action(WaitAction)
+        drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
+        return wait_record.frame_before, wait_record.frame_after
+
     def _settle_free_roam(self):
-        state = self._get_state()["pokemon_core"]["agent_state"]
-        self._saw_cutscene_activity = False
-        waited = 0
-        post_motion_remaining = 0
-        saw_fade = False
-        while (state == AgentState.FREE_ROAM
-               and not (self._last_terminated or self._last_truncated)
-               and waited < MOVE_MAX_CUTSCENE_WAIT):
-            frame = self._get_state()["core"]["current_frame"]
-            fade_open = is_blank_or_fade_frame(frame)
-            if fade_open:
-                saw_fade = True
-            box_open = has_bottom_dialogue_box(frame) or has_emote_bubble(frame) or fade_open
-            if box_open:
-                self._saw_cutscene_activity = True
-            if waited >= MOVE_SETTLE_WAIT and not box_open and post_motion_remaining <= 0:
-                break
-            wait_record = self._take_action(WaitAction)
-            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
-            waited += 1
-            state = self._get_state()["pokemon_core"]["agent_state"]
-            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
-                break
-            fade_now = is_blank_or_fade_frame(wait_record.frame_before) or is_blank_or_fade_frame(wait_record.frame_after)
-            if fade_now:
-                saw_fade = True
-            if (is_cutscene_frame_changing(wait_record.frame_before, wait_record.frame_after)
-                    or has_bottom_dialogue_box(wait_record.frame_after)
-                    or has_emote_bubble(wait_record.frame_after)
-                    or fade_now):
-                self._saw_cutscene_activity = True
-                if saw_fade and has_bottom_location_banner(wait_record.frame_after):
-                    post_motion_remaining = max(post_motion_remaining, MOVE_POST_WARP_BANNER_WAIT)
-                else:
-                    post_motion_remaining = max(post_motion_remaining, MOVE_POST_MOTION_WAIT)
-            elif post_motion_remaining > 0:
-                post_motion_remaining -= 1
-        if state == AgentState.IN_MENU:
-            state = self._settle_menu_state()
-        if state == AgentState.FREE_ROAM and not (self._last_terminated or self._last_truncated):
-            cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
-            if cur_step is not None:
-                try:
-                    self._env._last_settled_step = cur_step
-                except Exception:  # noqa: BLE001
-                    pass
+        state, _, saw_activity = settle_overworld_free_roam(
+            env=self._env,
+            get_state_fn=lambda: self._get_state()["pokemon_core"]["agent_state"],
+            get_frame_fn=lambda: self._get_state()["core"]["current_frame"],
+            is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
+            step_wait_fn=self._step_wait_with_crops,
+            settle_wait=MOVE_SETTLE_WAIT,
+            max_cutscene_wait=MOVE_MAX_CUTSCENE_WAIT,
+            post_motion_wait=MOVE_POST_MOTION_WAIT,
+            post_warp_banner_wait=MOVE_POST_WARP_BANNER_WAIT,
+            include_top_box=False,
+            record_dialogue_settled=False,
+            settle_menu_fn=self._settle_menu_state,
+        )
+        self._saw_cutscene_activity = saw_activity
         return state
 
     def _settle_menu_state(self):
-        state = self._get_state()["pokemon_core"]["agent_state"]
-        waited = 0
-        post_motion_remaining = 0
-        while (state == AgentState.IN_MENU
-               and not (self._last_terminated or self._last_truncated)
-               and waited < MOVE_MAX_CUTSCENE_WAIT):
-            frame = self._get_state()["core"]["current_frame"]
-            if has_menu_cursor(frame) or is_battle_screen(frame) or has_top_dialogue_box(frame):
-                break
-            if waited >= MENU_SETTLE_WAIT and post_motion_remaining <= 0:
-                if waited >= MOVE_SETTLE_WAIT:
-                    break
-            wait_record = self._take_action(WaitAction)
-            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
-            waited += 1
-            state = self._get_state()["pokemon_core"]["agent_state"]
-            if state != AgentState.IN_MENU or self._last_terminated or self._last_truncated:
-                break
-            after = wait_record.frame_after
-            if has_menu_cursor(after) or is_battle_screen(after) or has_top_dialogue_box(after):
-                break
-            if is_cutscene_frame_changing(wait_record.frame_before, after):
-                post_motion_remaining = MOVE_POST_MOTION_WAIT
-            elif post_motion_remaining > 0:
-                post_motion_remaining -= 1
-        return state
+        return settle_overworld_menu_state(
+            get_state_fn=lambda: self._get_state()["pokemon_core"]["agent_state"],
+            get_frame_fn=lambda: self._get_state()["core"]["current_frame"],
+            is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
+            step_wait_fn=self._step_wait_with_crops,
+            min_wait=MENU_SETTLE_WAIT,
+            settle_wait=MOVE_SETTLE_WAIT,
+            max_cutscene_wait=MOVE_MAX_CUTSCENE_WAIT,
+            post_motion_wait=MOVE_POST_MOTION_WAIT,
+        )
 
     def _check_post_settle_interruption(self, state: AgentState, context: str) -> Optional[int]:
         frame = self._get_state()["core"]["current_frame"]
@@ -1934,6 +1999,10 @@ Move: <1, 2, 3 or 4>
 The image is the current screen.
 [HISTORY]
 Choose the single button press that best moves towards completing this menu or choice box so the battle can continue (or press back to cancel and return to the battle menu if nothing is needed here).
+If you opened the bag/pack to heal your active Pokemon:
+- Check your active Pokemon's current/max HP and missing HP shown below: when your active Pokemon is missing 30 or more HP and a stronger healing item (such as one restoring 50 HP instead of 20 HP) is listed in the bag, move the cursor to the stronger healing item and press confirm so you recover enough HP to survive the opponent's next hit in one turn.
+- Once the 2-option USE / QUIT action box opens on the healing item, press confirm on USE.
+- Once the party selection screen opens, move the cursor to the Pokemon that needs healing (usually your active lead Pokemon at the top) and press confirm to use the item on it.
 If a move-learning prompt asks whether to delete/forget an older move to make room for a new move:
 - To learn the new move: select YES (press confirm when the cursor is on YES), then move the cursor to the weakest or least useful move in the move list and press confirm to forget it.
 - To skip learning the new move: select NO (press back) on deleting an older move, and then when asked whether to stop/abandon learning the move, select YES (press confirm while the cursor is on YES). Never press back or select NO on both prompts, as that repeats the move-learning question in an endless loop.
@@ -1968,6 +2037,8 @@ Press: <one of up, down, left, right, confirm, back>
         self._exited_to_free_roam: bool = False
         self._bag_unavailable: bool = False
         self._in_bag_menu: bool = False
+        self._in_pokemon_menu: bool = False
+        self._party_effect_pending: bool = False
         self._saw_battle_state: bool = False
         self._battle_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self.battle_lost: bool = False
@@ -1993,7 +2064,16 @@ Press: <one of up, down, left, right, confirm, back>
         "back": LowLevelActions.PRESS_BUTTON_B,
     }
 
+    def _is_in_battle_sub_screen(self, frame: np.ndarray) -> bool:
+        if is_pack_item_list_screen(frame) or is_pack_action_subbox_screen(frame):
+            return bool(self._in_bag_menu or self._saw_battle_state)
+        if is_party_menu_selection_screen(frame) and not self._party_effect_pending:
+            return bool(self._in_bag_menu or self._in_pokemon_menu or self._saw_battle_state)
+        return False
+
     def _has_battle_menu_cursor(self, frame: np.ndarray) -> bool:
+        if self._is_in_battle_sub_screen(frame):
+            return True
         if is_pack_item_list_screen(frame):
             return bool(self._in_bag_menu or not self._saw_battle_state)
         return has_menu_cursor(frame)
@@ -2024,7 +2104,10 @@ Press: <one of up, down, left, right, confirm, back>
     def _non_battle_menu_outcome(self, frame: np.ndarray) -> Optional[AgentState]:
         if effective_agent_state(AgentState.IN_MENU, frame) == AgentState.IN_DIALOGUE:
             return AgentState.IN_DIALOGUE
-        if is_start_menu_screen(frame) or (not self._in_bag_menu and is_overworld_pack_menu(frame)):
+        if is_start_menu_screen(frame) or (
+            not (self._in_bag_menu or self._in_pokemon_menu or self._saw_battle_state)
+            and is_overworld_pack_menu(frame)
+        ):
             return AgentState.IN_MENU
         if not self._saw_battle_state and (
             is_party_menu_screen(frame) or is_pack_screen(frame) or has_menu_cursor(frame)
@@ -2138,7 +2221,26 @@ Press: <one of up, down, left, right, confirm, back>
                 continue
             if state == AgentState.IN_MENU:
                 if self._non_battle_menu_outcome(frame) is not None or self._has_battle_menu_cursor(frame):
+                    self._party_effect_pending = False
                     break
+                if self._party_effect_pending and is_party_menu_screen(frame) and not has_bottom_dialogue_box(frame):
+                    wait_rec = self._take_action(WaitAction)
+                    records.append(wait_rec)
+                    turn_steps += 1
+                    if is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                        idle_steps += 1
+                        if idle_steps >= 2:
+                            self._party_effect_pending = False
+                    else:
+                        idle_steps = 0
+                    continue
+                if self._party_effect_pending and is_party_menu_screen(frame) and has_bottom_dialogue_box(frame):
+                    wait_rec = self._take_action(WaitAction)
+                    records.append(wait_rec)
+                    turn_steps += 1
+                    if not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                        idle_steps = 0
+                        continue
                 in_battle_intro = (
                     is_battle_screen(frame)
                     or is_party_menu_screen(frame)
@@ -2191,14 +2293,26 @@ Press: <one of up, down, left, right, confirm, back>
         return (", then " + " and ".join(parts)) if parts else ""
 
     def _history_block(self) -> str:
-        if not self.history and not self._bag_unavailable:
-            return ""
         lines = list(self.history)
+        cur_frame = self._current_frame()
+        live_hp = (
+            read_party_menu_hp(cur_frame)
+            or read_battle_hud_hp(cur_frame)
+            or self._last_seen_player_hp()
+        )
+        if live_hp is not None:
+            cur_hp, max_hp = live_hp
+            deficit = max(0, max_hp - cur_hp)
+            lines.append(
+                f"Active Pokemon HP: {cur_hp}/{max_hp} HP (missing {deficit} HP)."
+            )
         if self._bag_unavailable:
             lines.append(
                 "Note: You already checked the bag in this battle and had no usable item — "
                 "do NOT choose bag again; choose fight instead."
             )
+        if not lines:
+            return ""
         return "\nWhat has happened in this battle so far:\n" + "\n".join(lines) + "\n"
 
     def _instructions_block(self) -> str:
@@ -2233,7 +2347,7 @@ Press: <one of up, down, left, right, confirm, back>
         for step in self.report.steps:
             if isinstance(step, EnvironmentStepRecord):
                 for frame in (step.frame_before, step.frame_after):
-                    found_hud = read_battle_hud_hp(frame)
+                    found_hud = read_battle_hud_hp(frame) or read_party_menu_hp(frame)
                     if found_hud is not None:
                         last_hud = found_hud
         if last_hud is not None:
@@ -2315,12 +2429,25 @@ Press: <one of up, down, left, right, confirm, back>
         self.battle_lost = False
         self._battle_place = self._current_map_place()
         init_state = self._agent_state()
-        self._saw_battle_state = init_state == AgentState.IN_BATTLE
-        if init_state != AgentState.IN_BATTLE and not is_battle_screen(self._current_frame()):
+        init_frame = self._current_frame()
+        if init_state == AgentState.IN_MENU and (is_pack_screen(init_frame) or is_party_menu_screen(init_frame)):
+            if not is_overworld_pack_menu(init_frame):
+                self._saw_battle_state = True
+                if is_pack_screen(init_frame):
+                    self._in_bag_menu = True
+                elif is_party_menu_screen(init_frame):
+                    self._in_pokemon_menu = True
+        else:
+            self._saw_battle_state = init_state == AgentState.IN_BATTLE
+        if (
+            init_state != AgentState.IN_BATTLE
+            and not is_battle_screen(init_frame)
+            and not self._is_in_battle_sub_screen(init_frame)
+        ):
             return self._fail(BATTLE_NOT_IN_BATTLE, "not_in_battle",
                               f"The player is {init_state.name.lower()}, not in a battle.")
 
-        if not is_battle_decision_screen(self._current_frame()):
+        if not is_battle_decision_screen(self._current_frame()) and not self._has_battle_menu_cursor(self._current_frame()):
             self._begin_scripted("advance through opening battle text")
             intro_records: List[EnvironmentStepRecord] = []
             presses, dismisses = self._advance_until_decision(intro_records)
@@ -2471,11 +2598,20 @@ Press: <one of up, down, left, right, confirm, back>
                         return self._fail(BATTLE_UNREADABLE, "action_unreadable", output)
                     continue
                 consecutive_invalid = 0
+                was_party_selection = is_party_menu_selection_screen(frame)
                 record = self._take_battle_menu_press(press)
                 if self._last_terminated:
                     return self._fail(BATTLE_TERMINATED, "terminated")
                 if self._last_truncated:
                     return self._fail(BATTLE_TRUNCATED, "truncated")
+                after_press_frame = self._current_frame()
+                if (
+                    press == "confirm"
+                    and was_party_selection
+                    and is_party_menu_screen(after_press_frame)
+                    and not has_menu_cursor(after_press_frame)
+                ):
+                    self._party_effect_pending = True
                 turn_records = [record]
                 entry = f"- step {step + 1}: pressed {press} in battle menu"
                 if record.action_success == -1:
@@ -2486,13 +2622,14 @@ Press: <one of up, down, left, right, confirm, back>
                 presses, dismisses = 0, 0
                 if (
                     self._agent_state() != AgentState.IN_MENU
-                    or not self._has_battle_menu_cursor(self._current_frame())
+                    or not self._has_battle_menu_cursor(after_press_frame)
                 ):
                     presses, dismisses = self._advance_until_decision(turn_records)
                     if self._last_terminated:
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
+                    self._party_effect_pending = False
                     if self._in_bag_menu and (
                         self._agent_state() != AgentState.IN_MENU
                         or is_battle_command_menu(self._current_frame())
@@ -2503,6 +2640,11 @@ Press: <one of up, down, left, right, confirm, back>
                                 and is_battle_decision_screen(self._current_frame())):
                             self._bag_unavailable = True
                             entry += " (closed the bag without using an item; do not choose bag again)"
+                    if self._in_pokemon_menu and (
+                        self._agent_state() != AgentState.IN_MENU
+                        or is_battle_command_menu(self._current_frame())
+                    ):
+                        self._in_pokemon_menu = False
                 entry += self._format_auto_suffix(presses, dismisses)
                 texts = self._read_new_text(turn_records, new_turn=True)
                 if texts:
@@ -2615,6 +2757,8 @@ Press: <one of up, down, left, right, confirm, back>
                     elif self._agent_state() == AgentState.IN_MENU:
                         self._in_bag_menu = True
 
+                elif option == "pokemon" and record.action_success != -1 and self._agent_state() == AgentState.IN_MENU:
+                    self._in_pokemon_menu = True
                 if option == "fight":
                     attack = None
                     if record.action_success == 0:
@@ -3037,83 +3181,39 @@ class _DialogueSettlingExecutor(PolicyExecutor):
         frame = self._current_frame() if frame is None else frame
         return effective_agent_state(raw, frame)
 
+    def _step_wait_with_crops(self) -> Tuple[np.ndarray, np.ndarray]:
+        wait_record = self._take_action(WaitAction)
+        drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
+        return wait_record.frame_before, wait_record.frame_after
+
     def _wait_for_next_box(self, settle_wait: int = DIALOGUE_SETTLE_WAIT):
-        state = self._agent_state()
-        waited = 0
-        post_motion_remaining = 0
-        saw_fade = False
-        while (state == AgentState.FREE_ROAM
-               and not (self._last_terminated or self._last_truncated)
-               and waited < DIALOGUE_MAX_CUTSCENE_WAIT):
-            frame = self._current_frame()
-            fade_open = is_blank_or_fade_frame(frame)
-            if fade_open:
-                saw_fade = True
-            box_open = (has_bottom_dialogue_box(frame)
-                        or self._is_top_box_dialogue(frame)
-                        or has_emote_bubble(frame)
-                        or fade_open)
-            if waited >= settle_wait and not box_open and post_motion_remaining <= 0:
-                break
-            wait_record = self._take_action(WaitAction)
-            waited += 1
-            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
-            state = self._agent_state()
-            if state != AgentState.FREE_ROAM or self._last_terminated or self._last_truncated:
-                break
-            fade_now = is_blank_or_fade_frame(wait_record.frame_before) or is_blank_or_fade_frame(wait_record.frame_after)
-            if fade_now:
-                saw_fade = True
-            if (is_cutscene_frame_changing(wait_record.frame_before, wait_record.frame_after)
-                    or has_bottom_dialogue_box(wait_record.frame_after)
-                    or self._is_top_box_dialogue(wait_record.frame_after)
-                    or has_emote_bubble(wait_record.frame_after)
-                    or fade_now):
-                if saw_fade and has_bottom_location_banner(wait_record.frame_after):
-                    post_motion_remaining = max(post_motion_remaining, DIALOGUE_POST_WARP_BANNER_WAIT)
-                else:
-                    post_motion_remaining = max(post_motion_remaining, DIALOGUE_POST_MOTION_WAIT)
-            elif post_motion_remaining > 0:
-                post_motion_remaining -= 1
-        if state == AgentState.FREE_ROAM and not (self._last_terminated or self._last_truncated):
-            cur_step = getattr(getattr(self._env, "_emulator", None), "step_count", None)
-            if cur_step is not None:
-                try:
-                    if waited > settle_wait:
-                        self._env._last_settled_step = cur_step
-                    elif waited >= settle_wait:
-                        self._env._last_dialogue_settled_step = cur_step
-                except Exception:  # noqa: BLE001
-                    pass
+        state, _, _ = settle_overworld_free_roam(
+            env=self._env,
+            get_state_fn=self._agent_state,
+            get_frame_fn=self._current_frame,
+            is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
+            step_wait_fn=self._step_wait_with_crops,
+            settle_wait=settle_wait,
+            max_cutscene_wait=DIALOGUE_MAX_CUTSCENE_WAIT,
+            post_motion_wait=DIALOGUE_POST_MOTION_WAIT,
+            post_warp_banner_wait=DIALOGUE_POST_WARP_BANNER_WAIT,
+            include_top_box=True,
+            record_dialogue_settled=True,
+        )
         return state
 
     def _settle_state(self):
-        state = self._agent_state()
-        waited = 0
-        post_motion_remaining = 0
-        while (state == AgentState.IN_MENU
-               and not (self._last_terminated or self._last_truncated)
-               and waited < DIALOGUE_MAX_CUTSCENE_WAIT):
-            frame = self._current_frame()
-            if waited > 0 and (has_menu_cursor(frame) or is_battle_screen(frame) or self._is_top_box_dialogue(frame)):
-                break
-            if waited >= MENU_SETTLE_WAIT and post_motion_remaining <= 0:
-                if has_menu_cursor(frame) or is_battle_screen(frame) or self._is_top_box_dialogue(frame) or waited >= DIALOGUE_SETTLE_WAIT:
-                    break
-            wait_record = self._take_action(WaitAction)
-            waited += 1
-            drop_prefix_crops(captured_dialogue_crops([wait_record]), self.dialogue_crops)
-            state = self._agent_state()
-            if state != AgentState.IN_MENU or self._last_terminated or self._last_truncated:
-                break
-            after = wait_record.frame_after
-            if has_menu_cursor(after) or is_battle_screen(after) or self._is_top_box_dialogue(after):
-                break
-            if is_cutscene_frame_changing(wait_record.frame_before, after):
-                post_motion_remaining = DIALOGUE_POST_MOTION_WAIT
-            elif post_motion_remaining > 0:
-                post_motion_remaining -= 1
-        return state
+        return settle_overworld_menu_state(
+            get_state_fn=self._agent_state,
+            get_frame_fn=self._current_frame,
+            is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
+            step_wait_fn=self._step_wait_with_crops,
+            min_wait=MENU_SETTLE_WAIT,
+            settle_wait=DIALOGUE_SETTLE_WAIT,
+            max_cutscene_wait=DIALOGUE_MAX_CUTSCENE_WAIT,
+            post_motion_wait=DIALOGUE_POST_MOTION_WAIT,
+            require_waited_for_ready_check=True,
+        )
 
     def _settle_after_step(self, settle_wait: int = DIALOGUE_SETTLE_WAIT):
         state = self._agent_state()

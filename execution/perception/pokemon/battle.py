@@ -532,6 +532,16 @@ def is_party_menu_screen(frame: np.ndarray) -> bool:
     return False
 
 
+def is_party_menu_selection_screen(frame: np.ndarray) -> bool:
+    """Return True if the party menu screen is waiting for a Pokemon target or action selection rather than displaying an effect dialogue box."""
+    if not is_party_menu_screen(frame):
+        return False
+    img = _grey_frame(frame)
+    if has_menu_cursor(img):
+        return True
+    return not has_bottom_dialogue_box(img)
+
+
 def is_pack_screen(frame: np.ndarray) -> bool:
     """Return True if the screen shows the Generation 2 Pack screen (with or without an open sub-box)."""
     if frame is None:
@@ -554,15 +564,36 @@ def is_pack_screen(frame: np.ndarray) -> bool:
     return True
 
 
-def _max_pack_action_box_border_tiles(img: np.ndarray) -> int:
-    """Return the maximum vertical border tile count across the Pack action sub-box columns."""
-    return max(
-        sum(
-            is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
-            for ty in range(3, 12)
-        )
-        for tx in range(10, 16)
-    )
+def pack_action_box_height(frame: np.ndarray) -> int:
+    """Return the vertical tile height of an enclosed Pack action sub-box, or 0 if none is open."""
+    if frame is None:
+        return 0
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return 0
+    max_h = 0
+    for left_tx in range(10, 16):
+        span_end = min(19, left_tx + 5)
+        if span_end <= left_tx + 2:
+            continue
+        for top_ty in range(3, 10):
+            if not all(
+                is_horizontal_border_tile(img[top_ty * TILE_SIZE:(top_ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+                for tx in range(left_tx + 1, span_end)
+            ):
+                continue
+            for bot_ty in range(top_ty + 3, 12):
+                if not all(
+                    is_horizontal_border_tile(img[bot_ty * TILE_SIZE:(bot_ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+                    for tx in range(left_tx + 1, span_end)
+                ):
+                    continue
+                if all(
+                    is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, left_tx * TILE_SIZE:(left_tx + 1) * TILE_SIZE])
+                    for ty in range(top_ty + 1, bot_ty)
+                ):
+                    max_h = max(max_h, bot_ty - top_ty + 1)
+    return max_h
 
 
 def is_pack_item_list_screen(frame: np.ndarray) -> bool:
@@ -570,11 +601,21 @@ def is_pack_item_list_screen(frame: np.ndarray) -> bool:
     if not is_pack_screen(frame):
         return False
     img = _grey_frame(frame)
-    if _max_pack_action_box_border_tiles(img) >= 4:
+    if pack_action_box_height(img) >= 4:
         return False
     if has_quantity_selector_box(img):
         return False
     return True
+
+
+def is_pack_action_subbox_screen(frame: np.ndarray) -> bool:
+    """Return True if a Generation 2 Pack screen has a 2-option in-battle USE/QUIT action sub-box open."""
+    if not is_pack_screen(frame):
+        return False
+    img = _grey_frame(frame)
+    if has_quantity_selector_box(img):
+        return False
+    return 4 <= pack_action_box_height(img) <= 5
 
 
 def is_overworld_pack_menu(frame: np.ndarray) -> bool:
@@ -584,7 +625,7 @@ def is_overworld_pack_menu(frame: np.ndarray) -> bool:
     img = _grey_frame(frame)
     if has_quantity_selector_box(img):
         return True
-    return _max_pack_action_box_border_tiles(img) >= 6
+    return pack_action_box_height(img) >= 6
 
 
 def is_start_menu_screen(frame: np.ndarray) -> bool:
