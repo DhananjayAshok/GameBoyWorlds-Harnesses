@@ -1523,11 +1523,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return earlier
 
     def _handle_interruption(self, *, dialogue_task: str = "clear the dialogue that interrupted what the player was doing",
-                             initial_dialogue_crops: Optional[List[Any]] = None) -> Tuple[str, Dict[str, Any]]:
+                             initial_dialogue_crops: Optional[List[Any]] = None,
+                             initial_battle_instructions: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         states_seen: List[str] = []
         combined: Optional[Dict[str, Any]] = None
         pending_crops = list(initial_dialogue_crops) if initial_dialogue_crops else None
         pre_battle_dialogue: Optional[str] = None
+        active_battle_instructions: Optional[str] = initial_battle_instructions
         for step_idx in range(self.MAX_INTERRUPTION_CHAIN):
             if self._env_done() or self._battles_lost() or self._total_calls >= self._max_total_calls:
                 break
@@ -1563,6 +1565,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     if is_wild_flee
                     else self._battle_instructions(frame)
                 )
+                active_battle_instructions = instructions
                 handled = self._combat(
                     instructions,
                     counted=False,
@@ -1571,8 +1574,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 )
                 pending_crops = None
             elif state == AgentState.IN_MENU:
-                objective, is_start_menu = self._menu_objective(
-                    "deal with the menu that opened while the player was doing something else", frame)
+                from_battle_menu = bool(
+                    active_battle_instructions
+                    and (combined is None or combined.get("reason") == "left_battle_to_menu")
+                )
+                if from_battle_menu:
+                    hp_line = self._party_hp_block()
+                    hp_context = f" ({hp_line})" if hp_line else ""
+                    menu_instruction = (
+                        f"complete the in-battle menu action for the ongoing battle "
+                        f"(active battle instructions: \"{active_battle_instructions}\"){hp_context}"
+                    )
+                else:
+                    menu_instruction = "deal with the menu that opened while the player was doing something else"
+                objective, is_start_menu = self._menu_objective(menu_instruction, frame)
                 handled = self.call_executor("menu", objective, is_start_menu=is_start_menu, counted=False)
                 pending_crops = None
             else:
@@ -1969,7 +1984,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if is_move_action and self._calls > 0:
                     self._calls -= 1
                 seed_crops = getattr(self.last_executor, "dialogue_crops", None) if is_move_action else None
-                state, handled = self._handle_interruption(initial_dialogue_crops=seed_crops)
+                seed_battle_instructions = task if (action == "Battle" and result.get("reason") == "left_battle_to_menu") else None
+                state, handled = self._handle_interruption(
+                    initial_dialogue_crops=seed_crops,
+                    initial_battle_instructions=seed_battle_instructions,
+                )
                 if leg_initial_state is not None:
                     handled["report"].initial_state = leg_initial_state
                 after_place = self._record_map_stop()
