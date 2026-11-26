@@ -1194,6 +1194,7 @@ Candidates: <if Ambiguous, each candidate with its coordinates and what sets it 
 class OffScreenMoveExecutor(GridMoveExecutor):
     LOCATE_TAG = "locate_edge"
     MAX_DETERMINISTIC_CORRIDOR_WIDTH = 3
+    MAX_EDGE_ALIGNMENT_SHIFT = 2
 
     def _at_exterior_boundary(self, direction: str) -> bool:
         from execution.perception.pokemon.grid import split_grid
@@ -1297,6 +1298,50 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         avoid_warps = None if self._task_targets_warp() else warp_cells(identified=identified, global_map=gmap)
         return self._can_step_from_cell_in_kinds(kinds, (0, 0), direction, avoid_warps=avoid_warps)
 
+    def _at_front_target(
+        self,
+        direction: str,
+        kinds: Optional[Dict[Tuple[int, int], str]] = None,
+        identified: Optional[Dict[Any, Any]] = None,
+    ) -> bool:
+        from execution.perception.pokemon.navigation import (
+            FRONT_TARGET_TAGS,
+            QUARTERS,
+            _is_npc_target_cell,
+            has_offscreen_front_target,
+        )
+
+        gmap = getattr(self._env, "_map", None)
+        if has_offscreen_front_target(gmap, (0, 0), direction):
+            return True
+        if kinds is None and identified is None:
+            kinds, identified = self._live_perception()
+        people = self._people_now()
+        dx, dy = DIRECTIONS[direction]
+        first = (dx, dy)
+        second = (2 * dx, 2 * dy)
+        if _is_npc_target_cell(first, identified, people):
+            return True
+        if kinds is not None and kinds.get(first) == BLOCKED and _is_npc_target_cell(second, identified, people):
+            return True
+        if identified is not None:
+            first_tags = {
+                getattr(identified.get((first[0], first[1], q)), "tag", None)
+                for q in QUARTERS
+                if (first[0], first[1], q) in identified
+            }
+            if first_tags & FRONT_TARGET_TAGS:
+                return True
+            if kinds is not None and kinds.get(first) == BLOCKED:
+                second_tags = {
+                    getattr(identified.get((second[0], second[1], q)), "tag", None)
+                    for q in QUARTERS
+                    if (second[0], second[1], q) in identified
+                }
+                if second_tags & FRONT_TARGET_TAGS:
+                    return True
+        return False
+
     def _sidestep_targets_at_edge(
         self,
         target: Tuple[int, int],
@@ -1306,15 +1351,21 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         kinds, identified = self._live_perception()
         if kinds is None:
             return []
+        if self._steps_taken > 0 and self._at_front_target(direction, kinds=kinds, identified=identified):
+            return []
         gmap = getattr(self._env, "_map", None)
         avoid_warps = set() if self._task_targets_warp() else warp_cells(identified=identified, global_map=gmap)
         avoided_set = {c for c in parse_avoided_cells(self._task) if in_bounds(c)}
+        explicit_coords = {c for c in parse_all_cells(self._task) if in_bounds(c)}
+        limit_shift = self._steps_taken > 0 and target in explicit_coords
         axis = 0 if direction in ("up", "down") else 1
         candidates = []
         for cell in target_run:
             if cell == target or cell in avoided_set:
                 continue
             rel = (cell[0] - target[0], cell[1] - target[1])
+            if limit_shift and abs(rel[axis]) > self.MAX_EDGE_ALIGNMENT_SHIFT:
+                continue
             if not in_bounds(rel) or kinds.get(rel) != WALKABLE or rel in avoid_warps:
                 continue
             if self._can_step_from_cell_in_kinds(kinds, rel, direction, avoid_warps=avoid_warps) is not True:
@@ -1430,19 +1481,31 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         unroofed_open_exists = any(not _is_ledge_trap_cell(oc) for oc in open_cells)
         task_allows_ledge = bool(re.search(r"\b(?:ledge|jump)\b", self._task, re.IGNORECASE))
 
-        from execution.perception.pokemon.navigation import has_offscreen_continuation
+        from execution.perception.pokemon.navigation import (
+            has_offscreen_continuation,
+            has_offscreen_front_target,
+        )
 
         on_edge_coords = [c for c in coords if c in cells]
         if on_edge_coords:
             preferred = [c for c in on_edge_coords if c in open_cells]
+            front_targets = [c for c in on_edge_coords if has_offscreen_front_target(gmap, c, direction)]
+            if not preferred and front_targets:
+                preferred = front_targets
             if not preferred and open_cells:
+                axis = 0 if direction in ("up", "down") else 1
                 all_runs = edge_runs(cells, direction)
                 same_run_open = []
                 for c in on_edge_coords:
                     c_run = next((r for r in all_runs if c in r), [])
-                    same_run_open.extend(oc for oc in c_run if oc in open_cells and oc not in same_run_open)
+                    same_run_open.extend(
+                        oc
+                        for oc in c_run
+                        if oc in open_cells
+                        and abs(oc[axis] - c[axis]) <= self.MAX_EDGE_ALIGNMENT_SHIFT
+                        and oc not in same_run_open
+                    )
                 if same_run_open:
-                    axis = 0 if direction in ("up", "down") else 1
                     ref = on_edge_coords[0]
                     nearest = min(same_run_open, key=lambda c: (abs(c[axis] - ref[axis]), abs(c[axis])))
                     preferred = [nearest]
@@ -1450,6 +1513,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
                 candidate_explicit = [
                     c for c in ([c for c in on_edge_coords if c in forward_cells] or on_edge_coords)
                     if has_offscreen_continuation(gmap, c, direction)
+                    or has_offscreen_front_target(gmap, c, direction)
                 ]
                 if not candidate_explicit and open_cells:
                     preferred = open_cells
@@ -1592,11 +1656,18 @@ Location: <(x, y) or Not Found>
                 non_avoided_open = [c for c in open_cells if c not in avoided_set]
                 if non_avoided_open:
                     open_cells = non_avoided_open
-            from execution.perception.pokemon.navigation import has_offscreen_continuation
+            from execution.perception.pokemon.navigation import (
+                has_offscreen_continuation,
+                has_offscreen_front_target,
+            )
 
-            if target not in open_cells and open_cells:
+            if (
+                target not in open_cells
+                and open_cells
+                and not has_offscreen_front_target(gmap, target, direction)
+            ):
                 axis = 0 if direction in ("up", "down") else 1
-                adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= 2]
+                adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= self.MAX_EDGE_ALIGNMENT_SHIFT]
                 if adjacent_open:
                     target = min(adjacent_open, key=lambda c: (abs(c[axis] - target[axis]), abs(c[axis])))
                 elif not has_offscreen_continuation(gmap, target, direction):

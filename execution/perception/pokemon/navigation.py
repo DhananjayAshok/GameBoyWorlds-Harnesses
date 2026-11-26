@@ -1092,6 +1092,64 @@ def _gmap_blocked_sets(global_map: Optional[Any]) -> Tuple[set, Dict[Cell, set]]
         return set(), {}
 
 
+FRONT_TARGET_TAGS = {"npc", "interactable object", "sign", "item"}
+
+
+def has_offscreen_front_target(
+    global_map: Optional[Any],
+    cell: Cell,
+    direction: str,
+) -> bool:
+    if (
+        global_map is None
+        or not getattr(global_map, "current", None)
+        or getattr(global_map, "pos", None) is None
+        or direction not in DIRECTIONS
+    ):
+        return False
+    try:
+        _, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+        seg = global_map.current
+    except Exception:  # noqa: BLE001
+        return False
+    if not seg or (px, py) not in seg:
+        return False
+    dx, dy = DIRECTIONS[direction]
+    start = (px + cell[0], py + cell[1])
+    first = (start[0] + dx, start[1] + dy)
+    fc = seg.get(first)
+    if fc is None:
+        return False
+    f_kind = getattr(fc, "kind", None)
+    f_tags = set(getattr(fc, "tags", ()))
+    if f_kind == "occupied" or bool(f_tags & FRONT_TARGET_TAGS):
+        return True
+    if f_kind == BLOCKED:
+        second = (start[0] + 2 * dx, start[1] + 2 * dy)
+        sc = seg.get(second)
+        if sc is not None:
+            s_kind = getattr(sc, "kind", None)
+            s_tags = set(getattr(sc, "tags", ()))
+            if s_kind == "occupied" or bool(s_tags & FRONT_TARGET_TAGS):
+                return True
+        perp = ((1, 0), (-1, 0)) if direction in ("up", "down") else ((0, 1), (0, -1))
+        for ox, oy in perp:
+            nb1 = seg.get((first[0] + ox, first[1] + oy))
+            nb2 = seg.get((second[0] + ox, second[1] + oy))
+            if (
+                nb1 is not None
+                and getattr(nb1, "kind", None) == BLOCKED
+                and "interactable object" in getattr(nb1, "tags", ())
+                and nb2 is not None
+                and (
+                    getattr(nb2, "kind", None) == "occupied"
+                    or bool(set(getattr(nb2, "tags", ())) & FRONT_TARGET_TAGS)
+                )
+            ):
+                return True
+    return False
+
+
 def has_offscreen_continuation(
     global_map: Optional[Any],
     cell: Cell,
