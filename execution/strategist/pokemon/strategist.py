@@ -79,8 +79,12 @@ HEALING_ITEM_USED_PATTERN = re.compile(
 )
 HEALING_BAG_EMPTY_PATTERN = re.compile(
     r"(?:No\s+healing\s+item\s+was\s+used\s+in\s+menu"
-    r"|bag\s+is\s+empty\s*\(only\s+CANCEL\)"
-    r"|closed\s+the\s+bag\s+without\s+using\s+an\s+item;\s*do\s+not\s+choose\s+bag\s+again)",
+    r"|bag\s+is\s+empty\s*(?:\(only\s+CANCEL\)|—\s*only\s+CANCEL)"
+    r"|checked\s+all\s+bag\s+slots\s*—\s*no\s+usable\s+healing\s+item\s+in\s+bag"
+    r"|closed\s+the\s+bag\s+without\s+using\s+an\s+item;\s*do\s+not\s+choose\s+bag\s+again"
+    r"|\ball\s+potions\s+(?:in\s+the\s+bag\s+)?have\s+(?:now\s+)?been\s+used\s+up\b"
+    r"|\b(?:used|using)\s+up\s+(?:all\s+)?(?:our\s+|the\s+)?remaining\s+potions\b"
+    r"|\bno\s+(?:usable\s+)?healing\s+items\s+(?:left\s+|remaining\s+)?in\s+(?:the\s+)?bag\b)",
     re.IGNORECASE,
 )
 
@@ -740,7 +744,8 @@ class PokemonStrategist:
         self._fled_since_heal += fled
         m_rec = HEALING_ITEM_USED_PATTERN.search(digest)
         if m_rec:
-            self._healing_bag_empty = False
+            if bag_info is None and not is_healing_bag_empty_digest(digest):
+                self._healing_bag_empty = False
             if (
                 self._active_pokemon_status == "PSN"
                 and re.search(

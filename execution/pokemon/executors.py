@@ -2278,6 +2278,7 @@ Press: <one of up, down, left, right, confirm, back>
         self._saw_bag_end: bool = False
         self._bag_scrolled_in_opening: bool = False
         self._opened_bag_in_battle: bool = False
+        self._healing_items_exhausted: bool = False
         self._bag_cursor_idx: Optional[int] = None
         self._selected_bag_item: Optional[str] = None
         for entry in (initial_zero_pp_moves or ()):
@@ -2685,6 +2686,8 @@ Press: <one of up, down, left, right, confirm, back>
         if not self._bag_scrolled_in_opening and cursor_idx == 0 and bool(items):
             self._saw_bag_top = True
         self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
+        if self._healing_items_exhausted and any(is_healing_item_name(it) for it in self._seen_bag_items):
+            self._healing_items_exhausted = False
         return items, has_more, cursor_row
 
     def _consume_selected_bag_item(self, item_name: Optional[str]) -> None:
@@ -2697,7 +2700,10 @@ Press: <one of up, down, left, right, confirm, back>
             self._bag_item_quantities.pop(item_name, None)
             if item_name in self._seen_bag_items:
                 self._seen_bag_items.remove(item_name)
-            if self._saw_bag_end and not any(is_healing_item_name(it) for it in self._seen_bag_items):
+            has_heal_left = any(is_healing_item_name(it) for it in self._seen_bag_items)
+            if is_healing_item_name(item_name) and not has_heal_left:
+                self._healing_items_exhausted = True
+            if (self._saw_bag_end or self._healing_items_exhausted) and not has_heal_left:
                 live_status = self._last_seen_player_status()
                 if not live_status or not any(
                     is_status_heal_item_for_status(it, live_status) for it in self._seen_bag_items
@@ -3266,7 +3272,7 @@ Press: <one of up, down, left, right, confirm, back>
                 notes_lines.append(f"[Moves at 0 PP: {', '.join(zero_pp_items)}]")
             if self._seen_bag_items or self._opened_bag_in_battle:
                 all_checked = self._saw_bag_end or (
-                    self._bag_unavailable
+                    (self._bag_unavailable or self._healing_items_exhausted)
                     and not any(is_healing_item_name(it) for it in self._seen_bag_items)
                 )
                 end_note = " (all bag slots checked)" if all_checked else ""

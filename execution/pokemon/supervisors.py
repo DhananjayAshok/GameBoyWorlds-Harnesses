@@ -1090,7 +1090,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._update_bag_status_from_notes(notes)
         bag_info = CombatExecutor.extract_bag_items_from_text(notes)
         has_remaining_heal = bool(bag_info and any(is_healing_item_name(it) for it in bag_info[0]))
-        if getattr(self.last_executor, "_bag_unavailable", False) and not has_remaining_heal:
+        if (
+            (
+                getattr(self.last_executor, "_bag_unavailable", False)
+                or getattr(self.last_executor, "_healing_items_exhausted", False)
+            )
+            and not has_remaining_heal
+        ):
             self._healing_bag_empty = True
         hp = CombatExecutor.extract_player_hp_from_text(notes)
         if hp is not None:
@@ -1172,7 +1178,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             cur_hp, max_hp = self._last_seen_battle_hp
             low = cur_hp * 2 <= max_hp
             bag_note = (
-                " (healing bag was already checked and has no usable healing items)"
+                " (healing bag was already checked and has NO usable healing items — "
+                "do NOT open the ITEM menu or instruct the player to use a Potion, even if task guidance mentions Potions)"
                 if self._healing_bag_empty else ""
             )
             if low and not self._healing_bag_empty:
@@ -1191,7 +1198,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if self._active_pokemon_status:
                 lines.append(f"Active Pokemon status: {self._active_pokemon_status}{status_note}.")
             if self._healing_bag_empty:
-                lines.append("Bag healing item status: No usable healing items in bag (checked earlier).")
+                lines.append(
+                    "Bag healing item status: No usable healing items in bag (checked earlier — "
+                    "do NOT open the ITEM menu or instruct the player to use a Potion)."
+                )
         if self._zero_pp_moves:
             lines.append(
                 f"Active Pokemon moves at 0 PP (cannot be used until healed at a Pokemon Center): "
@@ -1480,6 +1490,16 @@ class PokemonPlayThroughSupervisor(Supervisor):
         summary = (parse_key_value(output, "Summary") or "").strip()
         if not summary:
             summary = f"{request} -> {executor_report}"
+        if re.search(
+            r"\b(?:all\s+potions\s+(?:in\s+the\s+bag\s+)?have\s+(?:now\s+)?been\s+used\s+up"
+            r"|used\s+up\s+(?:all\s+)?(?:our\s+|the\s+)?remaining\s+potions"
+            r"|using\s+up\s+(?:all\s+)?(?:our\s+|the\s+)?remaining\s+potions"
+            r"|no\s+(?:usable\s+)?healing\s+items\s+(?:left\s+|remaining\s+)?in\s+(?:the\s+)?bag"
+            r"|healing\s+bag\s+is\s+empty)\b",
+            f"{output}\n{summary}",
+            re.IGNORECASE,
+        ):
+            self._healing_bag_empty = True
         complete = bool(parse_yes_no(output, "Subgoal complete"))
         replan_needed = bool(parse_yes_no(output, "Replan needed")) and not complete
         reached = parse_int(output, "Reached subgoal", lo=subgoal_index + 1, hi=len(self.plan)) if remaining else None
@@ -1724,7 +1744,6 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if (
             self._healing_bag_empty
             and (not self._active_pokemon_status or self._status_heal_bag_empty)
-            and not re.search(r"\b(?:catch|capture|ball)\b", instructions or "", re.IGNORECASE)
             and "initial_bag_unavailable" not in executor_kwargs
         ):
             executor_kwargs["initial_bag_unavailable"] = True
