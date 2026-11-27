@@ -418,6 +418,9 @@ class PokemonStrategist:
         self._last_battle_hp_episode: Optional[int] = None
         self._fought_since_last_hp: int = 0
         self._healing_bag_empty: bool = False
+        self._active_pokemon_status: Optional[str] = None
+        self._status_heal_bag_empty: bool = False
+        self._zero_pp_moves: List[str] = []
         self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {}
 
         self._started_at = datetime.now()
@@ -495,8 +498,11 @@ class PokemonStrategist:
         digest = record.supervisor_report.digest if record.supervisor_report is not None else ""
         if is_healing_item_bought_digest(digest):
             self._healing_bag_empty = False
+            self._status_heal_bag_empty = False
         elif is_healing_bag_empty_digest(digest):
             self._healing_bag_empty = True
+        if "No status-healing item was used in menu" in digest:
+            self._status_heal_bag_empty = True
         if is_real_battle_loss(record) or is_healing_digest(digest):
             self._fought_since_heal = 0
             self._fled_since_heal = 0
@@ -504,6 +510,8 @@ class PokemonStrategist:
             self._last_battle_hp = None
             self._last_battle_hp_episode = None
             self._fought_since_last_hp = 0
+            self._active_pokemon_status = None
+            self._zero_pp_moves = []
             return
         fought, fled = fought_and_fled_battles_in_digest(digest)
         self._fought_since_heal += fought
@@ -511,6 +519,37 @@ class PokemonStrategist:
         m_rec = HEALING_ITEM_USED_PATTERN.search(digest)
         if m_rec:
             self._healing_bag_empty = False
+            if (
+                self._active_pokemon_status == "PSN"
+                and re.search(
+                    r"\buse\s+(?:a\s+Potion\s+\(and\s+an?\s+Antidote|an?\s+Antidote\s+\(if\s+available\))",
+                    digest,
+                    re.IGNORECASE,
+                )
+                and not re.search(r"\b(?:cured\s+of\s+(?:its\s+)?poison|poison\s+faded)\b", digest, re.IGNORECASE)
+            ):
+                self._status_heal_bag_empty = True
+        status = CombatExecutor.extract_player_status_from_text(digest)
+        if status is not None:
+            self._active_pokemon_status = status or None
+        zero_pp = CombatExecutor.extract_zero_pp_moves_from_text(digest)
+        if zero_pp is not None:
+            for item in zero_pp:
+                if item and item not in self._zero_pp_moves:
+                    self._zero_pp_moves.append(item)
+        elif fought > 0 and "Text seen along the way, in order:" in digest:
+            text_sec = digest.split("Text seen along the way, in order:", 1)[1]
+            for m_order in re.finditer(
+                r'while doing "(?:Defeat|Use)\b[^"\n]*?\busing\s+([A-Za-z][A-Za-z0-9 -]{2,15}?)(?:,|\s+to\b|\s+and\b|\s*\()',
+                text_sec,
+                re.IGNORECASE,
+            ):
+                ordered_move = m_order.group(1).strip().upper()
+                if ordered_move and f"USED {ordered_move}!" not in text_sec.upper() and re.search(r"\bUSED\s+[A-Z0-9 -]+!", text_sec, re.IGNORECASE):
+                    if ordered_move not in self._zero_pp_moves and not any(
+                        ordered_move in existing.upper() for existing in self._zero_pp_moves
+                    ):
+                        self._zero_pp_moves.append(ordered_move)
         hp = CombatExecutor.extract_player_hp_from_text(digest)
         if hp is None and record.supervisor_report is not None:
             for ex in record.supervisor_report.executor_reports:
@@ -549,7 +588,12 @@ class PokemonStrategist:
         last_hp = self._last_battle_hp
         last_hp_ep = self._last_battle_hp_episode
         fought_after_hp = self._fought_since_last_hp
-        if fought <= 0 and (last_hp is None or last_hp[0] >= last_hp[1]):
+        if (
+            fought <= 0
+            and (last_hp is None or last_hp[0] >= last_hp[1])
+            and not self._active_pokemon_status
+            and not self._zero_pp_moves
+        ):
             if last_heal_ep is not None:
                 return f"\nParty health status: Fully healed (0 battles fought since last heal in episode {last_heal_ep}).\n"
             return "\nParty health status: Fully healed (0 battles fought since last heal).\n"
@@ -565,6 +609,18 @@ class PokemonStrategist:
             if fought_after_hp > 0:
                 hp_note += f", followed by {fought_after_hp} more battle(s) without healing"
             parts.append(hp_note)
+        if self._active_pokemon_status:
+            if self._status_heal_bag_empty:
+                parts.append(
+                    f"active Pokemon status: {self._active_pokemon_status} "
+                    f"(bag has NO Antidote or status-curing item — do NOT ask to use an Antidote)"
+                )
+            else:
+                parts.append(f"active Pokemon status: {self._active_pokemon_status}")
+        if self._zero_pp_moves:
+            parts.append(
+                f"moves at 0 PP (cannot be used until healed at a Pokemon Center): {', '.join(self._zero_pp_moves)}"
+            )
         if self._healing_bag_empty:
             parts.append("bag was already checked and has no usable healing items")
         status = "; ".join(parts)
@@ -1367,6 +1423,9 @@ class PokemonStrategist:
             screen_people=self._screen_people if self.npcs is not None else None,
             initial_battle_hp=self._last_battle_hp,
             initial_healing_bag_empty=self._healing_bag_empty,
+            initial_pokemon_status=self._active_pokemon_status,
+            initial_status_heal_bag_empty=self._status_heal_bag_empty,
+            initial_zero_pp_moves=self._zero_pp_moves,
             initial_blocked_moves=self._blocked_moves,
             **self._supervisor_kwargs,
         )
@@ -1408,6 +1467,15 @@ class PokemonStrategist:
         self.global_map.refresh(self.tiles._by_hash)
 
         self._record_party_episode(record)
+        if getattr(supervisor, "_last_seen_battle_hp", None) is not None:
+            self._last_battle_hp = supervisor._last_seen_battle_hp
+            self._last_battle_hp_episode = record.n
+        self._healing_bag_empty = bool(getattr(supervisor, "_healing_bag_empty", self._healing_bag_empty))
+        self._active_pokemon_status = getattr(supervisor, "_active_pokemon_status", self._active_pokemon_status)
+        self._status_heal_bag_empty = bool(getattr(supervisor, "_status_heal_bag_empty", self._status_heal_bag_empty))
+        for z_move in (getattr(supervisor, "_zero_pp_moves", None) or ()):
+            if z_move and z_move not in self._zero_pp_moves:
+                self._zero_pp_moves.append(z_move)
         if record.status == "lost_battle":
             closed = []
         else:

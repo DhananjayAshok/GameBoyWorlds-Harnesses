@@ -17,12 +17,16 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_battle_screen, is_blank_or_fade_frame,
                                                  is_cutscene_frame_changing,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
-                                                 is_move_selection_screen, is_overworld_pack_menu,
+                                                 is_gen1_item_list_screen, is_move_selection_screen,
+                                                 is_no_pp_dialogue_frame, is_overworld_pack_menu,
                                                  is_pack_action_subbox_screen, is_pack_item_list_screen,
                                                  is_pack_screen, is_party_menu_screen,
                                                  is_party_menu_selection_screen, is_same_battle_frame,
                                                  is_start_menu_screen,
-                                                 read_battle_hud_hp, read_party_menu_hp)
+                                                 read_bag_item_list, read_battle_hud_hp,
+                                                 read_battle_hud_status, read_move_menu_cursor_slot,
+                                                 read_move_menu_names, read_move_menu_pp,
+                                                 read_party_menu_hp, read_party_menu_status)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
@@ -2141,7 +2145,7 @@ The image is the current battle screen, showing your moves.
 Your previous reply was:
 [PREVIOUS]
 
-That reply could not be used: it did not give the number of a move. Choose which of the four moves to use, where 1 is the top one.
+That reply could not be used: it did not give the number of a usable move with PP left. Choose which of the four moves to use, where 1 is the top one (never choose a move listed as having 0 PP left).
 
 Respond in exactly this format:
 Reasoning: <which move to use and why>
@@ -2181,6 +2185,7 @@ Press: <one of up, down, left, right, confirm, back>
         max_steps: int = 60,
         initial_dialogue_crops: Optional[List[Any]] = None,
         skip_intro_ocr: bool = False,
+        initial_zero_pp_moves: Optional[List[str]] = None,
         **kwargs,
     ):
         self.history: List[str] = []
@@ -2199,6 +2204,24 @@ Press: <one of up, down, left, right, confirm, back>
         self._saw_battle_state: bool = False
         self._battle_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self.battle_lost: bool = False
+        self._move_names: Dict[int, str] = {}
+        self._move_pp: Dict[int, Tuple[int, int]] = {}
+        self._zero_pp_slots: Dict[int, str] = {}
+        self._known_zero_pp_names: set = set()
+        for entry in (initial_zero_pp_moves or ()):
+            text = str(entry).strip()
+            if not text:
+                continue
+            m_slot = re.search(r"\bmove\s*([1-4])\b", text, re.IGNORECASE)
+            m_name = re.search(r"\(([A-Z0-9 -]+)\)", text)
+            name_val = m_name.group(1).strip().upper() if m_name else ""
+            if not name_val and not m_slot:
+                name_val = text.upper()
+            if m_slot:
+                slot_num = int(m_slot.group(1))
+                self._zero_pp_slots[slot_num] = name_val or self._zero_pp_slots.get(slot_num, "")
+            if name_val:
+                self._known_zero_pp_names.add(name_val)
         super().__init__(env, task, max_steps, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
@@ -2449,19 +2472,113 @@ Press: <one of up, down, left, right, confirm, back>
             parts.append(f"dismissed {stat_dismisses} stat box{'es' if stat_dismisses > 1 else ''}")
         return (", then " + " and ".join(parts)) if parts else ""
 
+    def _scan_move_menu_frame(self, frame: Optional[np.ndarray]) -> None:
+        if frame is None:
+            return
+        names = read_move_menu_names(frame)
+        if names:
+            for slot, name in names.items():
+                self._move_names[slot] = name
+                if slot in self._zero_pp_slots and not self._zero_pp_slots[slot]:
+                    self._zero_pp_slots[slot] = name
+                for known_name in list(self._known_zero_pp_names):
+                    if name == known_name or name.startswith(known_name) or known_name.startswith(name):
+                        self._zero_pp_slots[slot] = name
+        slot = read_move_menu_cursor_slot(frame)
+        pp = read_move_menu_pp(frame)
+        if slot is not None and pp is not None:
+            self._move_pp[slot] = pp
+            if pp[0] == 0:
+                move_name = self._move_names.get(slot, "")
+                self._zero_pp_slots[slot] = move_name
+                if move_name:
+                    self._known_zero_pp_names.add(move_name)
+            elif slot in self._zero_pp_slots:
+                old_name = self._zero_pp_slots.pop(slot, "")
+                if old_name:
+                    self._known_zero_pp_names.discard(old_name)
+
+    def _scan_record_move_frames(self, record: Optional[EnvironmentStepRecord]) -> None:
+        if record is None:
+            return
+        self._scan_move_menu_frame(record.frame_before)
+        self._scan_move_menu_frame(record.frame_after)
+        last_ev = getattr(self._env, "last_step_event", None)
+        passed = getattr(last_ev, "passed_frames", None) if last_ev is not None else None
+        if passed is not None:
+            for fr in passed:
+                self._scan_move_menu_frame(fr)
+
+    def _mark_zero_pp_slot(self, slot: int) -> None:
+        name = self._move_names.get(slot, "")
+        self._zero_pp_slots[slot] = name
+        if name:
+            self._known_zero_pp_names.add(name)
+        if slot in self._move_pp:
+            self._move_pp[slot] = (0, self._move_pp[slot][1])
+
+    def _format_zero_pp_list(self) -> List[str]:
+        items: List[str] = []
+        covered_names: set = set()
+        for slot in sorted(self._zero_pp_slots):
+            name = self._zero_pp_slots[slot] or self._move_names.get(slot, "")
+            if name:
+                items.append(f"Move {slot} ({name})")
+                covered_names.add(name)
+            else:
+                items.append(f"Move {slot}")
+        for name in sorted(self._known_zero_pp_names):
+            if not any(
+                name == cov or name.startswith(cov) or cov.startswith(name)
+                for cov in covered_names
+            ):
+                items.append(name)
+        return items
+
+    def _dismiss_no_pp_dialogue(self, turn_records: List[EnvironmentStepRecord]) -> int:
+        dismissed = 0
+        for _ in range(4):
+            frame = self._current_frame()
+            if is_move_selection_screen(frame) or not is_no_pp_dialogue_frame(frame):
+                break
+            extra = self._take_action(LowLevelAction, low_level_action=LowLevelActions.PRESS_BUTTON_B)
+            turn_records.append(extra)
+            dismissed += 1
+            if self._last_terminated or self._last_truncated:
+                break
+        self._scan_move_menu_frame(self._current_frame())
+        return dismissed
+
     def _history_block(self) -> str:
-        lines = list(self.history)
         cur_frame = self._current_frame()
+        self._scan_move_menu_frame(cur_frame)
+        lines = list(self.history)
         live_hp = (
             read_party_menu_hp(cur_frame)
             or read_battle_hud_hp(cur_frame)
             or self._last_seen_player_hp()
         )
+        live_status = self._last_seen_player_status(cur_frame)
         if live_hp is not None:
             cur_hp, max_hp = live_hp
             deficit = max(0, max_hp - cur_hp)
+            status_suffix = f", status: {live_status}" if live_status else ""
             lines.append(
-                f"Active Pokemon HP: {cur_hp}/{max_hp} HP (missing {deficit} HP)."
+                f"Active Pokemon HP: {cur_hp}/{max_hp} HP (missing {deficit} HP{status_suffix})."
+            )
+        elif live_status:
+            lines.append(f"Active Pokemon status: {live_status}.")
+        zero_pp_items = self._format_zero_pp_list()
+        if zero_pp_items:
+            avail = [
+                f"Move {s}" + (f" ({self._move_names[s]})" if s in self._move_names else "")
+                for s in (1, 2, 3, 4)
+                if s not in self._zero_pp_slots and (not self._move_names or s in self._move_names)
+            ]
+            avail_note = f" Choose from available moves with PP left: {', '.join(avail)}." if avail else ""
+            lines.append(
+                f"Note: Moves with 0 PP left (cannot be used — do NOT choose these moves): "
+                f"{', '.join(zero_pp_items)}.{avail_note}"
             )
         if self._bag_unavailable:
             lines.append(
@@ -2486,6 +2603,16 @@ Press: <one of up, down, left, right, confirm, back>
         re.IGNORECASE,
     )
 
+    PLAYER_STATUS_TAG_PATTERN = re.compile(
+        r"\[Party status seen in (?:battle|menu):\s*(PSN|BRN|PAR|SLP|FRZ|healthy)\]",
+        re.IGNORECASE,
+    )
+
+    ZERO_PP_TAG_PATTERN = re.compile(
+        r"\[Moves at 0 PP:\s*([^\]]+)\]",
+        re.IGNORECASE,
+    )
+
     @classmethod
     def extract_player_hp_from_text(cls, text: str) -> Optional[Tuple[int, int]]:
         last: Optional[Tuple[int, int]] = None
@@ -2498,6 +2625,55 @@ Press: <one of up, down, left, right, confirm, back>
                 if 0 <= cur_hp <= max_hp and 10 <= max_hp <= 999:
                     last = (cur_hp, max_hp)
         return last
+
+    @classmethod
+    def extract_player_status_from_text(cls, text: str) -> Optional[str]:
+        if not text:
+            return None
+        last_tag: Optional[str] = None
+        for m in cls.PLAYER_STATUS_TAG_PATTERN.finditer(text):
+            val = m.group(1).upper()
+            last_tag = "" if val == "HEALTHY" else val
+        if last_tag is not None:
+            return last_tag
+        if re.search(
+            r"\b(?:cured\s+of\s+(?:its\s+)?poison|poison\s+faded|healed\s+of\s+(?:its\s+)?(?:poison|burn|paralysis))\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return ""
+        if re.search(
+            r"(?:^|[\n.!])\s*(?!Enemy\b|Wild\b|Foe\b)[A-Za-z0-9_.'♀♂-]+\s+(?:was\s+poisoned|’s\s+hurt\s+by\s+poison|'s\s+hurt\s+by\s+poison)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return "PSN"
+        if re.search(
+            r"(?:^|[\n.!])\s*(?!Enemy\b|Wild\b|Foe\b)[A-Za-z0-9_.'♀♂-]+\s+(?:was\s+burned|’s\s+hurt\s+by\s+(?:its\s+)?burn|'s\s+hurt\s+by\s+(?:its\s+)?burn)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return "BRN"
+        if re.search(
+            r"(?:^|[\n.!])\s*(?!Enemy\b|Wild\b|Foe\b)[A-Za-z0-9_.'♀♂-]+\s+(?:is\s+paralyzed|’s\s+fully\s+paralyzed|'s\s+fully\s+paralyzed)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return "PAR"
+        return None
+
+    @classmethod
+    def extract_zero_pp_moves_from_text(cls, text: str) -> Optional[List[str]]:
+        if not text:
+            return None
+        last_list: Optional[List[str]] = None
+        for m in cls.ZERO_PP_TAG_PATTERN.finditer(text):
+            raw = m.group(1).strip()
+            if not raw or raw.lower() == "none":
+                last_list = []
+            else:
+                last_list = [part.strip() for part in raw.split(",") if part.strip()]
+        return last_list
 
     def _last_seen_player_hp(self) -> Optional[Tuple[int, int]]:
         last_hud: Optional[Tuple[int, int]] = None
@@ -2517,19 +2693,48 @@ Press: <one of up, down, left, right, confirm, back>
                     last = found
         return last
 
+    def _last_seen_player_status(self, current_frame: Optional[np.ndarray] = None) -> Optional[str]:
+        if current_frame is not None:
+            st = read_party_menu_status(current_frame)
+            if st is None:
+                st = read_battle_hud_status(current_frame)
+            if st is not None:
+                return st
+        last_hud_status: Optional[str] = None
+        for step in self.report.steps:
+            if isinstance(step, EnvironmentStepRecord):
+                for frame in (step.frame_before, step.frame_after):
+                    found_st = read_party_menu_status(frame)
+                    if found_st is None:
+                        found_st = read_battle_hud_status(frame)
+                    if found_st is not None:
+                        last_hud_status = found_st
+        if last_hud_status is not None:
+            return last_hud_status
+        return self.extract_player_status_from_text("\n".join(self.dialogue_text))
+
     def _choose_move(self, output: str) -> Optional[int]:
+        self._scan_move_menu_frame(self._current_frame())
         move = parse_int(output, "Move", lo=1, hi=4)
         for _ in range(self.MOVE_ATTEMPTS):
-            if move is not None:
+            if move is not None and move not in self._zero_pp_slots:
                 return move
-            self._record_invalid(output, reason="no move number")
+            reason = "move has 0 PP left" if (move is not None and move in self._zero_pp_slots) else "no move number"
+            self._record_invalid(output, reason=reason)
             frame = self._current_frame()
+            self._scan_move_menu_frame(frame)
             prompt = (self.MOVE_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
                       .replace("[HISTORY]", self._history_block())
                       .replace("[PREVIOUS]", output[:self.MAX_PREVIOUS_CHARS]))
             output = self._vlm_call(self.MOVE_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
             move = parse_int(output, "Move", lo=1, hi=4)
+        if move is not None and move in self._zero_pp_slots:
+            for candidate in (1, 2, 3, 4):
+                if candidate not in self._zero_pp_slots and (
+                    not self._move_names or candidate in self._move_names
+                ):
+                    return candidate
         if move is None:
             self._record_invalid(output, reason="no move number")
         return move
@@ -2576,6 +2781,12 @@ Press: <one of up, down, left, right, confirm, back>
                     )
                 else:
                     notes_lines.append(f"[Party HP seen in battle: {last_hp[0]}/{last_hp[1]} HP]")
+            last_status = self._last_seen_player_status()
+            if last_status is not None:
+                notes_lines.append(f"[Party status seen in battle: {last_status or 'healthy'}]")
+            zero_pp_items = self._format_zero_pp_list()
+            if zero_pp_items:
+                notes_lines.append(f"[Moves at 0 PP: {', '.join(zero_pp_items)}]")
         self.report.notes = "\n".join(notes_lines)
         return code
 
@@ -2818,6 +3029,20 @@ Press: <one of up, down, left, right, confirm, back>
                 continue
 
             frame = self._current_frame()
+            if is_no_pp_dialogue_frame(frame):
+                self._ensure_scripted("dismiss no-PP prompt")
+                dismiss_records: List[EnvironmentStepRecord] = []
+                n_dismissed = self._dismiss_no_pp_dialogue(dismiss_records)
+                if self._last_terminated:
+                    return self._fail(BATTLE_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._fail(BATTLE_TRUNCATED, "truncated")
+                if n_dismissed:
+                    self.history.append(
+                        f"- step {step + 1}: dismissed 'No PP left' prompt ({n_dismissed} B press{'es' if n_dismissed > 1 else ''})"
+                    )
+                    frame = self._current_frame()
+            self._scan_move_menu_frame(frame)
             move_menu_open = is_move_selection_screen(frame)
             prompt = (self.STEP_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
                       .replace("[HISTORY]", self._history_block()))
@@ -2841,20 +3066,37 @@ Press: <one of up, down, left, right, confirm, back>
                 if move is None:
                     entry += ", but no move number was given"
                 else:
+                    pre_pp = self._move_pp.get(move)
                     attack = self._take_action(PickAttackAction, option=move)
+                    self._scan_record_move_frames(attack)
+                    if pre_pp is None:
+                        pre_pp = self._move_pp.get(move)
                     if self._last_terminated:
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
                     turn_records.append(attack)
-                    entry += f", used move {move}"
+                    move_label = f"move {move}" + (f" ({self._move_names[move]})" if move in self._move_names else "")
+                    entry += f", used {move_label}"
                     if attack.action_success == 1:
-                        entry += " (no PP left)"
+                        self._mark_zero_pp_slot(move)
+                        n_dismissed = self._dismiss_no_pp_dialogue(turn_records)
+                        if self._last_terminated:
+                            return self._fail(BATTLE_TERMINATED, "terminated")
+                        if self._last_truncated:
+                            return self._fail(BATTLE_TRUNCATED, "truncated")
+                        entry += " (no PP left — do NOT choose this move again)"
+                        if n_dismissed:
+                            entry += f", dismissed prompt ({n_dismissed} B press{'es' if n_dismissed > 1 else ''})"
                         consecutive_failures = 0
                     elif attack.action_success == -1:
                         entry += " (the game did not accept it)"
                         consecutive_failures += 1
                     else:
+                        if pre_pp is not None and pre_pp[0] == 1:
+                            self._mark_zero_pp_slot(move)
+                        elif move in self._move_pp and self._move_pp[move][0] > 1:
+                            self._move_pp[move] = (self._move_pp[move][0] - 1, self._move_pp[move][1])
                         consecutive_failures = 0
                         presses, dismisses = self._advance_until_decision(turn_records)
                         if self._last_terminated:
@@ -2882,6 +3124,7 @@ Press: <one of up, down, left, right, confirm, back>
                     record = self._take_action(LowLevelAction, low_level_action=LowLevelActions.PRESS_BUTTON_B)
                 else:
                     record = self._take_action(BattleMenuAction, option=option)
+                    self._scan_record_move_frames(record)
                 if self._last_terminated:
                     return self._fail(BATTLE_TERMINATED, "terminated")
                 if self._last_truncated:
@@ -2918,31 +3161,55 @@ Press: <one of up, down, left, right, confirm, back>
                     self._in_pokemon_menu = True
                 if option == "fight":
                     attack = None
+                    move = None
                     if record.action_success == 0:
                         move = self._choose_move(output)
                         if move is None:
                             entry += ", but no move number was given"
                         else:
+                            pre_pp = self._move_pp.get(move)
                             attack = self._take_action(PickAttackAction, option=move)
+                            self._scan_record_move_frames(attack)
+                            if pre_pp is None:
+                                pre_pp = self._move_pp.get(move)
                     elif record.action_success == -1:
                         move = parse_int(output, "Move", lo=1, hi=4)
+                        if move is not None and move in self._zero_pp_slots:
+                            move = self._choose_move(output)
                         if move is not None:
+                            pre_pp = self._move_pp.get(move)
                             attack = self._take_action(PickAttackAction, option=move)
+                            self._scan_record_move_frames(attack)
+                            if pre_pp is None:
+                                pre_pp = self._move_pp.get(move)
                             if attack.action_success != -1:
                                 consecutive_failures = 0
                                 entry = f"- step {step + 1}: chose fight"
-                    if attack is not None:
+                    if attack is not None and move is not None:
                         if self._last_terminated:
                             return self._fail(BATTLE_TERMINATED, "terminated")
                         if self._last_truncated:
                             return self._fail(BATTLE_TRUNCATED, "truncated")
                         turn_records.append(attack)
-                        entry += f", used move {move}"
+                        move_label = f"move {move}" + (f" ({self._move_names[move]})" if move in self._move_names else "")
+                        entry += f", used {move_label}"
                         if attack.action_success == 1:
-                            entry += " (no PP left)"
+                            self._mark_zero_pp_slot(move)
+                            n_dismissed = self._dismiss_no_pp_dialogue(turn_records)
+                            if self._last_terminated:
+                                return self._fail(BATTLE_TERMINATED, "terminated")
+                            if self._last_truncated:
+                                return self._fail(BATTLE_TRUNCATED, "truncated")
+                            entry += " (no PP left — do NOT choose this move again)"
+                            if n_dismissed:
+                                entry += f", dismissed prompt ({n_dismissed} B press{'es' if n_dismissed > 1 else ''})"
                         elif attack.action_success == -1:
                             entry += " (the game did not accept it)"
                         else:
+                            if pre_pp is not None and pre_pp[0] == 1:
+                                self._mark_zero_pp_slot(move)
+                            elif move in self._move_pp and self._move_pp[move][0] > 1:
+                                self._move_pp[move] = (self._move_pp[move][0] - 1, self._move_pp[move][1])
                             presses, dismisses = self._advance_until_decision(turn_records)
                             if self._last_terminated:
                                 return self._fail(BATTLE_TERMINATED, "terminated")
@@ -3041,18 +3308,105 @@ Press: <one of up, down, left, right, confirm, back>
     MAX_MENU_DIALOGUE_SETTLE_STEPS = 20
     MAX_STALLED_MENU_DISMISSES = 4
 
+    STATUS_HEAL_TASK_PATTERN = re.compile(
+        r"\b(?:antidote|cure\s+poison|parlyz\s+heal|awakening|burn\s+heal|ice\s+heal|full\s+heal|status)\b",
+        re.IGNORECASE,
+    )
+    STATUS_HEAL_ITEM_NAMES = (
+        "ANTIDOTE",
+        "FULL HEAL",
+        "FULL RESTORE",
+        "PARLYZ HEAL",
+        "AWAKENING",
+        "BURN HEAL",
+        "ICE HEAL",
+        "PSNCUREBERRY",
+        "PRZCUREBERRY",
+        "MINT BERRY",
+        "BURNT BERRY",
+        "ICE BERRY",
+        "MIRACLEBERRY",
+    )
+
     def __init__(self, env, task, max_steps: int = 25, is_start_menu: bool = False, **kwargs):
         self.is_start_menu = is_start_menu
         self.presses: List[str] = []
         self.press_outcomes: List[str] = []
         self.dialogue_crops: List[Any] = []
         self.dialogue_text: str = ""
+        self._seen_bag_items: List[str] = []
+        self._saw_bag_end: bool = False
+        self._auto_scrolled_bag: bool = False
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
         self.report.termination_reason = reason
         self.report.notes = notes
         return code
+
+    def _scan_bag_frame(self, frame: Optional[np.ndarray]) -> Optional[Tuple[List[str], bool]]:
+        if frame is None:
+            return None
+        info = read_bag_item_list(frame)
+        if info is None:
+            return None
+        items, has_more = info
+        for name in items:
+            if name and name not in self._seen_bag_items:
+                self._seen_bag_items.append(name)
+        if not has_more:
+            self._saw_bag_end = True
+        return info
+
+    def _task_wants_status_heal(self) -> bool:
+        return bool(self.STATUS_HEAL_TASK_PATTERN.search(self._task or ""))
+
+    def _seen_status_heal_item(self) -> bool:
+        for item in self._seen_bag_items:
+            up = item.upper()
+            if any(target in up or up in target for target in self.STATUS_HEAL_ITEM_NAMES):
+                return True
+        return False
+
+    def _auto_scroll_bag_for_status_item(self) -> None:
+        if self._auto_scrolled_bag or self._saw_bag_end or not self._task_wants_status_heal():
+            return
+        frame = self._get_state()["core"]["current_frame"]
+        info = self._scan_bag_frame(frame)
+        if info is None:
+            return
+        _, has_more = info
+        if not has_more or self._seen_status_heal_item():
+            return
+        self._auto_scrolled_bag = True
+        if self._current_call is None:
+            self._begin_scripted("scroll bag to check for status-healing item")
+        down_steps = 0
+        for _ in range(10):
+            if self._last_terminated or self._last_truncated:
+                return
+            cur_frame = self._get_state()["core"]["current_frame"]
+            cur_info = self._scan_bag_frame(cur_frame)
+            if cur_info is None:
+                break
+            _, cur_more = cur_info
+            if self._seen_status_heal_item() or not cur_more:
+                break
+            rec = self._take_action(MenuAction, menu_action="down")
+            drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+            down_steps += 1
+            after_fr = self._get_state()["core"]["current_frame"]
+            self._scan_bag_frame(after_fr)
+            if is_same_battle_frame(rec.frame_before, rec.frame_after):
+                self._saw_bag_end = True
+                break
+        if not self._seen_status_heal_item() and down_steps > 0:
+            for _ in range(down_steps):
+                if self._last_terminated or self._last_truncated:
+                    return
+                rec = self._take_action(MenuAction, menu_action="up")
+                drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+                self._scan_bag_frame(self._get_state()["core"]["current_frame"])
 
     def _last_seen_party_hp(self) -> Optional[Tuple[int, int]]:
         last_party: Optional[Tuple[int, int]] = None
@@ -3072,6 +3426,35 @@ Press: <one of up, down, left, right, confirm, back>
                     last_vlm = found
         return last_vlm
 
+    def _last_seen_party_status(self) -> Optional[str]:
+        if self._saw_status_cure_effect():
+            return ""
+        last_st: Optional[str] = None
+        for step in self.report.steps:
+            if isinstance(step, EnvironmentStepRecord):
+                for frame in (step.frame_before, step.frame_after):
+                    found_st = read_party_menu_status(frame)
+                    if found_st is not None:
+                        last_st = found_st
+        return last_st
+
+    def _saw_status_cure_effect(self) -> bool:
+        if self.dialogue_text and re.search(
+            r"\b(?:cured\s+of\s+(?:its\s+)?poison|poison\s+faded|healed\s+of\s+(?:its\s+)?(?:poison|burn|paralysis)|woke\s+up|thawed\s+out)\b",
+            self.dialogue_text,
+            re.IGNORECASE,
+        ):
+            return True
+        for call in self.report.vlm_call_log:
+            if isinstance(call, ExecutorVLMCallRecord) and call.tag == self.STEP_TAG:
+                if re.search(
+                    r"\b(?:cured\s+of\s+(?:its\s+)?poison|poison\s+faded|healed\s+of\s+(?:its\s+)?(?:poison|burn|paralysis)|woke\s+up|thawed\s+out)\b",
+                    str(call.response),
+                    re.IGNORECASE,
+                ):
+                    return True
+        return False
+
     def _finish(self, code: int, reason: str) -> int:
         if self.dialogue_crops:
             self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
@@ -3080,19 +3463,34 @@ Press: <one of up, down, left, right, confirm, back>
         if self.dialogue_text:
             notes_lines.append(self.dialogue_text)
         saw_heal = self._saw_healing_item_effect()
+        saw_status_cure = self._saw_status_cure_effect()
         party_hp = self._last_seen_party_hp()
         if party_hp is not None and (
             saw_heal
             or re.search(r"\b(?:item|bag|potion|restore\s+hp|heal|pokemon|party)\b", self._task or "", re.IGNORECASE)
         ):
             notes_lines.append(f"[Party HP seen in menu: {party_hp[0]}/{party_hp[1]} HP]")
+        party_status = self._last_seen_party_status()
+        if party_status is not None:
+            notes_lines.append(f"[Party status seen in menu: {party_status or 'healthy'}]")
+        if self._seen_bag_items:
+            end_note = " (all bag slots checked)" if self._saw_bag_end else ""
+            notes_lines.append(f"[Bag items seen: {', '.join(self._seen_bag_items)}{end_note}]")
         if (
             self.is_start_menu
             and re.search(r"\b(?:item|bag|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
             and re.search(r"\b(?:heal|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
             and not saw_heal
+            and not saw_status_cure
         ):
             notes_lines.append("[No healing item was used in menu: bag had no usable healing item]")
+        if (
+            self._task_wants_status_heal()
+            and not saw_status_cure
+            and (self._saw_bag_end or not self._seen_status_heal_item())
+            and (self._seen_bag_items or self.is_start_menu)
+        ):
+            notes_lines.append("[No status-healing item was used in menu: bag had no usable status-healing item]")
         self.report.termination_reason = reason
         self.report.notes = "\n".join(filter(None, notes_lines))
         return code
@@ -3120,10 +3518,20 @@ Press: <one of up, down, left, right, confirm, back>
         return None
 
     def _history_block(self) -> str:
-        if not self.presses:
+        lines: List[str] = []
+        if self.presses:
+            outcomes = self.press_outcomes if len(self.press_outcomes) == len(self.presses) else self.presses
+            lines.append(f"Presses made so far, in order: {', '.join(outcomes)}.")
+        if self._seen_bag_items:
+            end_note = " (all bag slots checked)" if self._saw_bag_end else " (more items may be below)"
+            lines.append(f"Bag items seen so far: {', '.join(self._seen_bag_items)}{end_note}.")
+            if self._task_wants_status_heal() and self._saw_bag_end and not self._seen_status_heal_item():
+                lines.append(
+                    "Note: All bag slots were checked and there is NO Antidote or status-healing item in the bag."
+                )
+        if not lines:
             return ""
-        outcomes = self.press_outcomes if len(self.press_outcomes) == len(self.presses) else self.presses
-        return f"\nPresses made so far, in order: {', '.join(outcomes)}.\n"
+        return "\n" + "\n".join(lines) + "\n"
 
     def _saw_healing_item_effect(self) -> bool:
         if self.dialogue_text and re.search(
@@ -3226,6 +3634,13 @@ Press: <one of up, down, left, right, confirm, back>
             if state != AgentState.IN_MENU:
                 code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                 return self._finish(code, reason)
+            self._auto_scroll_bag_for_status_item()
+            if self._last_terminated:
+                return self._finish(MENU_TERMINATED, "terminated")
+            if self._last_truncated:
+                return self._finish(MENU_TRUNCATED, "truncated")
+            frame = self._get_state()["core"]["current_frame"]
+            self._scan_bag_frame(frame)
             prompt = (self.STEP_PROMPT.replace("[TASK]", self._task.strip())
                       .replace("[HISTORY]", self._history_block()))
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],

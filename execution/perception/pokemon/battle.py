@@ -1,5 +1,5 @@
 import re
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -911,3 +911,267 @@ def read_party_menu_hp(frame: np.ndarray) -> Optional[Tuple[int, int]]:
                 if hp is not None:
                     return hp
     return _read_tile_hp_fraction(img, ty=1, slash_tx=16)
+
+
+HUD_LETTER_TEMPLATES: Dict[Tuple[int, ...], str] = {
+    (16, 40, 40, 68, 124, 130, 130, 0): "A",
+    (248, 132, 132, 252, 130, 130, 252, 0): "B",
+    (60, 66, 128, 128, 128, 66, 60, 0): "C",
+    (248, 132, 130, 130, 130, 132, 248, 0): "D",
+    (254, 128, 128, 252, 128, 128, 254, 0): "E",
+    (254, 128, 128, 252, 128, 128, 128, 0): "F",
+    (60, 66, 128, 158, 130, 66, 60, 0): "G",
+    (130, 130, 130, 254, 130, 130, 130, 0): "H",
+    (124, 16, 16, 16, 16, 16, 124, 0): "I",
+    (126, 8, 8, 8, 136, 136, 112, 0): "J",
+    (132, 136, 144, 176, 200, 132, 130, 0): "K",
+    (128, 128, 128, 128, 128, 128, 254, 0): "L",
+    (130, 198, 170, 146, 130, 130, 130, 0): "M",
+    (130, 194, 162, 146, 138, 134, 130, 0): "N",
+    (56, 68, 130, 130, 130, 68, 56, 0): "O",
+    (252, 130, 130, 252, 128, 128, 128, 0): "P",
+    (56, 68, 130, 130, 138, 68, 58, 0): "Q",
+    (252, 130, 130, 252, 136, 132, 130, 0): "R",
+    (120, 132, 128, 124, 2, 130, 124, 0): "S",
+    (254, 16, 16, 16, 16, 16, 16, 0): "T",
+    (130, 130, 130, 130, 130, 66, 62, 0): "U",
+    (130, 130, 68, 68, 40, 40, 16, 0): "V",
+    (130, 146, 170, 170, 198, 198, 130, 0): "W",
+    (198, 68, 40, 16, 40, 68, 198, 0): "X",
+    (130, 68, 40, 16, 16, 16, 16, 0): "Y",
+    (254, 4, 8, 16, 32, 64, 254, 0): "Z",
+    (0, 0, 0, 126, 0, 0, 0, 0): "-",
+}
+
+STATUS_CODES = ("PSN", "BRN", "PAR", "SLP", "FRZ")
+
+GEN1_SCROLL_ARROW_SIGNATURES = {
+    (0, 254, 254, 124, 56, 16, 0, 0),
+    (254, 254, 124, 56, 16, 0, 0, 0),
+}
+
+
+def read_tile_text(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> str:
+    """Read a contiguous uppercase/digit text string from 8x8 tiles on row ty in [tx_start, tx_end)."""
+    y0 = ty * TILE_SIZE
+    if img.shape[0] < y0 + TILE_SIZE:
+        return ""
+    max_tx = min(tx_end, img.shape[1] // TILE_SIZE)
+    chars: List[str] = []
+    for tx in range(tx_start, max_tx):
+        tile = img[y0:y0 + TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+        if float((tile >= LIGHT_BACKGROUND).mean()) < 0.45:
+            break
+        sig = _tile_row_signature(tile)
+        if not any(sig):
+            chars.append(" ")
+        elif sig in HUD_LETTER_TEMPLATES:
+            chars.append(HUD_LETTER_TEMPLATES[sig])
+        elif sig in HUD_DIGIT_TEMPLATES:
+            chars.append(str(HUD_DIGIT_TEMPLATES[sig]))
+        else:
+            break
+    return " ".join("".join(chars).split())
+
+
+def read_move_menu_pp(frame: np.ndarray) -> Optional[Tuple[int, int]]:
+    """Return (cur_pp, max_pp) read from the TYPE/PP overlay box at tile row 11, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    y0 = 11 * TILE_SIZE
+    if img.shape[0] < y0 + TILE_SIZE or img.shape[1] < 10 * TILE_SIZE:
+        return None
+    if not all(
+        is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, :TILE_SIZE])
+        and is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 10 * TILE_SIZE:11 * TILE_SIZE])
+        for ty in range(8, 11)
+    ):
+        return None
+    slash_sig = _tile_row_signature(img[y0:y0 + TILE_SIZE, 7 * TILE_SIZE:8 * TILE_SIZE])
+    if slash_sig not in HUD_SLASH_TEMPLATES:
+        return None
+    cur_digits: List[str] = []
+    max_digits: List[str] = []
+    for tx, target in ((5, cur_digits), (6, cur_digits), (8, max_digits), (9, max_digits)):
+        tile = img[y0:y0 + TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+        if float((tile >= LIGHT_BACKGROUND).mean()) < 0.45:
+            return None
+        sig = _tile_row_signature(tile)
+        if not any(sig):
+            if target:
+                return None
+            continue
+        digit = HUD_DIGIT_TEMPLATES.get(sig)
+        if digit is None:
+            return None
+        target.append(str(digit))
+    if not cur_digits or not max_digits:
+        return None
+    cur_pp, max_pp = int("".join(cur_digits)), int("".join(max_digits))
+    if 0 <= cur_pp <= max_pp and 1 <= max_pp <= 99:
+        return (cur_pp, max_pp)
+    return None
+
+
+def read_move_menu_cursor_slot(frame: np.ndarray) -> Optional[int]:
+    """Return the selected move slot (1..4) when the 4-move selection menu is open, or None."""
+    if frame is None or not is_move_selection_screen(frame):
+        return None
+    img = _grey_frame(frame)
+    for slot, ty in enumerate((13, 14, 15, 16), 1):
+        if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE]):
+            return slot
+    return None
+
+
+def read_move_menu_names(frame: np.ndarray) -> Dict[int, str]:
+    """Return a dict mapping move slot (1..4) to move name (or prefix) on an open move selection screen."""
+    if frame is None or not is_move_selection_screen(frame):
+        return {}
+    img = _grey_frame(frame)
+    names: Dict[int, str] = {}
+    for slot, ty in enumerate((13, 14, 15, 16), 1):
+        name = read_tile_text(img, ty, 6, 14)
+        if name and name != "-":
+            names[slot] = name
+    return names
+
+
+def is_no_pp_dialogue_frame(frame: np.ndarray) -> bool:
+    """Return True when the 'No PP left for this move!' dialogue box is displayed below a 0/max PP overlay box."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if not has_bottom_dialogue_box(img) or is_move_selection_screen(img):
+        return False
+    pp = read_move_menu_pp(img)
+    return pp is not None and pp[0] == 0
+
+
+def _read_status_code_on_row(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> Optional[str]:
+    y0 = ty * TILE_SIZE
+    if img.shape[0] < y0 + TILE_SIZE:
+        return None
+    max_tx = min(tx_end, img.shape[1] // TILE_SIZE)
+    row_chars: List[str] = []
+    for tx in range(tx_start, max_tx):
+        tile = img[y0:y0 + TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+        if float((tile >= LIGHT_BACKGROUND).mean()) < 0.45:
+            row_chars.append(" ")
+            continue
+        sig = _tile_row_signature(tile)
+        row_chars.append(HUD_LETTER_TEMPLATES.get(sig, " "))
+    joined = "".join(row_chars)
+    for code in STATUS_CODES:
+        if code in joined:
+            return code
+    return None
+
+
+def read_battle_hud_status(frame: np.ndarray) -> Optional[str]:
+    """Return the active Pokemon's status code ('PSN', 'BRN', 'PAR', 'SLP', 'FRZ'), '' if healthy, or None if HUD not visible."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if read_battle_hud_hp(img) is None:
+        return None
+    code = _read_status_code_on_row(img, ty=8, tx_start=12, tx_end=19)
+    return code if code is not None else ""
+
+
+def read_party_menu_status(frame: np.ndarray) -> Optional[str]:
+    """Return the selected (or lead) Pokemon's status code ('PSN', 'BRN', 'PAR', 'SLP', 'FRZ'), '' if healthy, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if not is_party_menu_screen(img):
+        return None
+    target_slot_ty = 1
+    for slot_ty in (1, 3, 5, 7, 9, 11):
+        found_cursor = False
+        for cursor_ty in (slot_ty - 1, slot_ty):
+            if 0 <= cursor_ty < 12 and is_cursor_tile(
+                img[cursor_ty * TILE_SIZE:(cursor_ty + 1) * TILE_SIZE, :TILE_SIZE]
+            ):
+                if _read_tile_hp_fraction(img, ty=slot_ty, slash_tx=16) is not None:
+                    target_slot_ty = slot_ty
+                    found_cursor = True
+                    break
+        if found_cursor:
+            break
+    if _read_tile_hp_fraction(img, ty=target_slot_ty, slash_tx=16) is None:
+        return None
+    for check_ty in (target_slot_ty - 1, target_slot_ty, target_slot_ty + 1):
+        if 0 <= check_ty < 13:
+            code = _read_status_code_on_row(img, ty=check_ty, tx_start=9, tx_end=20)
+            if code is not None:
+                return code
+    return ""
+
+
+def is_gen1_item_list_screen(frame: np.ndarray) -> bool:
+    """Return True when the Generation 1 ITEM list box is open without an action/quantity sub-box."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < 13 * TILE_SIZE or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if is_party_menu_screen(img) or is_pack_screen(img):
+        return False
+    if has_quantity_selector_box(img):
+        return False
+    if not all(is_horizontal_border_tile(img[2 * TILE_SIZE:3 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+               for tx in range(5, 19)):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 4 * TILE_SIZE:5 * TILE_SIZE])
+               for ty in range(3, 12)):
+        return False
+    if not all(is_horizontal_border_tile(img[12 * TILE_SIZE:13 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+               for tx in range(5, 13)):
+        return False
+    inner = img[3 * TILE_SIZE:12 * TILE_SIZE, 5 * TILE_SIZE:13 * TILE_SIZE]
+    if float((inner >= LIGHT_BACKGROUND).mean()) < 0.70:
+        return False
+    if any(
+        all(is_horizontal_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+            for tx in range(14, 19))
+        for ty in (8, 9, 10)
+    ):
+        return False
+    return True
+
+
+def read_bag_item_list(frame: np.ndarray) -> Optional[Tuple[List[str], bool]]:
+    """Return (visible_item_names, has_more_below) when a Generation 1 or Generation 2 bag item list is open, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if is_gen1_item_list_screen(img):
+        items: List[str] = []
+        saw_cancel = False
+        for ty in (4, 6, 8, 10):
+            name = read_tile_text(img, ty, 6, 18)
+            if not name:
+                continue
+            if name == "CANCEL":
+                saw_cancel = True
+            else:
+                items.append(name)
+        arrow_sig = _tile_row_signature(img[11 * TILE_SIZE:12 * TILE_SIZE, 18 * TILE_SIZE:19 * TILE_SIZE])
+        has_more = (not saw_cancel) and (bool(items) or arrow_sig in GEN1_SCROLL_ARROW_SIGNATURES)
+        return (items, has_more)
+    if is_pack_item_list_screen(img):
+        items = []
+        saw_cancel = False
+        for ty in (2, 4, 6, 8, 10):
+            name = read_tile_text(img, ty, 8, 20)
+            if not name:
+                continue
+            if name == "CANCEL" or name.startswith("CANCEL "):
+                saw_cancel = True
+            else:
+                items.append(name)
+        has_more = (not saw_cancel) and bool(items)
+        return (items, has_more)
+    return None
