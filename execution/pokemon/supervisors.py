@@ -43,6 +43,7 @@ from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUG
                                        PLAYTHROUGH_TEXT_BLOCK, PRIMITIVES)
 from execution.strategist.pokemon.global_map.model import OCCUPIED, UNKNOWN, is_door
 from execution.strategist.pokemon.global_map.routes import blocked_target_cells
+from execution.strategist.pokemon.party_state import PartyInventoryState
 from execution.strategist.pokemon.global_map.text import LEGEND, ascii_window, door_lines, frontier_targets
 from execution.report import ExecutorReport
 from execution.supervisors.base import Supervisor
@@ -182,6 +183,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                  tile_recognizer: TileRecognizer, episode_number: int, guidance: Optional[str] = None,
                  battle_tips: Optional[List[str]] = None,
                  screen_people: Optional[Callable[[], Dict[Tuple[int, int], str]]] = None,
+                 party_state: Optional[PartyInventoryState] = None,
                  initial_battle_hp: Optional[Tuple[int, int]] = None,
                  initial_healing_bag_empty: bool = False,
                  initial_pokemon_status: Optional[str] = None,
@@ -195,14 +197,18 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._current_tag: Optional[str] = None
         self._guidance = guidance
         self._battle_tips = list(battle_tips or [])
-        self._last_seen_battle_hp: Optional[Tuple[int, int]] = initial_battle_hp
-        self._healing_bag_empty: bool = bool(initial_healing_bag_empty)
-        self._active_pokemon_status: Optional[str] = initial_pokemon_status or None
-        self._status_heal_bag_empty: bool = bool(initial_status_heal_bag_empty)
-        self._zero_pp_moves: List[str] = list(initial_zero_pp_moves or [])
-        self._known_bag_items: List[str] = list(initial_known_bag_items or [])
-        self._known_bag_complete: bool = bool(initial_known_bag_complete)
-        self._poison_step_remainder: int = 0
+        if party_state is None:
+            party_state = PartyInventoryState(
+                items=list(initial_known_bag_items or []),
+                saw_top=bool(initial_known_bag_complete),
+                saw_bottom=bool(initial_known_bag_complete),
+                healing_exhausted=bool(initial_healing_bag_empty),
+                status_heal_exhausted=bool(initial_status_heal_bag_empty),
+                last_battle_hp=initial_battle_hp,
+                active_pokemon_status=initial_pokemon_status or None,
+                zero_pp_moves=list(initial_zero_pp_moves or []),
+            )
+        self.party_state: PartyInventoryState = party_state
         self._losses_at_start = env.get_info()["pokemon_core"].get("n_battles_lost", 0)
         gmap_init = getattr(env, "_map", None)
         self._defeats_at_start = len(getattr(gmap_init, "defeats", ()) or ())
@@ -391,6 +397,73 @@ class PokemonPlayThroughSupervisor(Supervisor):
         except Exception:  # noqa: BLE001
             return None
 
+    @property
+    def _last_seen_battle_hp(self) -> Optional[Tuple[int, int]]:
+        return self.party_state.last_battle_hp
+
+    @_last_seen_battle_hp.setter
+    def _last_seen_battle_hp(self, value: Optional[Tuple[int, int]]) -> None:
+        self.party_state.last_battle_hp = value
+
+    @property
+    def _healing_bag_empty(self) -> bool:
+        return self.party_state.healing_bag_empty
+
+    @_healing_bag_empty.setter
+    def _healing_bag_empty(self, value: bool) -> None:
+        self.party_state.healing_bag_empty = bool(value)
+
+    @property
+    def _active_pokemon_status(self) -> Optional[str]:
+        return self.party_state.active_pokemon_status
+
+    @_active_pokemon_status.setter
+    def _active_pokemon_status(self, value: Optional[str]) -> None:
+        self.party_state.active_pokemon_status = value or None
+
+    @property
+    def _status_heal_bag_empty(self) -> bool:
+        return self.party_state.status_heal_bag_empty
+
+    @_status_heal_bag_empty.setter
+    def _status_heal_bag_empty(self, value: bool) -> None:
+        self.party_state.status_heal_bag_empty = bool(value)
+
+    @property
+    def _zero_pp_moves(self) -> List[str]:
+        return self.party_state.zero_pp_moves
+
+    @_zero_pp_moves.setter
+    def _zero_pp_moves(self, value: List[str]) -> None:
+        self.party_state.zero_pp_moves = list(value or [])
+
+    @property
+    def _known_bag_items(self) -> List[str]:
+        return self.party_state.items
+
+    @_known_bag_items.setter
+    def _known_bag_items(self, value: List[str]) -> None:
+        self.party_state.items = [
+            PartyInventoryState.normalize_item_name(x) for x in (value or [])
+            if PartyInventoryState.normalize_item_name(x)
+        ]
+
+    @property
+    def _known_bag_complete(self) -> bool:
+        return self.party_state.bag_complete
+
+    @_known_bag_complete.setter
+    def _known_bag_complete(self, value: bool) -> None:
+        self.party_state.bag_complete = bool(value)
+
+    @property
+    def _poison_step_remainder(self) -> int:
+        return self.party_state.poison_step_remainder
+
+    @_poison_step_remainder.setter
+    def _poison_step_remainder(self, value: int) -> None:
+        self.party_state.poison_step_remainder = int(value)
+
     def _apply_overworld_poison_step_decay(
         self,
         prev_place: Tuple[int, Tuple[int, int]],
@@ -411,13 +484,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if p_seg == n_seg
             else 1
         )
-        if steps_walked <= 0:
-            return
-        total = self._poison_step_remainder + steps_walked
-        ticks, self._poison_step_remainder = divmod(total, 4)
-        if ticks > 0:
-            cur_hp, max_hp = self._last_seen_battle_hp
-            self._last_seen_battle_hp = (max(1, cur_hp - ticks), max_hp)
+        self.party_state.record_overworld_steps(steps_walked)
 
     def _record_map_stop(self) -> Optional[Tuple[int, Tuple[int, int]]]:
         place = self._current_map_place()
@@ -978,6 +1045,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             log_error(f"Unknown executor tag {tag!r}. Options: {list(self.EXECUTORS)}",
                       self._parameters)
         run_kwargs = dict(self._executor_kwargs)
+        if tag in ("combat", "menu"):
+            run_kwargs.setdefault("party_state", self.party_state)
         run_kwargs.update(executor_kwargs)
         run_kwargs["hint"] = hint
         run_kwargs["allow_self_termination"] = allow_self_termination
@@ -1038,32 +1107,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         }
 
     def _update_party_from_dialogue_text(self, notes: Optional[str]) -> None:
-        if not notes:
-            return
-        if re.search(
-            r"\b(?:fighting\s+fit|fully\s+healed|restored\s+(?:your\s+POK[eé]MON\s+)?to\s+full\s+health)\b",
-            notes,
-            re.IGNORECASE,
-        ):
-            if self._last_seen_battle_hp is not None:
-                _, max_hp = self._last_seen_battle_hp
-                self._last_seen_battle_hp = (max_hp, max_hp)
-            self._active_pokemon_status = None
-            self._poison_step_remainder = 0
-            self._zero_pp_moves = []
-        for m_found in re.finditer(
-            r"\bYou\s+found\s+([A-Z0-9][A-Z0-9é -]{1,15})!|\bput\s+the\s+([A-Z0-9][A-Z0-9é -]{1,15})\s+in\b",
-            notes,
-        ):
-            raw_found = (m_found.group(1) or m_found.group(2) or "").strip().upper().replace("É", "E")
-            if raw_found and not re.search(r"^\d+\s+EXP\b|^₽|\bAWAY\s+SAFELY\b", raw_found, re.IGNORECASE):
-                if raw_found not in self._known_bag_items:
-                    self._known_bag_items.append(raw_found)
-        if re.search(r"\bfound\b.{1,30}!|\bput\s+the\b.{1,30}\bin\b|\bgot\b.{1,25}!", notes, re.IGNORECASE):
-            if re.search(r"\b(?:potion|super\s+potion|hyper\s+potion|full\s+restore|fresh\s+water|soda\s+pop|lemonade)\b", notes, re.IGNORECASE):
-                self._healing_bag_empty = False
-            if re.search(r"\b(?:antidote|full\s+heal|full\s+restore|parlyz\s+heal|awakening|burn\s+heal|ice\s+heal|berry)\b", notes, re.IGNORECASE):
-                self._status_heal_bag_empty = False
+        self.party_state.update_from_dialogue_notes(notes, episode_number=self._episode_number)
 
     def _process_interaction(self, report: ExecutorReport) -> Dict[str, Any]:
         succeeded = report.outcome in (0, 1, 2)
@@ -1083,154 +1127,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             ambiguous=report.outcome == MOVE_TARGET_AMBIGUOUS)
 
     def _update_bag_status_from_notes(self, notes: str, task: Optional[str] = None) -> bool:
-        bag_info = CombatExecutor.extract_bag_items_from_text(notes)
-        if bag_info is None:
-            return False
-        bag_items, all_checked = bag_info
-        task_str = task or ""
-        is_buy_only = bool(
-            re.search(r"\b(?:buy|purchase|shop)\b", task_str, re.IGNORECASE)
-            and not re.search(r"\bsell\b", task_str, re.IGNORECASE)
-        ) or bool(
-            re.search(r"\bThat\s+will\s+be\b", notes, re.IGNORECASE)
-            and not re.search(r"\bWhat\s+would\s+you\s+like\s+to\s+sell\b", notes, re.IGNORECASE)
-        )
-        if is_buy_only:
-            return False
-        items = list(bag_items)
-        if re.search(r"\b(?:buy|purchase)\b", task_str, re.IGNORECASE) and re.search(r"\bsell\b", task_str, re.IGNORECASE):
-            for m_s in re.finditer(r"\bsell\s+(?:the\s+|an?\s+)?([A-Z0-9][A-Z0-9 -]{1,15}?)\b", task_str, re.IGNORECASE):
-                s_name = m_s.group(1).strip().upper()
-                if s_name in items:
-                    s_idx = items.index(s_name)
-                    items = [
-                        it for idx_it, it in enumerate(items)
-                        if it.upper() != s_name and (idx_it <= s_idx or it in self._known_bag_items)
-                    ]
-                if s_name in self._known_bag_items:
-                    self._known_bag_items.remove(s_name)
-        if all_checked:
-            missing_non_heal = [
-                old for old in self._known_bag_items
-                if old not in items and not is_healing_item_name(old)
-            ]
-            if len(items) <= 4 and missing_non_heal:
-                self._known_bag_items = CombatExecutor._merge_visible_bag_items(self._known_bag_items, items)
-                if not any(is_healing_item_name(it) for it in items):
-                    self._known_bag_items = [
-                        it for it in self._known_bag_items
-                        if not is_healing_item_name(it) or it in items
-                    ]
-            else:
-                self._known_bag_items = list(items)
-            self._known_bag_complete = True
-        elif items:
-            self._known_bag_items = CombatExecutor._merge_visible_bag_items(self._known_bag_items, items)
-        if any(is_healing_item_name(it) for it in items):
-            self._healing_bag_empty = False
-        elif all_checked:
-            self._healing_bag_empty = True
-            self._known_bag_items = [it for it in self._known_bag_items if not is_healing_item_name(it)]
-        if any(is_status_heal_item_name(it) for it in items):
-            self._status_heal_bag_empty = False
-        elif all_checked:
-            self._status_heal_bag_empty = True
-        return True
+        return self.party_state.update_from_bag_notes(notes, task)
 
     def _update_party_hp_from_combat(self, report: ExecutorReport) -> None:
-        notes = report.notes or ""
-        self._update_bag_status_from_notes(notes, getattr(report, "task", None))
-        bag_info = CombatExecutor.extract_bag_items_from_text(notes)
-        has_remaining_heal = bool(bag_info and any(is_healing_item_name(it) for it in bag_info[0]))
-        if (
-            (
-                getattr(self.last_executor, "_bag_unavailable", False)
-                or getattr(self.last_executor, "_healing_items_exhausted", False)
-            )
-            and not has_remaining_heal
-        ):
-            self._healing_bag_empty = True
-            self._known_bag_items = [it for it in self._known_bag_items if not is_healing_item_name(it)]
-        if report.termination_reason == "battle_lost":
-            self._last_seen_battle_hp = None
-            self._active_pokemon_status = None
-            self._poison_step_remainder = 0
-            self._zero_pp_moves = []
-            return
-        hp = CombatExecutor.extract_player_hp_from_text(notes)
-        if hp is not None:
-            self._last_seen_battle_hp = hp
-            self._poison_step_remainder = 0
-        status = CombatExecutor.extract_player_status_from_text(notes)
-        if status is not None:
-            self._active_pokemon_status = status or None
-            if not self._active_pokemon_status:
-                self._poison_step_remainder = 0
-        zero_pp = CombatExecutor.extract_zero_pp_moves_from_text(notes)
-        if zero_pp is not None:
-            for item in zero_pp:
-                if item and item not in self._zero_pp_moves:
-                    self._zero_pp_moves.append(item)
+        self.party_state.update_from_combat_report(
+            report,
+            executor=self.last_executor,
+            episode_number=self._episode_number,
+        )
 
     def _update_party_hp_from_menu(self, report: ExecutorReport) -> None:
-        notes = report.notes or ""
-        task_str = getattr(report, "task", None) or ""
-        self._update_bag_status_from_notes(notes, task_str)
-        if "No healing item was used in menu" in notes:
-            self._healing_bag_empty = True
-            self._known_bag_items = [it for it in self._known_bag_items if not is_healing_item_name(it)]
-        if "No status-healing item was used in menu" in notes:
-            self._status_heal_bag_empty = True
-        if re.search(r"\b(?:here\s+you\s+(?:go|are)|thank\s+you)\b", notes, re.IGNORECASE):
-            if re.search(r"\bpotion\b", notes + " " + task_str, re.IGNORECASE):
-                self._healing_bag_empty = False
-                if "POTION" not in self._known_bag_items:
-                    self._known_bag_items.append("POTION")
-            if re.search(r"\b(?:antidote|full\s+heal|parlyz\s+heal|awakening|burn\s+heal|ice\s+heal)\b", notes + " " + task_str, re.IGNORECASE):
-                self._status_heal_bag_empty = False
-            if re.search(r"\bpok[eé]\s*ball\b", notes + " " + task_str, re.IGNORECASE):
-                if "POKE BALL" not in self._known_bag_items and "POK" not in self._known_bag_items:
-                    self._known_bag_items.append("POKE BALL")
-        if "grew" in notes and "RARE CANDY" in task_str.upper() and "RARE CANDY" in self._known_bag_items:
-            self._known_bag_items.remove("RARE CANDY")
-        if (
-            re.search(r"\b(?:HEALTH|ATTACK|DEFENSE|SPEED|SPECIAL)\s+rose\b", notes, re.IGNORECASE)
-            and "HP UP" in task_str.upper()
-            and "HP UP" in self._known_bag_items
-        ):
-            self._known_bag_items.remove("HP UP")
-        status = CombatExecutor.extract_player_status_from_text(notes)
-        if status is not None:
-            self._active_pokemon_status = status or None
-            if not self._active_pokemon_status:
-                self._poison_step_remainder = 0
-        menu_hp = CombatExecutor.extract_player_hp_from_text(notes)
-        m = re.search(r"\b(?:recovered(?:\s+by)?|restored)\s+(\d+)(?:\s*HP)?\b", notes, re.IGNORECASE)
-        if m:
-            self._healing_bag_empty = False
-            if menu_hp is not None:
-                self._last_seen_battle_hp = menu_hp
-                self._poison_step_remainder = 0
-            elif self._last_seen_battle_hp is not None:
-                delta = int(m.group(1))
-                cur_hp, max_hp = self._last_seen_battle_hp
-                self._last_seen_battle_hp = (min(max_hp, cur_hp + delta), max_hp)
-        elif re.search(
-            r"\b(?:fighting\s+fit|fully\s+healed|restored\s+(?:your\s+POK[eé]MON\s+)?to\s+full\s+health)\b",
-            notes,
-            re.IGNORECASE,
-        ):
-            if menu_hp is not None:
-                self._last_seen_battle_hp = (menu_hp[1], menu_hp[1])
-            elif self._last_seen_battle_hp is not None:
-                _, max_hp = self._last_seen_battle_hp
-                self._last_seen_battle_hp = (max_hp, max_hp)
-            self._active_pokemon_status = None
-            self._poison_step_remainder = 0
-            self._zero_pp_moves = []
-        elif menu_hp is not None:
-            self._last_seen_battle_hp = menu_hp
-            self._poison_step_remainder = 0
+        self.party_state.update_from_menu_report(
+            report,
+            episode_number=self._episode_number,
+        )
 
     def _party_hp_block(self) -> str:
         if (

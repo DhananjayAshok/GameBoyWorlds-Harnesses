@@ -29,6 +29,7 @@ from execution.strategist.pokemon.guide import (NEW_TOWN, StrategyGuide, battle_
                                                 update_guide)
 from execution.strategist.pokemon.knowledge import PokemonKnowledgeTree, remember, remember_all
 from execution.strategist.pokemon.notepad import ThoughtNotepad
+from execution.strategist.pokemon.party_state import PartyInventoryState
 from execution.strategist.pokemon.npc_map import with_people
 from execution.strategist.pokemon.npcs import PLACED_STATUS, STALE_EPISODES, NPCRegistry
 from execution.strategist.pokemon.global_map import (FAILURE_EPISODES, GlobalMap, MappingEnvironment, explore_text,
@@ -596,6 +597,10 @@ class PokemonStrategist:
         self.global_map = self._load_or_default(GlobalMap, GlobalMap)
         self.global_map.refresh(self.tiles._by_hash)
         self.guide = self._load_or_default(StrategyGuide, StrategyGuide)
+        self._had_saved_party_artifact = bool(
+            PartyInventoryState.saved_episodes(self._resume_dir, self._resume_episode)
+        )
+        self.party: PartyInventoryState = self._load_or_default(PartyInventoryState, PartyInventoryState)
         self._npc_registry = npc_registry
         self.npcs = self._load_or_default(NPCRegistry, lambda: NPCRegistry(game, name)) if npc_registry else None
         if self.npcs is not None:
@@ -626,18 +631,6 @@ class PokemonStrategist:
         self._episodes_run = 0
         self._ran = False
         self._explore_now = False
-        self._fought_since_heal: int = 0
-        self._fled_since_heal: int = 0
-        self._last_heal_episode: Optional[int] = None
-        self._last_battle_hp: Optional[Tuple[int, int]] = None
-        self._last_battle_hp_episode: Optional[int] = None
-        self._fought_since_last_hp: int = 0
-        self._healing_bag_empty: bool = False
-        self._active_pokemon_status: Optional[str] = None
-        self._status_heal_bag_empty: bool = False
-        self._zero_pp_moves: List[str] = []
-        self._known_bag_items: List[str] = []
-        self._known_bag_complete: bool = False
         self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {}
 
         self._started_at = datetime.now()
@@ -710,213 +703,118 @@ class PokemonStrategist:
             return artifact
         return factory()
 
+    @property
+    def _fought_since_heal(self) -> int:
+        return self.party.fought_since_heal
+
+    @_fought_since_heal.setter
+    def _fought_since_heal(self, value: int) -> None:
+        self.party.fought_since_heal = int(value)
+
+    @property
+    def _fled_since_heal(self) -> int:
+        return self.party.fled_since_heal
+
+    @_fled_since_heal.setter
+    def _fled_since_heal(self, value: int) -> None:
+        self.party.fled_since_heal = int(value)
+
+    @property
+    def _last_heal_episode(self) -> Optional[int]:
+        return self.party.last_heal_episode
+
+    @_last_heal_episode.setter
+    def _last_heal_episode(self, value: Optional[int]) -> None:
+        self.party.last_heal_episode = value
+
+    @property
+    def _last_battle_hp(self) -> Optional[Tuple[int, int]]:
+        return self.party.last_battle_hp
+
+    @_last_battle_hp.setter
+    def _last_battle_hp(self, value: Optional[Tuple[int, int]]) -> None:
+        self.party.last_battle_hp = value
+
+    @property
+    def _last_battle_hp_episode(self) -> Optional[int]:
+        return self.party.last_battle_hp_episode
+
+    @_last_battle_hp_episode.setter
+    def _last_battle_hp_episode(self, value: Optional[int]) -> None:
+        self.party.last_battle_hp_episode = value
+
+    @property
+    def _fought_since_last_hp(self) -> int:
+        return self.party.fought_since_last_hp
+
+    @_fought_since_last_hp.setter
+    def _fought_since_last_hp(self, value: int) -> None:
+        self.party.fought_since_last_hp = int(value)
+
+    @property
+    def _healing_bag_empty(self) -> bool:
+        return self.party.healing_bag_empty
+
+    @_healing_bag_empty.setter
+    def _healing_bag_empty(self, value: bool) -> None:
+        self.party.healing_bag_empty = bool(value)
+
+    @property
+    def _active_pokemon_status(self) -> Optional[str]:
+        return self.party.active_pokemon_status
+
+    @_active_pokemon_status.setter
+    def _active_pokemon_status(self, value: Optional[str]) -> None:
+        self.party.active_pokemon_status = value or None
+
+    @property
+    def _status_heal_bag_empty(self) -> bool:
+        return self.party.status_heal_bag_empty
+
+    @_status_heal_bag_empty.setter
+    def _status_heal_bag_empty(self, value: bool) -> None:
+        self.party.status_heal_bag_empty = bool(value)
+
+    @property
+    def _zero_pp_moves(self) -> List[str]:
+        return self.party.zero_pp_moves
+
+    @_zero_pp_moves.setter
+    def _zero_pp_moves(self, value: List[str]) -> None:
+        self.party.zero_pp_moves = list(value or [])
+
+    @property
+    def _known_bag_items(self) -> List[str]:
+        return self.party.items
+
+    @_known_bag_items.setter
+    def _known_bag_items(self, value: List[str]) -> None:
+        self.party.items = [
+            PartyInventoryState.normalize_item_name(x) for x in (value or [])
+            if PartyInventoryState.normalize_item_name(x)
+        ]
+
+    @property
+    def _known_bag_complete(self) -> bool:
+        return self.party.bag_complete
+
+    @_known_bag_complete.setter
+    def _known_bag_complete(self, value: bool) -> None:
+        self.party.bag_complete = bool(value)
+
     def _update_known_bag_from_digest(self, digest: str) -> Optional[Tuple[List[str], bool]]:
         if not digest:
             return None
-        last_non_buy_info: Optional[Tuple[List[str], bool]] = None
-        if "Text seen along the way, in order:" in digest:
-            text_sec = digest.split("Text seen along the way, in order:", 1)[1]
-            chunks = re.split(r"\n-\s+while\s+doing\s+\"", text_sec)
-            for ch in chunks[1:]:
-                if "\":" not in ch:
-                    continue
-                obj, body = ch.split("\":", 1)
-                is_buy_only = bool(
-                    re.search(r"\b(?:buy|purchase|shop)\b", obj, re.IGNORECASE)
-                    and not re.search(r"\bsell\b", obj, re.IGNORECASE)
-                ) or bool(
-                    re.search(r"\bThat\s+will\s+be\b", body, re.IGNORECASE)
-                    and not re.search(r"\bWhat\s+would\s+you\s+like\s+to\s+sell\b", body, re.IGNORECASE)
-                )
-                if is_buy_only:
-                    continue
-                for m in CombatExecutor.BAG_ITEMS_TAG_PATTERN.finditer(body):
-                    raw = m.group(1).strip()
-                    all_checked = bool(
-                        re.search(
-                            r"\((?:all\s+bag\s+slots\s+checked|end\s+of\s+bag\s+reached)\)",
-                            raw,
-                            re.IGNORECASE,
-                        )
-                    )
-                    clean_raw = re.sub(
-                        r"\s*\((?:all\s+bag\s+slots\s+checked|end\s+of\s+bag\s+reached)\)\s*",
-                        "",
-                        raw,
-                        flags=re.IGNORECASE,
-                    ).strip()
-                    items = [
-                        re.sub(r"\s*\(x\d+\)\s*$", "", part.strip(), flags=re.IGNORECASE)
-                        for part in clean_raw.split(",")
-                        if part.strip()
-                    ] if clean_raw and clean_raw.lower() != "none" else []
-                    items = [it for it in items if it and it.lower() != "none"]
-                    if re.search(r"\b(?:buy|purchase)\b", obj, re.IGNORECASE) and re.search(r"\bsell\b", obj, re.IGNORECASE):
-                        for m_s in re.finditer(
-                            r"\bsell\s+(?:the\s+|an?\s+)?([A-Z0-9][A-Z0-9 -]{1,15}?)\b",
-                            obj,
-                            re.IGNORECASE,
-                        ):
-                            s_name = m_s.group(1).strip().upper()
-                            if s_name in items:
-                                s_idx = items.index(s_name)
-                                items = [
-                                    it for idx_it, it in enumerate(items)
-                                    if it.upper() != s_name and (idx_it <= s_idx or it in self._known_bag_items)
-                                ]
-                            if s_name in self._known_bag_items:
-                                self._known_bag_items.remove(s_name)
-                    if all_checked:
-                        missing_non_heal = [
-                            old for old in self._known_bag_items
-                            if old not in items and not is_healing_item_name(old)
-                        ]
-                        if len(items) <= 4 and missing_non_heal:
-                            self._known_bag_items = CombatExecutor._merge_visible_bag_items(
-                                self._known_bag_items,
-                                items,
-                            )
-                            if not any(is_healing_item_name(it) for it in items):
-                                self._known_bag_items = [
-                                    it for it in self._known_bag_items
-                                    if not is_healing_item_name(it) or it in items
-                                ]
-                        else:
-                            self._known_bag_items = list(items)
-                        self._known_bag_complete = True
-                    elif items:
-                        self._known_bag_items = CombatExecutor._merge_visible_bag_items(
-                            self._known_bag_items,
-                            items,
-                        )
-                    last_non_buy_info = (list(self._known_bag_items), all_checked)
-                if "grew" in body and "RARE CANDY" in obj.upper() and "RARE CANDY" in self._known_bag_items:
-                    self._known_bag_items.remove("RARE CANDY")
-                if (
-                    re.search(r"\b(?:HEALTH|ATTACK|DEFENSE|SPEED|SPECIAL)\s+rose\b", body, re.IGNORECASE)
-                    and "HP UP" in obj.upper()
-                    and "HP UP" in self._known_bag_items
-                ):
-                    self._known_bag_items.remove("HP UP")
-        for m_found in re.finditer(
-            r"\bYou\s+found\s+([A-Z0-9][A-Z0-9é -]{1,15})!|\bput\s+the\s+([A-Z0-9][A-Z0-9é -]{1,15})\s+in\b",
-            digest,
-        ):
-            raw_found = (m_found.group(1) or m_found.group(2) or "").strip().upper().replace("É", "E")
-            if raw_found and not re.search(r"^\d+\s+EXP\b|^₽|\bAWAY\s+SAFELY\b", raw_found, re.IGNORECASE):
-                if raw_found not in self._known_bag_items:
-                    self._known_bag_items.append(raw_found)
-        if is_healing_item_bought_digest(digest):
-            if "POTION" not in self._known_bag_items and not any(is_healing_item_name(it) for it in self._known_bag_items):
-                self._known_bag_items.append("POTION")
-            if re.search(r"\bpok[eé]\s*balls?\b", digest, re.IGNORECASE):
-                if "POKE BALL" not in self._known_bag_items and "POK" not in self._known_bag_items:
-                    self._known_bag_items.append("POKE BALL")
-        elif is_healing_bag_empty_digest(digest):
-            self._known_bag_items = [it for it in self._known_bag_items if not is_healing_item_name(it)]
-        return last_non_buy_info
+        info = self.party.extract_bag_items_with_quantities_from_text(digest)
+        if info is not None:
+            items, qtys, all_checked = info
+            self.party.apply_bag_tag_observation(items, qtys, all_checked, body_text=digest)
+            return list(self.party.items), all_checked
+        return None
 
     def _record_party_episode(self, record: EpisodeRecord,
                               strategist_calls: Optional[List[StrategistVLMCallRecord]] = None) -> None:
-        digest = record.supervisor_report.digest if record.supervisor_report is not None else ""
-        bag_info = self._update_known_bag_from_digest(digest)
-        if bag_info is None:
-            bag_info = CombatExecutor.extract_bag_items_from_text(digest)
-        if is_healing_item_bought_digest(digest):
-            self._healing_bag_empty = False
-            self._status_heal_bag_empty = False
-        elif bag_info is not None:
-            bag_items, all_checked = bag_info
-            if any(is_healing_item_name(it) for it in bag_items):
-                self._healing_bag_empty = False
-            elif all_checked:
-                self._healing_bag_empty = True
-            if any(is_status_heal_item_name(it) for it in bag_items):
-                self._status_heal_bag_empty = False
-            elif all_checked:
-                self._status_heal_bag_empty = True
-        elif is_healing_bag_empty_digest(digest):
-            self._healing_bag_empty = True
-        if "No status-healing item was used in menu" in digest:
-            self._status_heal_bag_empty = True
-        if is_real_battle_loss(record) or is_healing_digest(digest):
-            self._fought_since_heal = 0
-            self._fled_since_heal = 0
-            self._last_heal_episode = record.n
-            self._last_battle_hp = None
-            self._last_battle_hp_episode = None
-            self._fought_since_last_hp = 0
-            self._active_pokemon_status = None
-            self._zero_pp_moves = []
-            return
-        fought, fled = fought_and_fled_battles_in_digest(digest)
-        self._fought_since_heal += fought
-        self._fled_since_heal += fled
-        m_rec = HEALING_ITEM_USED_PATTERN.search(digest)
-        if m_rec:
-            if bag_info is None and not is_healing_bag_empty_digest(digest):
-                self._healing_bag_empty = False
-            if (
-                self._active_pokemon_status == "PSN"
-                and re.search(
-                    r"\buse\s+(?:a\s+Potion\s+\(and\s+an?\s+Antidote|an?\s+Antidote\s+\(if\s+available\))",
-                    digest,
-                    re.IGNORECASE,
-                )
-                and not re.search(r"\b(?:cured\s+of\s+(?:its\s+)?poison|poison\s+faded)\b", digest, re.IGNORECASE)
-            ):
-                self._status_heal_bag_empty = True
-        status = CombatExecutor.extract_player_status_from_text(digest)
-        if status is not None:
-            self._active_pokemon_status = status or None
-        zero_pp = CombatExecutor.extract_zero_pp_moves_from_text(digest)
-        if zero_pp is not None:
-            for item in zero_pp:
-                if item and item not in self._zero_pp_moves:
-                    self._zero_pp_moves.append(item)
-        elif fought > 0 and "Text seen along the way, in order:" in digest:
-            text_sec = digest.split("Text seen along the way, in order:", 1)[1]
-            for m_order in re.finditer(
-                r'while doing "(?:Defeat|Use)\b[^"\n]*?\busing\s+([A-Za-z][A-Za-z0-9 -]{2,15}?)(?:,|\s+to\b|\s+and\b|\s*\()',
-                text_sec,
-                re.IGNORECASE,
-            ):
-                ordered_move = m_order.group(1).strip().upper()
-                if ordered_move and f"USED {ordered_move}!" not in text_sec.upper() and re.search(r"\bUSED\s+[A-Z0-9 -]+!", text_sec, re.IGNORECASE):
-                    if ordered_move not in self._zero_pp_moves and not any(
-                        ordered_move in existing.upper() for existing in self._zero_pp_moves
-                    ):
-                        self._zero_pp_moves.append(ordered_move)
-        hp = CombatExecutor.extract_player_hp_from_text(digest)
-        if hp is None and record.supervisor_report is not None:
-            for ex in record.supervisor_report.executor_reports:
-                if ex.executor_name == CombatExecutor.__name__:
-                    for call in ex.vlm_call_log:
-                        if isinstance(call, ExecutorVLMCallRecord) and call.tag in (
-                            CombatExecutor.STEP_TAG, CombatExecutor.MOVE_TAG
-                        ):
-                            found = CombatExecutor.extract_player_hp_from_text(str(call.response))
-                            if found is not None:
-                                hp = found
-        if hp is None and strategist_calls:
-            for c in strategist_calls:
-                if c.stage == "defeat_reflection":
-                    idx = c.prompt.find("The battle, as the player fought it:")
-                    end = c.prompt.find("The first image is the battle screen")
-                    if idx != -1:
-                        hp = CombatExecutor.extract_player_hp_from_text(
-                            c.prompt[idx:end if end != -1 else len(c.prompt)]
-                        )
-        if hp is not None:
-            self._last_battle_hp = hp
-            self._last_battle_hp_episode = record.n
-            self._fought_since_last_hp = 0
-        else:
-            if m_rec and self._last_battle_hp is not None and fought == 0:
-                cur_hp, max_hp = self._last_battle_hp
-                self._last_battle_hp = (min(max_hp, cur_hp + int(m_rec.group(1))), max_hp)
-                self._last_battle_hp_episode = record.n
-            self._fought_since_last_hp += fought
+        self.party.reconstruct_from_episode(record, strategist_calls)
 
     def _bag_inventory_suffix(self) -> str:
         if not self._known_bag_items:
@@ -1074,7 +972,8 @@ class PokemonStrategist:
                     false_loss_episodes.add(n)
                     ep.status = "completed"
                     ep.summary = sanitize_false_loss_summary(ep.summary)
-                self._record_party_episode(ep, archive.strategist_calls)
+                if not self._had_saved_party_artifact:
+                    self._record_party_episode(ep, archive.strategist_calls)
                 if n in keep_from:
                     episodes.append(ep)
             except Exception as e:  # noqa: BLE001
@@ -1652,7 +1551,8 @@ class PokemonStrategist:
         self.notepad.clear(episode_number=n)
 
     def save_all(self, episode_number: int) -> None:
-        artifacts = [self.tiles, self.goals, self.knowledge, self.notepad, self.guide, self.global_map]
+        self.party.touch(episode_number)
+        artifacts = [self.tiles, self.goals, self.knowledge, self.notepad, self.guide, self.global_map, self.party]
         if self.npcs is not None:
             artifacts.append(self.npcs)
         for artifact in artifacts:
@@ -1784,19 +1684,12 @@ class PokemonStrategist:
         env = MappingEnvironment(self._env, self.global_map, self.tiles, self._parameters,
                                  listeners=listeners + [record_so_far])
         step_from = self.global_map.step
-        pre_episode_hp = self._last_battle_hp
         supervisor = PokemonPlayThroughSupervisor(
             task=task, env=env, game=self._game, max_steps=self._supervisor_max_steps,
             tile_recognizer=self.tiles, episode_number=n, guidance=guidance, parameters=self._parameters,
             max_new_tokens=self._supervisor_max_new_tokens, battle_tips=battle_tips(self.guide),
             screen_people=self._screen_people if self.npcs is not None else None,
-            initial_battle_hp=self._last_battle_hp,
-            initial_healing_bag_empty=self._healing_bag_empty,
-            initial_pokemon_status=self._active_pokemon_status,
-            initial_status_heal_bag_empty=self._status_heal_bag_empty,
-            initial_zero_pp_moves=self._zero_pp_moves,
-            initial_known_bag_items=self._known_bag_items,
-            initial_known_bag_complete=self._known_bag_complete,
+            party_state=self.party,
             initial_blocked_moves=self._blocked_moves,
             **self._supervisor_kwargs,
         )
@@ -1838,33 +1731,6 @@ class PokemonStrategist:
         self.global_map.refresh(self.tiles._by_hash)
 
         self._record_party_episode(record)
-        self._healing_bag_empty = bool(getattr(supervisor, "_healing_bag_empty", self._healing_bag_empty))
-        self._status_heal_bag_empty = bool(getattr(supervisor, "_status_heal_bag_empty", self._status_heal_bag_empty))
-        sup_known_bag = getattr(supervisor, "_known_bag_items", None)
-        if sup_known_bag:
-            if getattr(supervisor, "_known_bag_complete", False):
-                self._known_bag_items = list(sup_known_bag)
-                self._known_bag_complete = True
-            else:
-                self._known_bag_items = CombatExecutor._merge_visible_bag_items(
-                    self._known_bag_items,
-                    list(sup_known_bag),
-                )
-        episode_digest = report.digest if report is not None else ""
-        if not (is_real_battle_loss(record) or is_healing_digest(episode_digest)):
-            sup_hp = getattr(supervisor, "_last_seen_battle_hp", None)
-            if sup_hp is not None and (self._last_battle_hp != sup_hp or sup_hp != pre_episode_hp):
-                self._last_battle_hp = sup_hp
-                if self._last_battle_hp_episode is None or sup_hp != pre_episode_hp:
-                    self._last_battle_hp_episode = record.n
-            self._active_pokemon_status = getattr(
-                supervisor,
-                "_active_pokemon_status",
-                self._active_pokemon_status,
-            )
-            for z_move in (getattr(supervisor, "_zero_pp_moves", None) or ()):
-                if z_move and z_move not in self._zero_pp_moves:
-                    self._zero_pp_moves.append(z_move)
         if record.status == "lost_battle":
             closed = []
         else:

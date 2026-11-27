@@ -42,6 +42,7 @@ from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE,
 from execution.executor_action import coords_to_string
 from execution.pokemon.executor_actions import CheckInteractionAction
 from execution.report import EnvironmentStepRecord, ExecutorVLMCallRecord
+from execution.strategist.pokemon.party_state import PartyInventoryState
 from utils import log_error, ocr, parse_int, parse_key_value, parse_yes_no
 
 
@@ -2243,8 +2244,10 @@ Press: <one of up, down, left, right, confirm, back>
         skip_intro_ocr: bool = False,
         initial_zero_pp_moves: Optional[List[str]] = None,
         initial_bag_unavailable: bool = False,
+        party_state: Optional[PartyInventoryState] = None,
         **kwargs,
     ):
+        self._party_state: Optional[PartyInventoryState] = party_state
         self.history: List[str] = []
         self.dialogue_crops: List[Any] = (
             drop_prefix_crops([c for c in initial_dialogue_crops if not is_battle_menu_crop(c)])
@@ -2261,7 +2264,20 @@ Press: <one of up, down, left, right, confirm, back>
                 re.IGNORECASE,
             )
         )
-        self._bag_unavailable: bool = bool(initial_bag_unavailable or task_says_bag_empty)
+        task_wants_ball = bool(
+            re.search(
+                r"\b(?:catch|capture|poke\s*ball|poké\s*ball|great\s*ball|ultra\s*ball)\b",
+                str(task or ""),
+                re.IGNORECASE,
+            )
+        )
+        state_bag_empty = bool(
+            party_state is not None
+            and party_state.healing_bag_empty
+            and (not party_state.active_pokemon_status or party_state.status_heal_bag_empty)
+            and not task_wants_ball
+        )
+        self._bag_unavailable: bool = bool(initial_bag_unavailable or task_says_bag_empty or state_bag_empty)
         self._in_bag_menu: bool = False
         self._in_pokemon_menu: bool = False
         self._party_effect_pending: bool = False
@@ -2272,17 +2288,26 @@ Press: <one of up, down, left, right, confirm, back>
         self._move_pp: Dict[int, Tuple[int, int]] = {}
         self._zero_pp_slots: Dict[int, str] = {}
         self._known_zero_pp_names: set = set()
-        self._seen_bag_items: List[str] = []
-        self._bag_item_quantities: Dict[str, Optional[int]] = {}
+        self._seen_bag_items: List[str] = list(party_state.items) if party_state is not None else []
+        self._bag_item_quantities: Dict[str, Optional[int]] = (
+            dict(party_state.quantities) if party_state is not None else {}
+        )
         self._saw_bag_top: bool = False
         self._saw_bag_bottom: bool = False
         self._saw_bag_end: bool = False
         self._bag_scrolled_in_opening: bool = False
         self._opened_bag_in_battle: bool = False
-        self._healing_items_exhausted: bool = False
+        self._healing_items_exhausted: bool = bool(
+            party_state.healing_exhausted if party_state is not None else False
+        )
         self._bag_cursor_idx: Optional[int] = None
         self._selected_bag_item: Optional[str] = None
-        for entry in (initial_zero_pp_moves or ()):
+        seed_zero_pp = (
+            initial_zero_pp_moves
+            if initial_zero_pp_moves is not None
+            else (party_state.zero_pp_moves if party_state is not None else ())
+        )
+        for entry in (seed_zero_pp or ()):
             text = str(entry).strip()
             if not text:
                 continue
@@ -2625,34 +2650,7 @@ Press: <one of up, down, left, right, confirm, back>
 
     @staticmethod
     def _merge_visible_bag_items(seen: List[str], visible: List[str]) -> List[str]:
-        clean_vis = [name for name in visible if name and name != "CANCEL"]
-        if not clean_vis:
-            return list(seen)
-        if not seen:
-            return list(clean_vis)
-        overlap_pairs = [(v_idx, seen.index(name)) for v_idx, name in enumerate(clean_vis) if name in seen]
-        if not overlap_pairs:
-            out = list(seen)
-            for name in clean_vis:
-                if name not in out:
-                    out.append(name)
-            return out
-        first_v_idx, first_s_idx = overlap_pairs[0]
-        prefix_new = [name for name in clean_vis[:first_v_idx] if name not in seen]
-        out = seen[:first_s_idx] + prefix_new + seen[first_s_idx:]
-        last_pos = out.index(clean_vis[overlap_pairs[-1][0]])
-        for name in clean_vis[overlap_pairs[-1][0] + 1:]:
-            if name not in out:
-                last_pos += 1
-                out.insert(last_pos, name)
-        for v_idx, name in enumerate(clean_vis):
-            if name not in out:
-                if v_idx > 0 and clean_vis[v_idx - 1] in out:
-                    pos = out.index(clean_vis[v_idx - 1]) + 1
-                    out.insert(pos, name)
-                else:
-                    out.append(name)
-        return out
+        return PartyInventoryState.merge_visible_items(seen, visible)
 
     def _scan_bag_menu_frame(self, frame: Optional[np.ndarray]) -> Optional[Tuple[List[str], bool, Optional[str]]]:
         if frame is None:
@@ -2663,10 +2661,6 @@ Press: <one of up, down, left, right, confirm, back>
         self._opened_bag_in_battle = True
         items, has_more = info
         quantities = dict(read_bag_item_quantities(frame) or ())
-        self._seen_bag_items = self._merge_visible_bag_items(self._seen_bag_items, items)
-        for name in items:
-            if name in quantities and quantities[name] is not None:
-                self._bag_item_quantities[name] = quantities[name]
         cursor_idx = read_bag_cursor_row_index(frame, tracked_index=self._bag_cursor_idx)
         cursor_row = read_bag_cursor_row(frame, tracked_index=self._bag_cursor_idx)
         if cursor_row == "CANCEL":
@@ -2680,12 +2674,37 @@ Press: <one of up, down, left, right, confirm, back>
             self._saw_bag_bottom = True
             if len(items) < max_items_with_cancel:
                 self._saw_bag_top = True
+        if (
+            not self._bag_scrolled_in_opening
+            and cursor_idx == 0
+            and bool(items)
+            and (
+                not self._seen_bag_items
+                or items[0] not in self._seen_bag_items
+                or self._seen_bag_items.index(items[0]) == 0
+            )
+        ):
+            self._saw_bag_top = True
+        if self._party_state is not None:
+            self._seen_bag_items = self._party_state.observe_bag_window(
+                items,
+                quantities=quantities,
+                has_more=has_more,
+                at_top=self._saw_bag_top,
+                at_bottom=self._saw_bag_bottom,
+                max_items_with_cancel=max_items_with_cancel,
+            )
+            self._bag_item_quantities = dict(self._party_state.quantities)
+        else:
+            self._seen_bag_items = self._merge_visible_bag_items(self._seen_bag_items, items)
+            for name in items:
+                if name in quantities and quantities[name] is not None:
+                    self._bag_item_quantities[name] = quantities[name]
+            if not has_more and len(items) < max_items_with_cancel:
                 for existing in list(self._seen_bag_items):
                     if existing not in items:
                         self._seen_bag_items.remove(existing)
                         self._bag_item_quantities.pop(existing, None)
-        if not self._bag_scrolled_in_opening and cursor_idx == 0 and bool(items):
-            self._saw_bag_top = True
         self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
         if self._healing_items_exhausted and any(is_healing_item_name(it) for it in self._seen_bag_items):
             self._healing_items_exhausted = False
@@ -2693,6 +2712,21 @@ Press: <one of up, down, left, right, confirm, back>
 
     def _consume_selected_bag_item(self, item_name: Optional[str]) -> None:
         if not item_name or item_name == "CANCEL":
+            return
+        if self._party_state is not None:
+            exhausted = self._party_state.consume_item(item_name)
+            self._seen_bag_items = list(self._party_state.items)
+            self._bag_item_quantities = dict(self._party_state.quantities)
+            if self._party_state.healing_exhausted:
+                self._healing_items_exhausted = True
+            if exhausted:
+                has_heal_left = any(is_healing_item_name(it) for it in self._seen_bag_items)
+                if (self._saw_bag_end or self._healing_items_exhausted or self._party_state.healing_bag_empty) and not has_heal_left:
+                    live_status = self._last_seen_player_status()
+                    if not live_status or not any(
+                        is_status_heal_item_for_status(it, live_status) for it in self._seen_bag_items
+                    ):
+                        self._bag_unavailable = True
             return
         qty = self._bag_item_quantities.get(item_name)
         if qty is not None and qty > 1:
@@ -2847,12 +2881,16 @@ Press: <one of up, down, left, right, confirm, back>
                 or is_same_battle_frame(rec.frame_before, rec.frame_after)
             ):
                 self._saw_bag_bottom = True
+                if self._party_state is not None:
+                    self._party_state.saw_bottom = True
                 self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
             elif step_dir == "up" and (
                 (after_items == vis_items and after_cursor == cursor_row)
                 or is_same_battle_frame(rec.frame_before, rec.frame_after)
             ):
                 self._saw_bag_top = True
+                if self._party_state is not None:
+                    self._party_state.saw_top = True
                 self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
 
         cur_frame = self._current_frame()
@@ -3251,9 +3289,14 @@ Press: <one of up, down, left, right, confirm, back>
             reason = "battle_lost"
         self.report.termination_reason = reason
         notes_lines = list(self.dialogue_text)
-        if reason != "battle_lost":
+        if reason == "battle_lost":
+            if self._party_state is not None:
+                self._party_state.record_full_heal()
+        else:
             last_hp = self._last_seen_player_hp()
             if last_hp is not None:
+                if self._party_state is not None:
+                    self._party_state.record_battle_hp(last_hp)
                 evolved = bool(
                     re.search(r"\bevolved\s+into\b", "\n".join(self.dialogue_text), re.IGNORECASE)
                     and not re.search(r"\bstopped\s+evolving\b", "\n".join(self.dialogue_text), re.IGNORECASE)
@@ -3267,15 +3310,26 @@ Press: <one of up, down, left, right, confirm, back>
                     notes_lines.append(f"[Party HP seen in battle: {last_hp[0]}/{last_hp[1]} HP]")
             last_status = self._last_seen_player_status()
             if last_status is not None:
+                if self._party_state is not None:
+                    self._party_state.record_status(last_status)
                 notes_lines.append(f"[Party status seen in battle: {last_status or 'healthy'}]")
             zero_pp_items = self._format_zero_pp_list()
             if zero_pp_items:
+                if self._party_state is not None:
+                    self._party_state.record_zero_pp(zero_pp_items)
                 notes_lines.append(f"[Moves at 0 PP: {', '.join(zero_pp_items)}]")
-        if self._seen_bag_items or self._opened_bag_in_battle:
-            all_checked = self._saw_bag_end or (
-                (self._bag_unavailable or self._healing_items_exhausted)
-                and not any(is_healing_item_name(it) for it in self._seen_bag_items)
+        if self._opened_bag_in_battle:
+            all_checked = (
+                self._saw_bag_end
+                or (self._party_state is not None and self._party_state.bag_complete)
+                or (
+                    (self._bag_unavailable or self._healing_items_exhausted)
+                    and not any(is_healing_item_name(it) for it in self._seen_bag_items)
+                )
             )
+            if self._party_state is not None and (self._bag_unavailable or self._healing_items_exhausted):
+                if not any(is_healing_item_name(it) for it in self._seen_bag_items):
+                    self._party_state.mark_healing_bag_empty()
             end_note = " (all bag slots checked)" if all_checked else ""
             items_str = ", ".join(self._seen_bag_items) if self._seen_bag_items else "none"
             notes_lines.append(f"[Bag items seen: {items_str}{end_note}]")
@@ -3442,6 +3496,8 @@ Press: <one of up, down, left, right, confirm, back>
                     self._saw_bag_end = True
                     self._seen_bag_items.clear()
                     self._bag_item_quantities.clear()
+                    if self._party_state is not None:
+                        self._party_state.observe_bag_window([], has_more=False, at_top=True, at_bottom=True)
                     self._bag_unavailable = True
                     self._in_bag_menu = False
                     self.history.append(
@@ -3501,12 +3557,16 @@ Press: <one of up, down, left, right, confirm, back>
                         or is_same_battle_frame(record.frame_before, record.frame_after)
                     ):
                         self._saw_bag_bottom = True
+                        if self._party_state is not None:
+                            self._party_state.saw_bottom = True
                         self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
                     elif press == "up" and (
                         (bag_after_info[0] == bag_before_info[0] and bag_after_info[2] == bag_before_info[2])
                         or is_same_battle_frame(record.frame_before, record.frame_after)
                     ):
                         self._saw_bag_top = True
+                        if self._party_state is not None:
+                            self._party_state.saw_top = True
                         self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
                 if (
                     press == "confirm"
@@ -3727,6 +3787,8 @@ Press: <one of up, down, left, right, confirm, back>
                         self._saw_bag_end = True
                         self._seen_bag_items.clear()
                         self._bag_item_quantities.clear()
+                        if self._party_state is not None:
+                            self._party_state.observe_bag_window([], has_more=False, at_top=True, at_bottom=True)
                         self._bag_unavailable = True
                         self._in_bag_menu = False
                         entry += " (the bag is empty — only CANCEL — so closed it; do not choose bag again)"
@@ -3915,20 +3977,33 @@ Press: <one of up, down, left, right, confirm, back>
         "MIRACLEBERRY",
     )
 
-    def __init__(self, env, task, max_steps: int = 25, is_start_menu: bool = False, **kwargs):
+    def __init__(
+        self,
+        env,
+        task,
+        max_steps: int = 25,
+        is_start_menu: bool = False,
+        party_state: Optional[PartyInventoryState] = None,
+        **kwargs,
+    ):
         self.is_start_menu = is_start_menu
+        self._party_state: Optional[PartyInventoryState] = party_state
         self.presses: List[str] = []
         self.press_outcomes: List[str] = []
         self.dialogue_crops: List[Any] = []
         self.dialogue_text: str = ""
-        self._seen_bag_items: List[str] = []
-        self._bag_item_quantities: Dict[str, Optional[int]] = {}
+        self._seen_bag_items: List[str] = list(party_state.items) if party_state is not None else []
+        self._bag_item_quantities: Dict[str, Optional[int]] = (
+            dict(party_state.quantities) if party_state is not None else {}
+        )
+        self._opened_bag_in_menu: bool = False
         self._saw_bag_top: bool = False
         self._saw_bag_bottom: bool = False
         self._saw_bag_end: bool = False
         self._bag_scrolled_in_opening: bool = False
         self._bag_cursor_idx: Optional[int] = None
         self._pending_bag_item: Optional[str] = None
+        self._last_consumed_bag_item: Optional[str] = None
         self._confirmed_bag_items: set = set()
         self._last_auto_scrolled_confirmed_count: Optional[int] = None
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
@@ -3944,12 +4019,18 @@ Press: <one of up, down, left, right, confirm, back>
         info = read_bag_item_list(frame)
         if info is None:
             return None
+        self._opened_bag_in_menu = True
         items, has_more = info
         quantities = dict(read_bag_item_quantities(frame) or ())
-        self._seen_bag_items = CombatExecutor._merge_visible_bag_items(self._seen_bag_items, items)
-        for name in items:
-            if name in quantities and quantities[name] is not None:
-                self._bag_item_quantities[name] = quantities[name]
+        if self._last_consumed_bag_item:
+            if self._party_state is not None:
+                self._party_state.consume_item(self._last_consumed_bag_item, count=0, visible_after=items)
+                self._seen_bag_items = list(self._party_state.items)
+                self._bag_item_quantities = dict(self._party_state.quantities)
+            elif items and self._last_consumed_bag_item not in items and self._last_consumed_bag_item in self._seen_bag_items:
+                self._seen_bag_items.remove(self._last_consumed_bag_item)
+                self._bag_item_quantities.pop(self._last_consumed_bag_item, None)
+            self._last_consumed_bag_item = None
         cursor_idx = read_bag_cursor_row_index(frame, tracked_index=self._bag_cursor_idx)
         cursor_row = read_bag_cursor_row(frame, tracked_index=self._bag_cursor_idx)
         if cursor_row == "CANCEL":
@@ -3963,8 +4044,32 @@ Press: <one of up, down, left, right, confirm, back>
             self._saw_bag_bottom = True
             if len(items) < max_items_with_cancel:
                 self._saw_bag_top = True
-        if not self._bag_scrolled_in_opening and cursor_idx == 0 and bool(items):
+        if (
+            not self._bag_scrolled_in_opening
+            and cursor_idx == 0
+            and bool(items)
+            and (
+                not self._seen_bag_items
+                or items[0] not in self._seen_bag_items
+                or self._seen_bag_items.index(items[0]) == 0
+            )
+        ):
             self._saw_bag_top = True
+        if self._party_state is not None:
+            self._seen_bag_items = self._party_state.observe_bag_window(
+                items,
+                quantities=quantities,
+                has_more=has_more,
+                at_top=self._saw_bag_top,
+                at_bottom=self._saw_bag_bottom,
+                max_items_with_cancel=max_items_with_cancel,
+            )
+            self._bag_item_quantities = dict(self._party_state.quantities)
+        else:
+            self._seen_bag_items = CombatExecutor._merge_visible_bag_items(self._seen_bag_items, items)
+            for name in items:
+                if name in quantities and quantities[name] is not None:
+                    self._bag_item_quantities[name] = quantities[name]
         self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
         return info
 
@@ -4079,12 +4184,16 @@ Press: <one of up, down, left, right, confirm, back>
                 or is_same_battle_frame(rec.frame_before, rec.frame_after)
             ):
                 self._saw_bag_bottom = True
+                if self._party_state is not None:
+                    self._party_state.saw_bottom = True
                 self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
             elif step_dir == "up" and (
                 (after_items == vis_items and after_cursor == cursor_row)
                 or is_same_battle_frame(rec.frame_before, rec.frame_after)
             ):
                 self._saw_bag_top = True
+                if self._party_state is not None:
+                    self._party_state.saw_top = True
                 self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
 
     def _last_seen_party_hp(self) -> Optional[Tuple[int, int]]:
@@ -4152,9 +4261,14 @@ Press: <one of up, down, left, right, confirm, back>
         party_status = self._last_seen_party_status()
         if party_status is not None:
             notes_lines.append(f"[Party status seen in menu: {party_status or 'healthy'}]")
-        if self._seen_bag_items:
-            end_note = " (all bag slots checked)" if self._saw_bag_end else ""
-            notes_lines.append(f"[Bag items seen: {', '.join(self._seen_bag_items)}{end_note}]")
+        if self._opened_bag_in_menu:
+            all_checked = (
+                self._saw_bag_end
+                or (self._party_state is not None and self._party_state.bag_complete)
+            )
+            end_note = " (all bag slots checked)" if all_checked else ""
+            items_str = ", ".join(self._seen_bag_items) if self._seen_bag_items else "none"
+            notes_lines.append(f"[Bag items seen: {items_str}{end_note}]")
         if (
             self.is_start_menu
             and re.search(r"\b(?:item|bag|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
@@ -4162,13 +4276,17 @@ Press: <one of up, down, left, right, confirm, back>
             and not saw_heal
             and not saw_status_cure
         ):
+            if self._party_state is not None:
+                self._party_state.mark_healing_bag_empty()
             notes_lines.append("[No healing item was used in menu: bag had no usable healing item]")
         if (
             self._task_wants_status_heal()
             and not saw_status_cure
             and (self._saw_bag_end or not self._seen_status_heal_item())
-            and (self._seen_bag_items or self.is_start_menu)
+            and (self._opened_bag_in_menu or self.is_start_menu)
         ):
+            if self._party_state is not None:
+                self._party_state.mark_status_heal_bag_empty()
             notes_lines.append("[No status-healing item was used in menu: bag had no usable status-healing item]")
         self.report.termination_reason = reason
         self.report.notes = "\n".join(filter(None, notes_lines))
@@ -4224,8 +4342,8 @@ Press: <one of up, down, left, right, confirm, back>
                 lines.append(f"Visible bag rows in order: {', '.join(formatted_rows)}{more_note}.")
             if cursor_row:
                 lines.append(f"Current bag cursor row: {cursor_row}.")
-        if self._seen_bag_items:
-            if self._saw_bag_end:
+        if self._opened_bag_in_menu and self._seen_bag_items:
+            if self._saw_bag_end or (self._party_state is not None and self._party_state.bag_complete):
                 end_note = " (all bag slots checked)"
             elif self._saw_bag_bottom and not self._saw_bag_top:
                 end_note = " (bottom of bag reached, but top bag slots above have NOT been checked yet — press up to scroll up)"
@@ -4422,12 +4540,16 @@ Press: <one of up, down, left, right, confirm, back>
                     or is_same_battle_frame(record.frame_before, record.frame_after)
                 ):
                     self._saw_bag_bottom = True
+                    if self._party_state is not None:
+                        self._party_state.saw_bottom = True
                     self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
                 elif press == "up" and (
                     (bag_after[0] == bag_before[0] and after_bag_cursor == pre_bag_cursor)
                     or is_same_battle_frame(record.frame_before, record.frame_after)
                 ):
                     self._saw_bag_top = True
+                    if self._party_state is not None:
+                        self._party_state.saw_top = True
                     self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
             if (
                 press == "confirm"
@@ -4439,13 +4561,19 @@ Press: <one of up, down, left, right, confirm, back>
                 )
             ):
                 self._confirmed_bag_items.add(self._pending_bag_item)
-                qty = self._bag_item_quantities.get(self._pending_bag_item)
-                if qty is not None and qty > 1:
-                    self._bag_item_quantities[self._pending_bag_item] = qty - 1
-                elif qty == 1:
-                    self._bag_item_quantities.pop(self._pending_bag_item, None)
-                    if self._pending_bag_item in self._seen_bag_items:
-                        self._seen_bag_items.remove(self._pending_bag_item)
+                self._last_consumed_bag_item = self._pending_bag_item
+                if self._party_state is not None:
+                    self._party_state.consume_item(self._pending_bag_item)
+                    self._seen_bag_items = list(self._party_state.items)
+                    self._bag_item_quantities = dict(self._party_state.quantities)
+                else:
+                    qty = self._bag_item_quantities.get(self._pending_bag_item)
+                    if qty is not None and qty > 1:
+                        self._bag_item_quantities[self._pending_bag_item] = qty - 1
+                    elif qty == 1:
+                        self._bag_item_quantities.pop(self._pending_bag_item, None)
+                        if self._pending_bag_item in self._seen_bag_items:
+                            self._seen_bag_items.remove(self._pending_bag_item)
                 self._pending_bag_item = None
             state = effective_agent_state(self._agent_state(), after_frame)
             if state != AgentState.IN_MENU:
