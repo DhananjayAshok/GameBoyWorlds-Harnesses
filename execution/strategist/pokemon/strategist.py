@@ -216,6 +216,60 @@ def extract_blocked_moves_from_narrative(
     return out
 
 
+def rewrite_healed_shifts_in_text(
+    text: str,
+    gmap: GlobalMap,
+) -> str:
+    if not text or not gmap.current:
+        return text
+    shifts = [
+        sh for sh in getattr(gmap, "healed_shifts", ())
+        if gmap.resolve(sh.get("segment", -1), (0, 0))[0] == gmap.segment
+        and (sh.get("ox", 0), sh.get("oy", 0)) != (0, 0)
+    ]
+    if not shifts:
+        return text
+    last_sh = shifts[-1]
+    ox, oy = int(last_sh["ox"]), int(last_sh["oy"])
+    old_pos = tuple(last_sh["old_pos"])
+    post_old_positions = {old_pos}
+    d_step = int(last_sh.get("from_step", 0))
+    if d_step > 0:
+        for t, s, p in gmap.trail:
+            if t >= d_step and gmap.resolve(s, (0, 0))[0] == gmap.segment:
+                rp = gmap.resolve(s, p)[1]
+                post_old_positions.add((rp[0] - ox, rp[1] - oy))
+    if not any(
+        f"({op[0]}, {op[1]})" in text or f"({op[0]},{op[1]})" in text
+        for op in post_old_positions
+    ):
+        return text
+
+    def _shift_narrative_bracket(m: re.Match) -> str:
+        p1 = (int(m.group(1)), int(m.group(2)))
+        p2 = (int(m.group(3)), int(m.group(4)))
+        if p1 not in post_old_positions and p2 not in post_old_positions:
+            return m.group(0)
+        x1, y1 = p1[0] + ox, p1[1] + oy
+        x2, y2 = p2[0] + ox, p2[1] + oy
+        rest = m.group(5)
+        rest = re.sub(
+            r"(episode\s+start\s+)\((-?\d+),\s*(-?\d+)\)",
+            lambda ms: f"{ms.group(1)}({int(ms.group(2)) + ox}, {int(ms.group(3)) + oy})",
+            rest,
+        )
+        return f"[Area coordinate: ({x1}, {y1}) -> ({x2}, {y2}){rest}]"
+
+    out = NARRATIVE_COORD_RE.sub(_shift_narrative_bracket, text)
+    np_coord = (old_pos[0] + ox, old_pos[1] + oy)
+    out = re.sub(
+        rf"(`?)\({old_pos[0]},\s*{old_pos[1]}\)(`?)",
+        lambda m, npc=np_coord: f"{m.group(1)}({npc[0]}, {npc[1]}){m.group(2)}",
+        out,
+    )
+    return out
+
+
 def sanitize_stale_notepad_routes(
     text: str,
     gmap: GlobalMap,
@@ -228,6 +282,124 @@ def sanitize_stale_notepad_routes(
 
     seg = gmap.current
     px, py = gmap.pos
+    shifts = [
+        sh for sh in getattr(gmap, "healed_shifts", ())
+        if gmap.resolve(sh.get("segment", -1), (0, 0))[0] == gmap.segment
+        and (sh.get("ox", 0), sh.get("oy", 0)) != (0, 0)
+    ]
+    if shifts:
+        last_sh = shifts[-1]
+        ox, oy = int(last_sh["ox"]), int(last_sh["oy"])
+        old_pos = tuple(last_sh["old_pos"])
+        if f"({old_pos[0]}, {old_pos[1]})" in text or f"({old_pos[0]},{old_pos[1]})" in text:
+            out = rewrite_healed_shifts_in_text(text, gmap)
+            doors = gmap.door_list(gmap.segment)
+            rel_door_set = {
+                (c[0] - px, c[1] - py)
+                for d in doors
+                for c in d["cells"]
+            }
+            frontiers = set(gmap.frontier(gmap.segment))
+            rel_frontier_set = {(f[0] - px, f[1] - py) for f in frontiers}
+            new_lines = []
+            in_edges_section = False
+            for line in out.splitlines():
+                stripped = line.strip()
+                if re.match(r"^-\s*Unexplored\s+edges\b", stripped, re.IGNORECASE):
+                    in_edges_section = True
+                    line = re.sub(
+                        r"\(\d+\s+squares?\)",
+                        f"({len(frontiers)} square{'s' if len(frontiers) != 1 else ''})",
+                        line,
+                        flags=re.IGNORECASE,
+                    )
+                    new_lines.append(line)
+                    continue
+                elif stripped.startswith("- ") and not line.startswith("  "):
+                    in_edges_section = False
+
+                if in_edges_section and line.startswith("  - "):
+                    m_edge = re.search(r"\((-?\d+),\s*(-?\d+)\)", line)
+                    if m_edge:
+                        ex, ey = int(m_edge.group(1)), int(m_edge.group(2))
+                        if (ex, ey) not in rel_frontier_set:
+                            if (ex - ox, ey - oy) in rel_frontier_set:
+                                nx, ny = ex - ox, ey - oy
+                                found = path_in_segment(
+                                    gmap, gmap.segment, (px, py), (px + nx, py + ny), blocked_moves=blocked_moves
+                                )
+                                line = re.sub(
+                                    rf"(`?)\({ex},\s*{ey}\)(`?)",
+                                    lambda m, x=nx, y=ny: f"{m.group(1)}({x}, {y}){m.group(2)}",
+                                    line,
+                                    count=1,
+                                )
+                                if found is not None and found[1]:
+                                    n_steps = len(found[1])
+                                    line = re.sub(r"\b\d+\s+steps\b", f"{n_steps} steps", line, count=1)
+                                    line = re.sub(
+                                        r"\((`?)(?:(?:up|down|left|right)\s+\d+(?:,\s*)?)+(`?)\)",
+                                        lambda m, mv=compress_moves(found[1]): f"({m.group(1)}{mv}{m.group(2)})",
+                                        line,
+                                        count=1,
+                                    )
+                                else:
+                                    line = re.sub(r"\b\d+\s+steps\b", f"{abs(nx) + abs(ny)} steps", line, count=1)
+                                new_lines.append(line)
+                            continue
+
+                m_coords = list(re.finditer(r"(`?)\((-?\d+),\s*(-?\d+)\)(`?)", line))
+                if m_coords and line.startswith("  - "):
+                    m0 = m_coords[0]
+                    rx, ry = int(m0.group(2)), int(m0.group(3))
+                    if (
+                        (rx, ry) in rel_door_set
+                        and (rx + ox, ry + oy) not in rel_door_set
+                        and re.search(rf"\({rx + ox},\s*{ry + oy}\)", out)
+                        and any(
+                            (px + rx, py + ry) in d["cells"] and d.get("leads_to") is not None
+                            for d in doors
+                        )
+                        and not any(
+                            w in line.lower()
+                            for w in ("center", "gym", "house", "well", "mart", "lab", "cave", "tower", "gate")
+                        )
+                    ):
+                        continue
+                    if (rx, ry) not in rel_door_set and (rx - ox, ry - oy) in rel_door_set:
+                        nx, ny = rx - ox, ry - oy
+                        line = re.sub(
+                            rf"(`?)\({rx},\s*{ry}\)(`?)",
+                            lambda m, x=nx, y=ny: f"{m.group(1)}({x}, {y}){m.group(2)}",
+                            line,
+                            count=1,
+                        )
+                        if len(m_coords) > 1:
+                            for m_sec in m_coords[1:]:
+                                sx, sy = int(m_sec.group(2)), int(m_sec.group(3))
+                                line = re.sub(
+                                    rf"(`?)\({sx},\s*{sy}\)(`?)",
+                                    lambda m, x=sx - ox, y=sy - oy: f"{m.group(1)}({x}, {y}){m.group(2)}",
+                                    line,
+                                    count=1,
+                                )
+                        found = path_in_segment(
+                            gmap, gmap.segment, (px, py), (px + nx, py + ny), blocked_moves=blocked_moves
+                        )
+                        if found is not None and found[1]:
+                            n_steps = len(found[1])
+                            line = re.sub(r"\b\d+\s+steps\b", f"{n_steps} steps", line, count=1)
+                            line = re.sub(
+                                r"\((`?)(?:(?:up|down|left|right)\s+\d+(?:,\s*)?)+(`?)\)",
+                                lambda m, mv=compress_moves(found[1]): f"({m.group(1)}{mv}{m.group(2)})",
+                                line,
+                                count=1,
+                            )
+                        else:
+                            line = re.sub(r"\b\d+\s+steps\b", f"{abs(nx) + abs(ny)} steps", line, count=1)
+                new_lines.append(line)
+            text = "\n".join(new_lines)
+
     blocked_targets = blocked_target_cells(gmap, gmap.segment, blocked_moves)
 
     def trace_is_blocked(seq_str: str) -> Tuple[bool, Tuple[int, int]]:
@@ -733,6 +905,20 @@ class PokemonStrategist:
                 log_warn(f"Strategist: could not load episode {n} report from {self._resume_dir!r}: {e}",
                          self._parameters)
         if episodes and self.global_map.current:
+            if getattr(self.global_map, "healed_shifts", None):
+                for ep in episodes:
+                    if ep.summary:
+                        ep.summary = rewrite_healed_shifts_in_text(ep.summary, self.global_map)
+                    if ep.supervisor_report is not None:
+                        if ep.supervisor_report.narrative:
+                            ep.supervisor_report.narrative = [
+                                rewrite_healed_shifts_in_text(ln, self.global_map)
+                                for ln in ep.supervisor_report.narrative
+                            ]
+                        if ep.supervisor_report.digest:
+                            ep.supervisor_report.digest = rewrite_healed_shifts_in_text(
+                                ep.supervisor_report.digest, self.global_map
+                            )
             last_ep = episodes[-1]
             if last_ep.supervisor_report is not None and last_ep.supervisor_report.narrative:
                 self._ingest_narrative_blocked_moves(

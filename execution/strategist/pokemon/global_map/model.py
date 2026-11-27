@@ -224,6 +224,7 @@ class MapCell:
     first_seen: int
     last_seen: int
     pixels: Optional[np.ndarray] = None
+    prior: Optional[Tuple[Any, ...]] = None
 
 
 class GlobalMap(StrategistArtifact):
@@ -275,6 +276,7 @@ class GlobalMap(StrategistArtifact):
         self.walk_patterns: set = set()
         self.blocked_cells: List[set] = [set()]
         self.blocked_moves: List[Dict[Cell, set]] = [{}]
+        self.healed_shifts: List[Dict[str, Any]] = []
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -304,6 +306,7 @@ class GlobalMap(StrategistArtifact):
         self.__dict__.setdefault("blocked_moves", [{} for _ in self.segments])
         while len(self.blocked_moves) < len(self.segments):
             self.blocked_moves.append({})
+        self.__dict__.setdefault("healed_shifts", [])
         self._heal_post_defeat_shifts()
         for si in range(len(self.segments)):
             self._heal_visited_ground(si)
@@ -793,6 +796,7 @@ class GlobalMap(StrategistArtifact):
                 seg[g] = MapCell(kind, tags, hashes, self.step, self.step, pixels)
                 added += 1
                 continue
+            prev_last_seen = old.last_seen
             old.last_seen = self.step
             if is_uniform_piece and old.pixels is not None and int(old.pixels.min()) != int(old.pixels.max()):
                 continue
@@ -835,6 +839,21 @@ class GlobalMap(StrategistArtifact):
                 and int(old.pixels.min()) < int(old.pixels.max())
             ):
                 continue
+            if (
+                old.kind not in (OCCUPIED, UNKNOWN)
+                and old.hashes != hashes
+                and prev_last_seen < self.step
+            ):
+                existing_prior = getattr(old, "prior", None)
+                if existing_prior is None or (self.step - int(existing_prior[4]) > 600):
+                    old.prior = (
+                        old.kind,
+                        old.tags,
+                        old.hashes,
+                        old.first_seen,
+                        prev_last_seen,
+                        old.pixels.copy() if old.pixels is not None else None,
+                    )
             if (
                 kind == BLOCKED
                 and not cell_learnable
@@ -894,6 +913,7 @@ class GlobalMap(StrategistArtifact):
             self.observe(frame, identified, shift)
             return "start"
         was_in_battle = bool(self.in_battle)
+        had_pending = self.pending is not None
         pre_battle_place = self.resolve(*self.battle_place) if (was_in_battle and self.battle_place is not None) else None
         use_passed = passed_frames if (not was_in_battle and self.pending is None) else None
         anchor_place = getattr(self, "_anchor_place", None)
@@ -919,6 +939,7 @@ class GlobalMap(StrategistArtifact):
         if placed is not None:
             delta, residual, structural = placed
             prev_pos = self.pos
+            prev_residual = self.residual
             pos = (base_pos[0] + delta[0], base_pos[1] + delta[1])
             step_delta = (pos[0] - prev_pos[0], pos[1] - prev_pos[1])
             shift = tuple((-r) % GRID_SKIP for r in residual)
@@ -927,17 +948,7 @@ class GlobalMap(StrategistArtifact):
                     self.pending = (direction, max_steps, reported)
                 self.stats["blackout_frames"] += 1
                 return "blank"
-            if not structural:
-                self._learn_ledges(base_pos, pos, direction)
-                if (delta[0] == 0) != (delta[1] == 0) and 1 < abs(delta[0]) + abs(delta[1]) <= MAX_STEP_FILL:
-                    sx = (delta[0] > 0) - (delta[0] < 0)
-                    sy = (delta[1] > 0) - (delta[1] < 0)
-                    for i in range(1, abs(delta[0]) + abs(delta[1])):
-                        mid = (base_pos[0] + sx * i, base_pos[1] + sy * i)
-                        c_mid = self.segments[self.segment].get(mid)
-                        if c_mid is None or c_mid.kind not in (BLOCKED, LEDGE, LEDGE_LEFT):
-                            self.visits[self.segment][mid] += 1
-            was_off_grid = self.residual != (0, 0) or residual != (0, 0)
+            was_off_grid = prev_residual != (0, 0) or residual != (0, 0)
             if residual != (0, 0) and not structural and grid_offset(frame) == (0, 0):
                 residual = (0, 0)
                 shift = (0, 0)
@@ -947,40 +958,64 @@ class GlobalMap(StrategistArtifact):
                 if snapped is not None and snapped != self.pos:
                     self.pos = snapped
                     step_delta = (self.pos[0] - prev_pos[0], self.pos[1] - prev_pos[1])
-            if not structural and step_delta != (0, 0):
-                self.clear_traversed_step(prev_pos, self.pos, self.segment)
-            placed_steps = abs(delta[0]) + abs(delta[1])
-            if structural:
-                if direction in DIRECTIONS and delta != (0, 0):
-                    if anchor_place is None or anchor_place[0] != self.segment:
-                        self._anchor_place = (self.segment, prev_pos)
-                    self._anchor_pending = (direction, max_steps, reported)
-                if direction in DIRECTIONS and reported is not None and placed_steps < reported:
-                    rem_reported = reported - placed_steps
-                    rem_max = max(rem_reported + 1, max_steps - placed_steps)
-                    self.pending = (direction, rem_max, rem_reported)
+            placement_rejected = False
+            if (
+                not structural
+                and self.residual == (0, 0)
+                and (was_in_battle or had_pending)
+                and not has_bottom_dialogue_box(frame)
+                and not has_modal_preview_box(frame)
+            ):
+                m_pl, ov_pl = self._placement_screen_agreement(frame, self.segment, self.pos, (0, 0))
+                if ov_pl >= 16 and m_pl < 0.40 * ov_pl:
+                    self.pos, self.residual = prev_pos, prev_residual
+                    placed = None
+                    placement_rejected = True
+            if not placement_rejected:
+                if not structural:
+                    self._learn_ledges(base_pos, pos, direction)
+                    if (delta[0] == 0) != (delta[1] == 0) and 1 < abs(delta[0]) + abs(delta[1]) <= MAX_STEP_FILL:
+                        sx = (delta[0] > 0) - (delta[0] < 0)
+                        sy = (delta[1] > 0) - (delta[1] < 0)
+                        for i in range(1, abs(delta[0]) + abs(delta[1])):
+                            mid = (base_pos[0] + sx * i, base_pos[1] + sy * i)
+                            c_mid = self.segments[self.segment].get(mid)
+                            if c_mid is None or c_mid.kind not in (BLOCKED, LEDGE, LEDGE_LEFT):
+                                self.visits[self.segment][mid] += 1
+                if not structural and step_delta != (0, 0):
+                    self.clear_traversed_step(prev_pos, self.pos, self.segment)
+                placed_steps = abs(delta[0]) + abs(delta[1])
+                if structural:
+                    if direction in DIRECTIONS and delta != (0, 0):
+                        if anchor_place is None or anchor_place[0] != self.segment:
+                            self._anchor_place = (self.segment, prev_pos)
+                        self._anchor_pending = (direction, max_steps, reported)
+                    if direction in DIRECTIONS and reported is not None and placed_steps < reported:
+                        rem_reported = reported - placed_steps
+                        rem_max = max(rem_reported + 1, max_steps - placed_steps)
+                        self.pending = (direction, rem_max, rem_reported)
+                    else:
+                        self.pending = None
                 else:
                     self.pending = None
-            else:
-                self.pending = None
-                self._anchor_pending = None
-            self.lost = 0
-            if not structural:
-                self.anchor = _screen(frame)
-                self._anchor_place = (self.segment, self.pos)
-            if not structural:
-                self.in_battle = False
-            self.stats["placed_by_edges" if structural else "placed"] += 1
-            if structural:
-                # recoloured (a flash or fade): the position holds, the colours do not
-                self.stats["recoloured_frames"] += 1
-            elif self.residual == (0, 0):
-                self.observe(frame, identified, can_learn_walkable=(step_delta != (0, 0)))
-                self._try_merge(frame)
-            else:
-                self.observe(frame, identified, shift)
-                self.stats["off_grid_frames"] += 1
-            return "moved" if step_delta != (0, 0) else "stayed"
+                    self._anchor_pending = None
+                self.lost = 0
+                if not structural:
+                    self.anchor = _screen(frame)
+                    self._anchor_place = (self.segment, self.pos)
+                if not structural:
+                    self.in_battle = False
+                self.stats["placed_by_edges" if structural else "placed"] += 1
+                if structural:
+                    # recoloured (a flash or fade): the position holds, the colours do not
+                    self.stats["recoloured_frames"] += 1
+                elif self.residual == (0, 0):
+                    self.observe(frame, identified, can_learn_walkable=(step_delta != (0, 0)))
+                    self._try_merge(frame)
+                else:
+                    self.observe(frame, identified, shift)
+                    self.stats["off_grid_frames"] += 1
+                return "moved" if step_delta != (0, 0) else "stayed"
         shift = self._grid_shift(frame)
         warp_targets = self._known_warp_targets(direction, max_steps, reported) if self.faded else None
         allow_fn = lambda si, q: not self.arrival_breaks_doors(si, q)
@@ -1004,6 +1039,7 @@ class GlobalMap(StrategistArtifact):
                 warp_targets=warp_targets,
             )
             if found is None and not self._blacks_out(frame, b_seg, b_pos, shift) and not self._wipe_closing(frame):
+                m_b, ov_b = self._placement_screen_agreement(frame, b_seg, b_pos, shift)
                 far_found = self.relocalise(
                     frame,
                     shift=shift,
@@ -1013,35 +1049,27 @@ class GlobalMap(StrategistArtifact):
                 if far_found is not None and far_found != (b_seg, b_pos):
                     f_seg, f_pos = far_found
                     f_map = self.segments[f_seg] if 0 <= f_seg < len(self.segments) else {}
-                    b_map = self.segments[b_seg]
-                    a_scr = _screen(frame)
-                    masked_chk = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
-                    local_chk: Dict[Cell, Tuple[Optional[str], ...]] = {}
-                    lp_chk: Dict[Cell, np.ndarray] = {}
-                    blank_chk: List[Cell] = []
-                    for (lx, ly), piece in _local_cells(a_scr, shift):
-                        if (lx, ly) == (0, 0) or (lx, ly) in masked_chk:
-                            continue
-                        if int(piece.min()) == int(piece.max()):
-                            blank_chk.append((lx, ly))
-                            continue
-                        local_chk[(lx, ly)] = self._cell_hashes(split_quarters(piece))
-                        lp_chk[(lx, ly)] = piece
-                    m_b, ov_b = self._screen_agreement(b_map, local_chk, b_pos, blank_chk, lp_chk)
-                    m_f, ov_f = self._screen_agreement(f_map, local_chk, f_pos, blank_chk, lp_chk)
+                    m_f, ov_f = self._placement_screen_agreement(frame, f_seg, f_pos, shift)
                     has_respawn_door = any(
                         (f_pos[0] + dx, f_pos[1] + dy) in f_map and is_door(f_map[(f_pos[0] + dx, f_pos[1] + dy)])
                         for dx, dy in ((0, 1), (0, 0), (0, -1), (-1, 0), (1, 0))
                     )
                     if (
-                        has_respawn_door
-                        and ov_f > 0
-                        and m_f >= 0.85 * ov_f
+                        ov_f >= 12
                         and (ov_b == 0 or m_b < 0.45 * ov_b)
+                        and (
+                            m_f >= 0.75 * ov_f
+                            or (has_respawn_door and m_f >= 0.70 * ov_f)
+                        )
                     ):
                         found = far_found
                         self.battle_place = None
                 if found is None:
+                    if ov_b >= 12 and m_b < 0.45 * ov_b:
+                        self.segment, self.pos = b_seg, b_pos
+                        self.lost += 1
+                        self.stats["lost_frames"] += 1
+                        return "lost"
                     found = (b_seg, b_pos)
         elif not self.faded and 0 <= self.segment < len(self.segments) and self.segments[self.segment]:
             found = self.relocalise(
@@ -2282,6 +2310,7 @@ class GlobalMap(StrategistArtifact):
                 c.first_seen,
                 c.last_seen,
                 c.pixels.copy() if c.pixels is not None else None,
+                getattr(c, "prior", None),
             )
             for g, c in post_cells.items()
         }
@@ -2321,20 +2350,76 @@ class GlobalMap(StrategistArtifact):
                 self.visits[d_seg].pop(g, None)
             if moved_v > 0:
                 self.visits[d_seg][(g[0] + ox, g[1] + oy)] += moved_v
+        for g, cnt in pre_visits.items():
+            if cnt > self.visits[d_seg].get(g, 0):
+                self.visits[d_seg][g] = cnt
         warp_doors = {
             self._door_at(d_seg, self.resolve(s, p)[1])
             for _, wa, pa, wb, pb in self.warps
             for s, p in ((wa, pa), (wb, pb))
             if self.resolve(s, (0, 0))[0] == d_seg
         }
+        ref_ground = next(
+            (mc for mc in pre_cells.values() if mc.kind == WALKABLE and not is_door(mc) and len(set(mc.hashes)) == 1),
+            None,
+        )
+        ref_obstacle = next(
+            (
+                mc for mc in pre_cells.values()
+                if mc.kind == BLOCKED
+                and mc.tags == ("obstacle",)
+                and not is_door(mc)
+                and len(mc.hashes) == 4
+                and None not in mc.hashes
+            ),
+            None,
+        )
         for g, c_snap in list(post_snapshot.items()):
             p_last = trail_by_t.get(c_snap.last_seen, d_pos)
+            g_src = (g[0] + ox, g[1] + oy)
+            prior_snap = getattr(c_snap, "prior", None)
+            if prior_snap is not None and int(prior_snap[4]) < d_step:
+                pk, pt, ph, pfs, pls, ppix = prior_snap
+                seg[g] = MapCell(pk, pt, ph, pfs, pls, ppix)
+                continue
             if c_snap.first_seen >= d_step:
                 seg.pop(g, None)
-            elif (g[0] - ox, g[1] - oy) not in post_snapshot and p_last != d_pos:
+                continue
+            if (g[0] - ox, g[1] - oy) not in post_snapshot and p_last != d_pos:
                 seg.pop(g, None)
-            elif is_door(c_snap) and g not in warp_doors and (g[0] + ox, g[1] + oy) in seg and is_door(seg[(g[0] + ox, g[1] + oy)]):
-                seg[g] = MapCell(BLOCKED, ("obstacle",), c_snap.hashes, c_snap.first_seen, c_snap.last_seen, c_snap.pixels)
+                continue
+            if is_door(c_snap) and g not in warp_doors and g_src in seg and is_door(seg[g_src]):
+                nb_obs = next(
+                    (
+                        seg[nb]
+                        for dx, dy in ((-1, 0), (1, 0), (0, 1))
+                        for nb in [(g[0] + dx, g[1] + dy)]
+                        if nb in seg and seg[nb].kind == BLOCKED and "obstacle" in seg[nb].tags and not is_door(seg[nb])
+                    ),
+                    ref_obstacle,
+                )
+                seg[g] = MapCell(
+                    BLOCKED,
+                    ("obstacle",),
+                    nb_obs.hashes if nb_obs is not None else (None, None, None, None),
+                    c_snap.first_seen,
+                    c_snap.last_seen,
+                    nb_obs.pixels if nb_obs is not None else None,
+                )
+                continue
+            if (
+                self.visits[d_seg].get(g, 0) > 0
+                and (c_snap.kind in (BLOCKED, OCCUPIED) or "sign" in c_snap.tags)
+                and not (is_door(c_snap) and g in warp_doors)
+            ):
+                seg[g] = MapCell(
+                    WALKABLE,
+                    ("ground",),
+                    ref_ground.hashes if ref_ground is not None else (None, None, None, None),
+                    c_snap.first_seen,
+                    c_snap.last_seen,
+                    ref_ground.pixels if ref_ground is not None else None,
+                )
         for g, c_snap in sorted(post_snapshot.items(), key=lambda kv: (kv[1].last_seen, kv[1].first_seen)):
             g_dst = (g[0] + ox, g[1] + oy)
             c_old = seg.get(g_dst)
@@ -2347,10 +2432,6 @@ class GlobalMap(StrategistArtifact):
                 if c_old is not None and c_old.kind == WALKABLE:
                     c_old.last_seen = last_s
                     continue
-                ref_ground = next(
-                    (mc for mc in pre_cells.values() if mc.kind == WALKABLE and not is_door(mc) and len(set(mc.hashes)) == 1),
-                    None,
-                )
                 seg[g_dst] = MapCell(
                     WALKABLE,
                     ("ground",),
@@ -2367,6 +2448,7 @@ class GlobalMap(StrategistArtifact):
             else (t, s, p)
             for i, (t, s, p) in enumerate(self.trail)
         ]
+        old_pos = self.pos
         if self.segment == d_seg and self.pos is not None:
             self.pos = (self.pos[0] + ox, self.pos[1] + oy)
             if getattr(self, "_anchor_place", None) is not None and self._anchor_place[0] == d_seg:
@@ -2376,6 +2458,17 @@ class GlobalMap(StrategistArtifact):
             bs, bp = self.resolve(*self.battle_place)
             if bs == d_seg and bp != d_pos:
                 self.battle_place = (d_seg, (bp[0] + ox, bp[1] + oy))
+        self.__dict__.setdefault("healed_shifts", [])
+        if old_pos is not None and self.pos is not None and old_pos != self.pos:
+            self.healed_shifts.append({
+                "segment": d_seg,
+                "from_step": d_step,
+                "to_step": self.step,
+                "ox": ox,
+                "oy": oy,
+                "old_pos": old_pos,
+                "new_pos": self.pos,
+            })
         self._seg_index_cache = {}
         self._overlap_cache = {}
         return 1
@@ -2561,6 +2654,31 @@ class GlobalMap(StrategistArtifact):
                 if best is None or n > best[0]:
                     best = (n, si, offset)
         return None if best is None else (best[1], best[2])
+
+    def _placement_screen_agreement(
+        self,
+        frame: np.ndarray,
+        segment: int,
+        pos: Cell,
+        shift: Cell = (0, 0),
+    ) -> Tuple[int, int]:
+        if not (0 <= segment < len(self.segments)) or not self.segments[segment]:
+            return 0, 0
+        seg = self.segments[segment]
+        a_scr = _screen(frame)
+        masked = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
+        local: Dict[Cell, Tuple[Optional[str], ...]] = {}
+        lp: Dict[Cell, np.ndarray] = {}
+        blank: List[Cell] = []
+        for (lx, ly), piece in _local_cells(a_scr, shift):
+            if (lx, ly) == (0, 0) or (lx, ly) in masked:
+                continue
+            if int(piece.min()) == int(piece.max()):
+                blank.append((lx, ly))
+                continue
+            local[(lx, ly)] = self._cell_hashes(split_quarters(piece))
+            lp[(lx, ly)] = piece
+        return self._screen_agreement(seg, local, pos, blank, lp)
 
     @staticmethod
     def _screen_agreement(seg: Dict[Cell, MapCell], local: Dict[Cell, Tuple[Optional[str], ...]],
