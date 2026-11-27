@@ -14,6 +14,7 @@ from execution.perception.pokemon.navigation import (FURNITURE_OVERHANG_TOP_TAGS
                                                      approach_cells,
                                                      describe_target_reachability,
                                                      in_bounds,
+                                                     infer_spatial_patterned_floor_cells,
                                                      is_counter_separator_cell,
                                                      is_east_cliff_barrier_cell, is_npc_head_overhang_floor_cell,
                                                      is_overhang_floor_cell, is_patterned_floor_cell,
@@ -471,7 +472,12 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
     is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
     is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     is_npc_head_overhang = is_npc_head_overhang_floor_cell(cell, quarter_tags)
-    is_patterned_floor = is_patterned_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
+    patterned_cells = infer_spatial_patterned_floor_cells(
+        quarter_tags, quarter_descriptions, quarter_images
+    )
+    is_patterned_floor = cell in patterned_cells or is_patterned_floor_cell(
+        cell, quarter_tags, quarter_descriptions, quarter_images
+    )
     groups: Dict[Tuple[str, Optional[str]], set] = {}
     for quarter in QUARTER_OFFSETS:
         tile = identified.get((cell[0], cell[1], quarter))
@@ -485,12 +491,18 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
                 continue
             if is_npc_head_overhang and quarter in ("bottom_left", "bottom_right") and tag == "npc":
                 continue
+            norm_solid_ground = False
             if is_patterned_floor and tag == "obstacle":
                 tag = "ground"
+                norm_solid_ground = is_solid_shade_piece(getattr(tile, "image", None))
             desc = (
-                "Poke Ball on the ground"
-                if tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description))
-                else tile.description
+                "plain ground"
+                if norm_solid_ground
+                else (
+                    "Poke Ball on the ground"
+                    if tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description))
+                    else tile.description
+                )
             )
             groups.setdefault((tag, desc), set()).add(quarter)
     parts = []

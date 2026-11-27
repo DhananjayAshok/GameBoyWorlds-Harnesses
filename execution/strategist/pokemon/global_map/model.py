@@ -818,6 +818,8 @@ class GlobalMap(StrategistArtifact):
             prev_last_seen = old.last_seen
             old.last_seen = self.step
             if is_uniform_piece and old.pixels is not None and int(old.pixels.min()) != int(old.pixels.max()):
+                if old.kind == BLOCKED and kind == WALKABLE and (x, y) in patterned_floor_cells and g not in seg_blocked:
+                    old.kind, old.tags = kind, tags
                 continue
             # an NPC on a cell, or a tile not yet recognised, never overwrites what the cell was known to be
             if kind in (OCCUPIED, UNKNOWN) and old.kind not in (OCCUPIED, UNKNOWN):

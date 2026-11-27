@@ -346,6 +346,95 @@ PATTERNED_FLOOR_OBSTACLE_REJECT_DESC_PATTERN = re.compile(
 )
 
 
+def _quarter_array(img: Optional[Any]) -> Optional[np.ndarray]:
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+    arr = np.squeeze(np.asarray(img))
+    return arr if arr.shape == (8, 8) else None
+
+
+def _dominant_ground_shades(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+) -> set:
+    if quarter_images is None:
+        return set()
+    cell_q = quarter_tags.get(cell, {})
+    cell_imgs = quarter_images.get(cell, {})
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    if "obstacle" in set(cell_q.values()):
+        for q in QUARTERS:
+            arr = _quarter_array(cell_imgs.get(q))
+            if arr is not None and int(arr.min()) != int(arr.max()):
+                if PATTERNED_FLOOR_OBSTACLE_REJECT_DESC_PATTERN.search(cell_d.get(q) or ""):
+                    return set()
+    doms: set = set()
+    for q in QUARTERS:
+        if cell_q.get(q) not in ("ground", "ground decoration"):
+            continue
+        arr = _quarter_array(cell_imgs.get(q))
+        if arr is None:
+            continue
+        vals, counts = np.unique(arr, return_counts=True)
+        if len(vals) < 2 or int(vals.min()) < 56:
+            continue
+        best_idx = int(np.argmax(counts))
+        if float(counts[best_idx]) / arr.size >= 0.50:
+            doms.add(int(vals[best_idx]))
+    return doms
+
+
+def _uniform_obstacle_floor_shade(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+) -> Optional[int]:
+    if quarter_images is None:
+        return None
+    cell_q = quarter_tags.get(cell, {})
+    cell_imgs = quarter_images.get(cell, {})
+    if len(cell_q) < 4 or len(cell_imgs) < 4:
+        return None
+    tag_set = set(cell_q.values())
+    if "obstacle" not in tag_set or not (tag_set <= {"ground", "ground decoration", "obstacle"}):
+        return None
+    cell_d = (quarter_descriptions or {}).get(cell, {})
+    obst_shades: set = set()
+    uniform_ground_shades: set = set()
+    has_multishade_ground = False
+    for q in QUARTERS:
+        arr = _quarter_array(cell_imgs.get(q))
+        if arr is None:
+            return None
+        if int(arr.min()) != int(arr.max()):
+            if cell_q.get(q) == "obstacle":
+                return None
+            if PATTERNED_FLOOR_OBSTACLE_REJECT_DESC_PATTERN.search(cell_d.get(q) or ""):
+                return None
+            has_multishade_ground = True
+        else:
+            s = int(arr.min())
+            if s < 88:
+                return None
+            if cell_q.get(q) == "obstacle":
+                obst_shades.add(s)
+            else:
+                uniform_ground_shades.add(s)
+    if len(obst_shades) != 1:
+        return None
+    s = next(iter(obst_shades))
+    if uniform_ground_shades and uniform_ground_shades != {s}:
+        return None
+    if has_multishade_ground and s not in _dominant_ground_shades(
+        cell, quarter_tags, quarter_descriptions, quarter_images
+    ):
+        return None
+    return s
+
+
 def is_patterned_floor_cell(
     cell: Cell,
     quarter_tags: Dict[Cell, Dict[str, str]],
@@ -366,7 +455,14 @@ def is_patterned_floor_cell(
         return False
     ground_qs = [q for q in QUARTERS if cell_q.get(q) in ("ground", "ground decoration")]
     obst_qs = [q for q in QUARTERS if cell_q.get(q) == "obstacle"]
-    if len(ground_qs) < min_ground_quarters or not obst_qs:
+    if not ground_qs or not obst_qs:
+        return False
+    uni_shade = _uniform_obstacle_floor_shade(cell, quarter_tags, quarter_descriptions, quarter_images)
+    if uni_shade is not None and uni_shade in _dominant_ground_shades(
+        cell, quarter_tags, quarter_descriptions, quarter_images
+    ):
+        return True
+    if len(ground_qs) < min_ground_quarters:
         return False
     cell_d = (quarter_descriptions or {}).get(cell, {})
     for q in QUARTERS:
@@ -376,11 +472,8 @@ def is_patterned_floor_cell(
     ground_shades: set = set()
     ground_means: List[float] = []
     for q in ground_qs:
-        img = cell_imgs.get(q)
-        if img is None or getattr(img, "size", 0) == 0:
-            return False
-        arr = np.squeeze(np.asarray(img))
-        if arr.shape != (8, 8):
+        arr = _quarter_array(cell_imgs.get(q))
+        if arr is None:
             return False
         vals = np.unique(arr)
         if int(arr.min()) < 56:
@@ -391,11 +484,8 @@ def is_patterned_floor_cell(
         return False
     mean_ground = sum(ground_means) / len(ground_means)
     for q in obst_qs:
-        img = cell_imgs.get(q)
-        if img is None or getattr(img, "size", 0) == 0:
-            return False
-        arr = np.squeeze(np.asarray(img))
-        if arr.shape != (8, 8):
+        arr = _quarter_array(cell_imgs.get(q))
+        if arr is None:
             return False
         vals, counts = np.unique(arr, return_counts=True)
         shades = {int(v) for v in vals}
@@ -418,7 +508,37 @@ def infer_spatial_patterned_floor_cells(
     for cell in quarter_tags:
         if is_patterned_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images, min_ground_quarters=2):
             inferred.add(cell)
-    if not hashes or quarter_images is None:
+    if quarter_images is None:
+        return inferred
+    dom_by_cell = {
+        cell: _dominant_ground_shades(cell, quarter_tags, quarter_descriptions, quarter_images)
+        for cell in quarter_tags
+    }
+    if (0, 0) not in dom_by_cell or not dom_by_cell.get((0, 0)):
+        player_doms: set = set()
+        for _, nb in neighbours((0, 0)):
+            player_doms.update(dom_by_cell.get(nb, set()))
+        if player_doms:
+            dom_by_cell[(0, 0)] = player_doms
+    uni_by_cell = {
+        cell: _uniform_obstacle_floor_shade(cell, quarter_tags, quarter_descriptions, quarter_images)
+        for cell in quarter_tags
+    }
+    queue = deque()
+    for cell, s in uni_by_cell.items():
+        if s is None:
+            continue
+        if s in dom_by_cell.get(cell, set()) or any(s in dom_by_cell.get(nb, set()) for _, nb in neighbours(cell)):
+            inferred.add(cell)
+            queue.append(cell)
+    while queue:
+        cur = queue.popleft()
+        s = uni_by_cell.get(cur)
+        for _, nb in neighbours(cur):
+            if nb not in inferred and uni_by_cell.get(nb) == s:
+                inferred.add(nb)
+                queue.append(nb)
+    if not hashes:
         return inferred
     by_pattern: Dict[Tuple[Optional[str], ...], List[Cell]] = {}
     for cell in quarter_tags:
