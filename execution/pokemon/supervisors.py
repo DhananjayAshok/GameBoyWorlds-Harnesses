@@ -11,6 +11,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  has_top_dialogue_box, is_battle_screen,
                                                  is_blank_or_fade_frame,
                                                  is_cutscene_frame_changing, is_healing_item_name,
+                                                 is_overworld_menu_or_ui_screen,
                                                  is_overworld_pack_menu, is_pack_screen,
                                                  is_party_menu_screen, is_status_heal_item_name,
                                                  read_battle_hud_hp, read_move_learning_dialogue_status)
@@ -264,7 +265,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
         raw = self._agent_state() if raw_state is None else raw_state
         if raw in (AgentState.IN_MENU, AgentState.FREE_ROAM):
             frame = self._current_frame() if frame is None else frame
-            return effective_agent_state(raw, frame)
+            eff = effective_agent_state(raw, frame)
+            if raw == AgentState.IN_MENU and eff == AgentState.IN_BATTLE and is_overworld_menu_or_ui_screen(frame):
+                return AgentState.IN_MENU
+            return eff
         return raw
 
     def _is_in_dialogue(self, frame=None) -> bool:
@@ -2181,7 +2185,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 self._settle_menu_state()
             frame = self._current_frame()
             self._scan_frame_for_party_move_status(frame)
-            state = self._effective_state(frame)
+            raw_cur_state = self._agent_state()
+            state = self._effective_state(frame, raw_state=raw_cur_state)
+            if (
+                raw_cur_state == AgentState.IN_MENU
+                and state == AgentState.IN_BATTLE
+                and not active_battle_instructions
+                and (is_overworld_menu_or_ui_screen(frame) or not is_battle_screen(frame))
+            ):
+                state = AgentState.IN_MENU
             if state == AgentState.FREE_ROAM and combined is not None:
                 break
             state_label = state.name.lower()

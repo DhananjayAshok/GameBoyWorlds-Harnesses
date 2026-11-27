@@ -19,7 +19,8 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_screen_wide_cutscene_change,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
                                                  is_gen1_item_list_screen, is_move_selection_screen,
-                                                 is_no_pp_dialogue_frame, is_overworld_pack_menu,
+                                                 is_no_pp_dialogue_frame, is_overworld_confirmation_subbox,
+                                                 is_overworld_menu_or_ui_screen, is_overworld_pack_menu,
                                                  is_pack_action_subbox_screen, is_pack_item_list_screen,
                                                  is_pack_screen, is_party_menu_screen,
                                                  has_party_subbox,
@@ -38,6 +39,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  read_menu_cursor_item_name,
                                                  read_move_menu_cursor_slot,
                                                  read_move_menu_names, read_move_menu_pp,
+                                                 read_party_menu_compatibility,
                                                  read_party_menu_cursor_slot, read_party_menu_hp,
                                                  read_party_menu_members, read_party_menu_status,
                                                  read_move_learning_dialogue_status,
@@ -413,8 +415,53 @@ class InteractionExecutor(PolicyExecutor):
         )
         return state
 
+    def _task_allows_affirmative_confirmation(self) -> bool:
+        raw = self._task or ""
+        return not bool(
+            re.search(
+                r"\b(?:select\s+no|choose\s+no|say\s+no|decline|refuse|cancel)\b",
+                raw,
+                re.IGNORECASE,
+            )
+        )
+
+    def _confirm_interaction_prompt_if_applicable(self, records: List[EnvironmentStepRecord]) -> AgentState:
+        state = self._agent_state()
+        if (
+            state != AgentState.IN_MENU
+            or self._last_terminated
+            or self._last_truncated
+            or not self._task_allows_affirmative_confirmation()
+        ):
+            return state
+        frame = self._current_frame()
+        if not is_overworld_confirmation_subbox(frame):
+            return state
+        confirm_rec = self._take_action(MenuAction, menu_action="confirm")
+        records.append(confirm_rec)
+        if self._last_terminated or self._last_truncated:
+            return self._agent_state()
+        state = self._agent_state()
+        if state == AgentState.FREE_ROAM:
+            self._wait_for_interaction(records, settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT)
+            if self._agent_state() == AgentState.FREE_ROAM and self._has_interaction_overlay():
+                self._advance_interaction_overlay(records)
+            state = self._agent_state()
+        if state == AgentState.IN_MENU and not (self._last_terminated or self._last_truncated):
+            state = settle_overworld_menu_state(
+                get_state_fn=self._agent_state,
+                get_frame_fn=self._current_frame,
+                is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
+                step_wait_fn=lambda: self._step_wait_record(records),
+                min_wait=MENU_SETTLE_WAIT,
+                settle_wait=INTERACT_POST_DIALOGUE_SETTLE_WAIT,
+                max_cutscene_wait=INTERACT_MAX_CUTSCENE_WAIT,
+                post_motion_wait=INTERACT_POST_MOTION_WAIT,
+            )
+        return self._agent_state()
+
     def _settle_interaction_menu_state(self, records: List[EnvironmentStepRecord]):
-        return settle_overworld_menu_state(
+        state = settle_overworld_menu_state(
             get_state_fn=self._agent_state,
             get_frame_fn=self._current_frame,
             is_done_fn=lambda: bool(self._last_terminated or self._last_truncated),
@@ -424,6 +471,9 @@ class InteractionExecutor(PolicyExecutor):
             max_cutscene_wait=INTERACT_MAX_CUTSCENE_WAIT,
             post_motion_wait=INTERACT_POST_MOTION_WAIT,
         )
+        if state == AgentState.IN_MENU and not (self._last_terminated or self._last_truncated):
+            state = self._confirm_interaction_prompt_if_applicable(records)
+        return state
 
     def _advance_interaction_overlay(self, records: List[EnvironmentStepRecord]):
         state = self._agent_state()
@@ -4070,7 +4120,20 @@ Press: <one of up, down, left, right, confirm, back>
         self._quantity_adjusted_in_box: bool = False
         self._completed_tm_hm_party_attempt: bool = False
         self._last_move_teaching_outcome: Optional[Tuple[str, str, str]] = None
+        self._overworld_menu_session: bool = bool(is_start_menu)
+        self._tm_hm_scrolled_in_opening: bool = False
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
+
+    def _effective_menu_state(self, frame: np.ndarray) -> AgentState:
+        raw_state = self._agent_state()
+        eff = effective_agent_state(raw_state, frame)
+        if (
+            raw_state == AgentState.IN_MENU
+            and eff == AgentState.IN_BATTLE
+            and (self._overworld_menu_session or is_overworld_menu_or_ui_screen(frame))
+        ):
+            return AgentState.IN_MENU
+        return eff
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
         self.report.termination_reason = reason
@@ -4417,6 +4480,40 @@ Press: <one of up, down, left, right, confirm, back>
             re.search(r"\b(?:toss|discard|drop|give|hold|sell|deposit|store)\b", clause, re.IGNORECASE)
         )
 
+    def _task_wants_tm_hm_pocket(self) -> bool:
+        raw = self._task or ""
+        return bool(
+            re.search(
+                r"\b(?:tm\s*pocket|tm/hm|hm\s*0?\d|tm\s*\d{2})\b",
+                raw,
+                re.IGNORECASE,
+            )
+        )
+
+    def _match_tm_hm_target_row(self, rows: Optional[List[str]]) -> Optional[Tuple[int, str]]:
+        if not rows or not self._task:
+            return None
+        up_task = self._task.upper()
+        target_codes = set()
+        for m in re.finditer(r"\bHM\s*0?(\d)\b", up_task):
+            target_codes.add(f"H{m.group(1)}")
+        for m in re.finditer(r"\bH(\d)\b", up_task):
+            target_codes.add(f"H{m.group(1)}")
+        for m in re.finditer(r"\bTM\s*(\d{2})\b", up_task):
+            target_codes.add(m.group(1))
+        for idx, row in enumerate(rows):
+            if row == "CANCEL":
+                continue
+            clean = re.sub(r"\s*\(X\d+\)\s*$", "", row.strip().upper())
+            parts = clean.split(None, 1)
+            code = parts[0] if parts else ""
+            move_name = parts[1] if len(parts) > 1 else clean
+            if code in target_codes:
+                return (idx, clean)
+            if len(move_name) >= 3 and re.search(r"\b" + re.escape(move_name) + r"\b", up_task):
+                return (idx, clean)
+        return None
+
     def _advance_tm_hm_use_to_party_screen(self) -> bool:
         if self._current_call is None:
             self._begin_scripted("advance TM/HM startup prompts to party selection screen")
@@ -4426,7 +4523,7 @@ Press: <one of up, down, left, right, confirm, back>
             cur_frame = self._get_state()["core"]["current_frame"]
             if is_party_menu_screen(cur_frame):
                 return True
-            if effective_agent_state(self._agent_state(), cur_frame) != AgentState.IN_MENU:
+            if self._effective_menu_state(cur_frame) != AgentState.IN_MENU:
                 break
             if (
                 not is_tm_hm_pack_pocket(cur_frame)
@@ -4440,6 +4537,158 @@ Press: <one of up, down, left, right, confirm, back>
             rec = self._take_action(MenuAction, menu_action="confirm")
             drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
         return is_party_menu_screen(self._get_state()["core"]["current_frame"])
+
+    def _auto_select_able_party_member_and_advance(self) -> Optional[str]:
+        cur_frame = self._get_state()["core"]["current_frame"]
+        if not is_party_menu_selection_screen(cur_frame) or has_party_subbox(cur_frame):
+            return None
+        compat_list = read_party_menu_compatibility(cur_frame)
+        if not compat_list:
+            return None
+        able_slots = [(idx, name) for idx, name, status in compat_list if status == "ABLE"]
+        if not able_slots:
+            return None
+        up_task = (self._task or "").upper()
+        named_able = [
+            (idx, name)
+            for idx, name in able_slots
+            if name and len(name) >= 3 and name.upper() in up_task
+        ]
+        target_slot, target_name = named_able[0] if named_able else able_slots[0]
+        if len(able_slots) > 1 and not named_able:
+            cursor_slot = read_party_menu_cursor_slot(cur_frame)
+            if cursor_slot not in [idx for idx, _ in able_slots]:
+                return None
+            target_slot = cursor_slot
+            target_name = dict(able_slots)[target_slot]
+        if self._current_call is None:
+            self._begin_scripted(f"select ABLE party Pokemon {target_name}")
+        for _ in range(6):
+            if self._last_terminated or self._last_truncated:
+                return None
+            cur_frame = self._get_state()["core"]["current_frame"]
+            if not is_party_menu_selection_screen(cur_frame) or has_party_subbox(cur_frame):
+                return None
+            cursor_slot = read_party_menu_cursor_slot(cur_frame)
+            if cursor_slot is None or cursor_slot == target_slot:
+                break
+            step_dir = "down" if target_slot > cursor_slot else "up"
+            rec = self._take_action(MenuAction, menu_action=step_dir)
+            drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+        if self._last_terminated or self._last_truncated:
+            return None
+        before_confirm = self._get_state()["core"]["current_frame"]
+        confirm_rec = self._take_action(MenuAction, menu_action="confirm")
+        drop_prefix_crops(captured_dialogue_crops([confirm_rec]), self.dialogue_crops)
+        if self._last_terminated or self._last_truncated:
+            return target_name
+        after_confirm = self._get_state()["core"]["current_frame"]
+        if self._should_settle_menu_dialogue(before_confirm, after_confirm, "confirm"):
+            self._settle_menu_dialogue()
+            if self._last_terminated or self._last_truncated:
+                return target_name
+        cur_frame = self._get_state()["core"]["current_frame"]
+        if (
+            self._task_wants_move_teaching()
+            and is_party_menu_screen(cur_frame)
+            and has_party_subbox(cur_frame)
+            and read_party_move_forget_list(cur_frame) is None
+        ):
+            d_l1, _ = read_dialogue_box_lines(cur_frame)
+            if not (d_l1.lower().startswith("stop ") or d_l1.lower().startswith("abandon ")):
+                yes_before = cur_frame
+                yes_rec = self._take_action(MenuAction, menu_action="confirm")
+                drop_prefix_crops(captured_dialogue_crops([yes_rec]), self.dialogue_crops)
+                if not (self._last_terminated or self._last_truncated):
+                    yes_after = self._get_state()["core"]["current_frame"]
+                    if self._should_settle_menu_dialogue(yes_before, yes_after, "confirm"):
+                        self._settle_menu_dialogue()
+        return target_name
+
+    def _auto_navigate_tm_hm_pocket_and_party(self) -> None:
+        if (
+            self._completed_tm_hm_party_attempt
+            or not self._task_wants_move_teaching()
+            or not self._task_allows_tm_hm_use()
+        ):
+            return
+        frame = self._get_state()["core"]["current_frame"]
+        if (
+            is_pack_screen(frame)
+            and not is_tm_hm_pack_pocket(frame)
+            and pack_action_box_height(frame) < 4
+            and not has_quantity_selector_box(frame)
+            and self._task_wants_tm_hm_pocket()
+        ):
+            if self._current_call is None:
+                self._begin_scripted("switch Pack to TM/HM pocket")
+            for _ in range(3):
+                if self._last_terminated or self._last_truncated:
+                    return
+                rec = self._take_action(MenuAction, menu_action="left")
+                drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+                self.presses.append("left")
+                self.press_outcomes.append("left")
+                if self._last_terminated or self._last_truncated:
+                    return
+                frame = self._get_state()["core"]["current_frame"]
+                if is_tm_hm_pack_pocket(frame):
+                    self._tm_hm_scrolled_in_opening = False
+                    self.press_outcomes[-1] = "left (switched Pack to TM/HM pocket)"
+                    break
+        frame = self._get_state()["core"]["current_frame"]
+        if (
+            is_tm_hm_pack_pocket(frame)
+            and is_pack_item_list_screen(frame)
+            and not self._tm_hm_scrolled_in_opening
+        ):
+            rows = read_tm_hm_pocket_rows(frame)
+            matched = self._match_tm_hm_target_row(rows)
+            if matched is not None:
+                target_idx, target_label = matched
+                if self._current_call is None:
+                    self._begin_scripted(f"select {target_label} in TM/HM pocket")
+                self._tm_hm_scrolled_in_opening = True
+                for _ in range(target_idx):
+                    if self._last_terminated or self._last_truncated:
+                        return
+                    down_rec = self._take_action(MenuAction, menu_action="down")
+                    drop_prefix_crops(captured_dialogue_crops([down_rec]), self.dialogue_crops)
+                    self.presses.append("down")
+                    self.press_outcomes.append("down")
+                if self._last_terminated or self._last_truncated:
+                    return
+                self._active_menu_item = target_label
+                sel_rec = self._take_action(MenuAction, menu_action="confirm")
+                drop_prefix_crops(captured_dialogue_crops([sel_rec]), self.dialogue_crops)
+                self.presses.append("confirm")
+                self.press_outcomes.append(f"confirm (selected {target_label})")
+                if self._last_terminated or self._last_truncated:
+                    return
+                after_sel = self._get_state()["core"]["current_frame"]
+                if is_item_use_subbox_screen(after_sel):
+                    use_rec = self._take_action(MenuAction, menu_action="confirm")
+                    drop_prefix_crops(captured_dialogue_crops([use_rec]), self.dialogue_crops)
+                    if self._last_terminated or self._last_truncated:
+                        return
+                    if self._advance_tm_hm_use_to_party_screen():
+                        if self._last_terminated or self._last_truncated:
+                            return
+                        chosen_poke = self._auto_select_able_party_member_and_advance()
+                        if chosen_poke:
+                            cur_after = self._get_state()["core"]["current_frame"]
+                            if read_party_move_forget_list(cur_after) is not None:
+                                self.press_outcomes[-1] = (
+                                    f"confirm (selected {target_label}, confirmed USE and YES, selected {chosen_poke}, and confirmed YES to delete an older move — choose which move to forget)"
+                                )
+                            else:
+                                self.press_outcomes[-1] = (
+                                    f"confirm (selected {target_label}, confirmed USE and YES, and taught the move to {chosen_poke})"
+                                )
+                        else:
+                            self.press_outcomes[-1] = (
+                                f"confirm (selected {target_label} and confirmed USE and YES to open the party selection screen)"
+                            )
 
     def _auto_scroll_bag_for_status_item(self) -> None:
         frame = self._get_state()["core"]["current_frame"]
@@ -4800,7 +5049,7 @@ Press: <one of up, down, left, right, confirm, back>
                 return
             frame = self._get_state()["core"]["current_frame"]
             self._scan_move_learning_frame(frame)
-            state = effective_agent_state(self._agent_state(), frame)
+            state = self._effective_menu_state(frame)
             if state != AgentState.IN_MENU:
                 return
             if not self._has_menu_bottom_box(frame) or has_menu_cursor(frame):
@@ -4816,7 +5065,7 @@ Press: <one of up, down, left, right, confirm, back>
                     return
                 after_wait = self._get_state()["core"]["current_frame"]
                 self._scan_move_learning_frame(after_wait)
-                state = effective_agent_state(self._agent_state(), after_wait)
+                state = self._effective_menu_state(after_wait)
                 if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_wait) or has_menu_cursor(after_wait):
                     return
                 if not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
@@ -4830,7 +5079,7 @@ Press: <one of up, down, left, right, confirm, back>
                 return
             after_dismiss = self._get_state()["core"]["current_frame"]
             self._scan_move_learning_frame(after_dismiss)
-            state = effective_agent_state(self._agent_state(), after_dismiss)
+            state = self._effective_menu_state(after_dismiss)
             if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_dismiss) or has_menu_cursor(after_dismiss):
                 return
             if has_party_subbox(after_dismiss) or pack_action_box_height(after_dismiss) >= 4:
@@ -4843,7 +5092,7 @@ Press: <one of up, down, left, right, confirm, back>
                 if self._last_terminated or self._last_truncated:
                     return
                 after_wait = self._get_state()["core"]["current_frame"]
-                state = effective_agent_state(self._agent_state(), after_wait)
+                state = self._effective_menu_state(after_wait)
                 if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_wait) or has_menu_cursor(after_wait):
                     return
                 if is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
@@ -4854,6 +5103,47 @@ Press: <one of up, down, left, right, confirm, back>
                     stalled_dismisses = 0
             else:
                 stalled_dismisses = 0
+
+    def _auto_close_completed_overworld_menu(self) -> None:
+        if not self._overworld_menu_session or not self._completed_tm_hm_party_attempt:
+            return
+        if any(self._bag_target_matches(it) for it in self._seen_bag_items):
+            return
+        raw = self._task or ""
+        if re.search(r"\b(?:field\s+move|use\s+cut\s+from\s+the\s+party)\b", raw, re.IGNORECASE):
+            return
+        if self._current_call is None:
+            self._begin_scripted("close Pack/Item and Start menus to return to overworld")
+        for _ in range(4):
+            if self._last_terminated or self._last_truncated:
+                return
+            cur_frame = self._get_state()["core"]["current_frame"]
+            if self._effective_menu_state(cur_frame) != AgentState.IN_MENU:
+                return
+            if not (
+                is_pack_screen(cur_frame)
+                or is_gen1_item_list_screen(cur_frame)
+                or is_start_menu_screen(cur_frame)
+            ):
+                return
+            rec = self._take_action(MenuAction, menu_action="back")
+            drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+            self.presses.append("back")
+            self.press_outcomes.append("back (closed menu)")
+            if self._last_terminated or self._last_truncated:
+                return
+            after_frame = self._get_state()["core"]["current_frame"]
+            if self._effective_menu_state(after_frame) != AgentState.IN_MENU:
+                return
+            if is_start_menu_screen(after_frame) and not has_menu_cursor(after_frame):
+                for _ in range(2):
+                    wait_rec = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                    if self._last_terminated or self._last_truncated:
+                        return
+                    after_frame = self._get_state()["core"]["current_frame"]
+                    if has_menu_cursor(after_frame) or not is_start_menu_screen(after_frame):
+                        break
 
     def _consume_confirmed_bag_item(self, item_name: Optional[str]) -> None:
         if not item_name or item_name == "CANCEL":
@@ -4888,6 +5178,13 @@ Press: <one of up, down, left, right, confirm, back>
             code = self._open_main_menu()
             if code is not None:
                 return code
+        init_frame = self._get_state()["core"]["current_frame"]
+        if self.is_start_menu or (
+            self._agent_state() == AgentState.IN_MENU
+            and (is_overworld_menu_or_ui_screen(init_frame) or not is_battle_screen(init_frame))
+            and not re.search(r"\bactive\s+battle\s+instructions\b", self._task or "", re.IGNORECASE)
+        ):
+            self._overworld_menu_session = True
 
         needs_menu_closed = self.is_start_menu or bool(
             re.search(r"\b(?:close|exit|return\s+to\s+(?:the\s+)?overworld)\b", self._task or "", re.IGNORECASE)
@@ -4895,10 +5192,26 @@ Press: <one of up, down, left, right, confirm, back>
         consecutive_invalid = 0
         for _ in range(self._max_steps):
             frame = self._get_state()["core"]["current_frame"]
-            state = effective_agent_state(self._agent_state(), frame)
+            state = self._effective_menu_state(frame)
             if state != AgentState.IN_MENU:
                 code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                 return self._finish(code, reason)
+            self._auto_navigate_tm_hm_pocket_and_party()
+            if self._last_terminated:
+                return self._finish(MENU_TERMINATED, "terminated")
+            if self._last_truncated:
+                return self._finish(MENU_TRUNCATED, "truncated")
+            if self._completed_tm_hm_party_attempt and needs_menu_closed:
+                self._auto_close_completed_overworld_menu()
+                if self._last_terminated:
+                    return self._finish(MENU_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._finish(MENU_TRUNCATED, "truncated")
+                closed_frame = self._get_state()["core"]["current_frame"]
+                closed_state = self._effective_menu_state(closed_frame)
+                if closed_state != AgentState.IN_MENU:
+                    code, reason = LEFT_MENU_OUTCOMES.get(closed_state, (MENU_OK, "menu_closed"))
+                    return self._finish(code, reason)
             self._auto_scroll_bag_for_status_item()
             if self._last_terminated:
                 return self._finish(MENU_TERMINATED, "terminated")
@@ -4910,6 +5223,10 @@ Press: <one of up, down, left, right, confirm, back>
             if self._last_truncated:
                 return self._finish(MENU_TRUNCATED, "truncated")
             frame = self._get_state()["core"]["current_frame"]
+            state = self._effective_menu_state(frame)
+            if state != AgentState.IN_MENU:
+                code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
+                return self._finish(code, reason)
             self._scan_bag_frame(frame)
             prompt = (self.STEP_PROMPT.replace("[TASK]", self._task.strip())
                       .replace("[HISTORY]", self._history_block()))
@@ -4927,7 +5244,7 @@ Press: <one of up, down, left, right, confirm, back>
                     if self._last_truncated:
                         return self._finish(MENU_TRUNCATED, "truncated")
                     settled_frame = self._get_state()["core"]["current_frame"]
-                    settled_state = effective_agent_state(self._agent_state(), settled_frame)
+                    settled_state = self._effective_menu_state(settled_frame)
                     if settled_state != AgentState.IN_MENU:
                         code, reason = LEFT_MENU_OUTCOMES.get(settled_state, (MENU_OK, "menu_closed"))
                         return self._finish(code, reason)
@@ -5093,7 +5410,7 @@ Press: <one of up, down, left, right, confirm, back>
             ):
                 self._consume_confirmed_bag_item(self._pending_bag_item)
                 self._pending_bag_item = None
-            state = effective_agent_state(self._agent_state(), after_frame)
+            state = self._effective_menu_state(after_frame)
             if state != AgentState.IN_MENU:
                 code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                 return self._finish(code, reason)
@@ -5144,7 +5461,14 @@ Press: <one of up, down, left, right, confirm, back>
                     self.press_outcomes[-1] = f"{press} (settled party text)"
                 else:
                     self.press_outcomes[-1] = f"{press} (settled menu dialogue)"
-                state = effective_agent_state(self._agent_state(), after_settle)
+                if self._completed_tm_hm_party_attempt and needs_menu_closed:
+                    self._auto_close_completed_overworld_menu()
+                    if self._last_terminated:
+                        return self._finish(MENU_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(MENU_TRUNCATED, "truncated")
+                    after_settle = self._get_state()["core"]["current_frame"]
+                state = self._effective_menu_state(after_settle)
                 if state != AgentState.IN_MENU:
                     code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                     return self._finish(code, reason)
