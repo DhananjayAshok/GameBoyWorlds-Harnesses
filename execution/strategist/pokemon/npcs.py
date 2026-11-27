@@ -495,7 +495,14 @@ class NPCRegistry(StrategistArtifact):
             for track in live.values():
                 moved = _manhattan(det["square"], track.square)
                 if moved <= allowance:
-                    view = self.look_of(self.npcs[track.npc]).views[track.view]
+                    npc = self.get(track.npc)
+                    track.npc = npc.id
+                    views = self.look_of(npc).views
+                    if not views:
+                        continue
+                    if not (0 <= track.view < len(views)):
+                        track.view = 0
+                    view = views[track.view]
                     pairs.append((moved, S.mask_distance(det["mask"], view.key)[0], i, track.id))
         pairs.sort()
         assigned: Dict[int, int] = {}
@@ -751,10 +758,11 @@ class NPCRegistry(StrategistArtifact):
     def _turned(self, npc: NPC, det: Dict[str, Any], step: int) -> int:
         look = self.look_of(npc)
         last = self.last_seen(self._gmap, npc)[2]
+        last_view = last.view if 0 <= last.view < len(look.views) else 0
         if not det["full"]:
-            return last.view
+            return last_view
         look.views.append(View(det["window"].copy(), det["mask"].copy(), None, None, (self._episode, step)))
-        look.links.append((last.view, len(look.views) - 1, "same_square"))
+        look.links.append((last_view, len(look.views) - 1, "same_square"))
         self._stack = None
         self.stats["views_added"] += 1
         self.stats["same_square"] += 1
@@ -763,7 +771,10 @@ class NPCRegistry(StrategistArtifact):
     def _update_track(self, track: Track, det: Dict[str, Any], crowded: bool, step: int) -> None:
         p = self._p
         npc = self.get(track.npc)
+        track.npc = npc.id
         look = self.look_of(npc)
+        if not (0 <= track.view < len(look.views)):
+            track.view = 0
         current = look.views[track.view]
         distance, _ = S.mask_distance(det["mask"], current.key)
         track.square, track.last_step = det["square"], step
@@ -790,13 +801,17 @@ class NPCRegistry(StrategistArtifact):
 
     def _note_sighting(self, track: Track, det: Dict[str, Any], step: int) -> None:
         # The picture comparison allows a left/right mirror, so a turn is recorded per sighting and makes a new one.
-        views = self.look_of(self.npcs[track.npc]).views
-        flipped = bool(track.view < len(views) and S.mask_distance(det["mask"], views[track.view].key)[1])
+        npc = self.get(track.npc)
+        track.npc = npc.id
+        views = self.look_of(npc).views
+        if views and not (0 <= track.view < len(views)):
+            track.view = 0
+        flipped = bool(0 <= track.view < len(views) and S.mask_distance(det["mask"], views[track.view].key)[1])
         if (track.last_sight_square == det["square"] and step - track.last_sight_step < SIGHTING_EVERY
                 and flipped == track.last_sight_flipped):
             return
-        self.npcs[track.npc].sightings.append(Sighting(self._episode, step, track.segment, det["square"], track.view,
-                                                       det["offset"], track.id, flipped))
+        npc.sightings.append(Sighting(self._episode, step, track.segment, det["square"], track.view,
+                                      det["offset"], track.id, flipped))
         track.last_sight_step, track.last_sight_square, track.last_sight_flipped = step, det["square"], flipped
         self.stats["sightings"] += 1
 
@@ -1767,7 +1782,47 @@ class NPCRegistry(StrategistArtifact):
             self._attribute_by_text(c)
             self.stats["conversations_read"] += 1
 
+    def _remap_view_to_look(self, src_look: Look, src_view: int, dst_look: Look) -> int:
+        if not dst_look.views:
+            return 0
+        if src_look.id == dst_look.id:
+            return src_view if 0 <= src_view < len(dst_look.views) else 0
+        if 0 <= src_view < len(src_look.views):
+            v = src_look.views[src_view]
+            dists = [(S.mask_distance(v.key, dv.key)[0], i)
+                     for i, dv in enumerate(dst_look.views) if not dv.partial]
+            if not dists:
+                dists = [(S.mask_distance(v.key, dv.key)[0], i) for i, dv in enumerate(dst_look.views)]
+            if dists and (v.partial or min(dists)[0] <= self._p["auto"]):
+                return min(dists)[1]
+            dst_look.views.append(View(v.pixels.copy(), v.key.copy(), v.facing, None,
+                                       v.first_seen, n_seen=v.n_seen, partial=v.partial))
+            dst_look.links.append((0, len(dst_look.views) - 1, "same_square"))
+            self._stack = None
+            self.stats["views_added"] += 1
+            return len(dst_look.views) - 1
+        return 0
+
     def merge_npcs(self, keep: NPC, drop: NPC) -> None:
+        keep_look, drop_look = self.look_of(keep), self.look_of(drop)
+        view_map: Dict[int, int] = {}
+        for s in drop.sightings:
+            if keep_look.id != drop_look.id or not (0 <= s.view < len(keep_look.views)):
+                if s.view not in view_map:
+                    view_map[s.view] = self._remap_view_to_look(drop_look, s.view, keep_look)
+                s.view = view_map[s.view]
+        for s in keep.sightings:
+            if not (0 <= s.view < len(keep_look.views)):
+                s.view = 0
+        for track in self._tracks.values():
+            if track.npc == drop.id or self.get(track.npc).id == drop.id:
+                track.npc = keep.id
+                if keep_look.id != drop_look.id or not (0 <= track.view < len(keep_look.views)):
+                    if track.view not in view_map:
+                        view_map[track.view] = self._remap_view_to_look(drop_look, track.view, keep_look)
+                    track.view = view_map[track.view]
+            elif self.get(track.npc).id == keep.id and not (0 <= track.view < len(keep_look.views)):
+                track.view = 0
         keep.sightings += drop.sightings
         keep.conversations += drop.conversations
         if drop.name not in keep.aliases:
@@ -1789,11 +1844,16 @@ class NPCRegistry(StrategistArtifact):
         keep.views += drop.views
         keep.links += [(a + shift, b + shift, why) for a, b, why in drop.links]
         keep.links.append((0, shift, "track"))
+        shifted_npcs: Set[str] = set()
         for npc in self.npcs.values():
             if self.look_aliases.get(npc.look, npc.look) == drop_id or npc.look == drop_id:
                 npc.look = keep_id
+                shifted_npcs.add(npc.id)
                 for s in npc.sightings:
                     s.view += shift
+        for track in self._tracks.values():
+            if track.npc in shifted_npcs or self.get(track.npc).id in shifted_npcs:
+                track.view += shift
         self.look_aliases[drop_id] = keep_id
         del self.looks[drop_id]
         self._stack = None
