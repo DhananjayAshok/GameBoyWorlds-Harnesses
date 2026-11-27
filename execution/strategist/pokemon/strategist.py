@@ -1291,9 +1291,12 @@ class PokemonStrategist:
             if before is None:
                 named_changed = True
                 log_info(f"Global map: named segment {segment} '{name}': {description}", self._parameters)
-            elif changed:
+            elif name != before:
                 named_changed = True
                 log_info(f"Global map: renamed segment {segment} '{before}' -> '{name}': {description}",
+                         self._parameters)
+            elif changed:
+                log_info(f"Global map: updated description of segment {segment} '{name}': {description}",
                          self._parameters)
             else:
                 log_info(f"Global map: kept the name of segment {segment} '{name}'.", self._parameters)

@@ -244,11 +244,18 @@ def _describe(reg, gmap, npc, number: int, met: bool = False) -> str:
 
 def _candidates(reg, npc) -> List[Any]:
     out, seen = [], {npc.id}
+    npc_segs = {s.segment for s in getattr(npc, "sightings", ())}
     for cid in npc.candidates:
         if cid not in reg.npcs:
             continue
         other = reg.get(cid)
         if other.id in seen or other.merged_into is not None:
+            continue
+        other_segs = {s.segment for s in getattr(other, "sightings", ())}
+        same_segment = bool(npc_segs and other_segs and (npc_segs & other_segs))
+        has_personal_name = bool(other.real_name and other.name_type == "personal")
+        has_story_talk = bool(other.description and _interacted_with(reg, other))
+        if not (same_segment or has_personal_name or has_story_talk):
             continue
         seen.add(other.id)
         out.append(other)
@@ -387,11 +394,15 @@ def sanitize_character_looks(reg) -> None:
         convs = [reg.conversations[cid] for cid in npc.conversations
                  if cid in reg.conversations and reg.conversations[cid].trigger != "battle_start"]
         if convs:
-            if any(c.led_to == "battle" or c.outcome == "battle" for c in convs):
+            for c in convs:
+                if is_routine_service_text(c.text) and c.led_to == "battle":
+                    c.led_to = "free_roam"
+            if any(is_routine_service_text(c.text) for c in convs) and not any(c.outcome == "battle" for c in convs):
+                if npc.kind in ("unknown", "object", "trainer"):
+                    npc.kind = "person"
+            elif any(c.led_to == "battle" or c.outcome == "battle" for c in convs):
                 if npc.kind in ("unknown", "person", "object"):
                     npc.kind = "trainer"
-            elif any(is_routine_service_text(c.text) for c in convs) and npc.kind in ("unknown", "object"):
-                npc.kind = "person"
         if _has_character_conversation(reg, npc):
             look = reg.look_of(npc)
             if look.kind_hint == "object":
@@ -591,6 +602,69 @@ def _same_text(text: str) -> str:
     return re.sub(r"[\s▼▶]+", " ", text).strip().casefold()
 
 
+def _is_short_cry_or_repeat_suffix(conv: Any, other: Any) -> bool:
+    norm_c = _same_text(getattr(conv, "text", "") or "")
+    norm_o = _same_text(getattr(other, "text", "") or "")
+    if not norm_c or not norm_o:
+        return False
+    if norm_c == norm_o:
+        return True
+    lines_c = _clean_dialogue_lines(getattr(conv, "text", "") or "")
+    if len(lines_c) > 2 or len(norm_c) > 48:
+        return False
+    same_npc = bool(getattr(conv, "npc", None) and getattr(conv, "npc", None) == getattr(other, "npc", None))
+    tag_c = TAG.match(lines_c[0]) if lines_c else None
+    same_tag = bool(
+        tag_c
+        and any(
+            (m := TAG.match(ln)) and m.group(1).strip().casefold() == tag_c.group(1).strip().casefold()
+            for ln in _clean_dialogue_lines(getattr(other, "text", "") or "")
+        )
+    )
+    if not (same_npc or same_tag):
+        return False
+    if norm_o.endswith(norm_c):
+        return True
+    other_lines_norm = {_same_text(ln) for ln in _clean_dialogue_lines(getattr(other, "text", "") or "")}
+    return norm_c in other_lines_norm
+
+
+def find_summary_twin(reg: Any, conv: Any) -> Optional[Any]:
+    norm = _same_text(getattr(conv, "text", "") or "")
+    if not norm:
+        return None
+    for other in reg.conversations.values():
+        if other is conv or not other.summary or other.trigger == "battle_start":
+            continue
+        if _same_text(other.text) == norm:
+            return other
+    for other in reg.conversations.values():
+        if other is conv or not other.summary or other.trigger == "battle_start":
+            continue
+        if _is_short_cry_or_repeat_suffix(conv, other):
+            return other
+    return None
+
+
+def is_repeat_conversation(reg: Any, conv: Any, before_episode: Optional[int] = None) -> bool:
+    norm = _same_text(getattr(conv, "text", "") or "")
+    if not norm:
+        return True
+    conv_ep = getattr(conv, "episode", 0)
+    max_ep = conv_ep if before_episode is None else before_episode
+    conv_step = getattr(conv, "map_step_start", 0)
+    for other in getattr(reg, "conversations", {}).values():
+        if other is conv or other.trigger == "battle_start" or not (other.text or "").strip():
+            continue
+        other_ep = getattr(other, "episode", 0)
+        other_step = getattr(other, "map_step_start", 0)
+        if not (other_ep < max_ep or (before_episode is None and other_ep == conv_ep and other_step < conv_step)):
+            continue
+        if _same_text(other.text) == norm or _is_short_cry_or_repeat_suffix(conv, other):
+            return True
+    return False
+
+
 def run_summaries(reg, vlm_call: Callable[..., Any], game: str, gmap, only=None) -> None:
     todo = [c for c in (only if only is not None else reg.conversations.values())
             if c.trigger != "battle_start" and c.text.strip() and not c.summarised][:MAX_BATCH]
@@ -605,6 +679,8 @@ def run_summaries(reg, vlm_call: Callable[..., Any], game: str, gmap, only=None)
         service = routine_service_summary(c.text) or routine_trainer_challenge_summary(reg, c)
         if service is not None:
             c.summary, c.outcome, c.summarised = service[0], service[1], True
+            if is_routine_service_text(c.text) and c.led_to == "battle":
+                c.led_to = "free_roam"
             if c.outcome == "battle":
                 tag = TAG.match(c.text)
                 if tag and not c.speaker_name:
@@ -612,12 +688,8 @@ def run_summaries(reg, vlm_call: Callable[..., Any], game: str, gmap, only=None)
                 if c.npc in reg.npcs and reg.get(c.npc).kind in ("unknown", "person"):
                     reg.get(c.npc).kind = "trainer"
             todo.remove(c)
-    done = {}
-    for c in reg.conversations.values():
-        if c.summary and c.trigger != "battle_start":
-            done.setdefault(_same_text(c.text), c)
     for c in list(todo):
-        twin = done.get(_same_text(c.text))
+        twin = find_summary_twin(reg, c)
         if twin is not None and twin is not c:
             c.summary, c.speaker_name, c.name_type, c.summarised = (twin.summary, twin.speaker_name,
                                                                     twin.name_type, True)

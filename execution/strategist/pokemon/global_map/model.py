@@ -233,6 +233,7 @@ class SegmentInfo:
     named_pixels: int = 0
     explored: Optional[int] = None
     kind: Optional[str] = None
+    needs_merge_rename: bool = False
 
 
 @dataclass
@@ -623,6 +624,7 @@ class GlobalMap(StrategistArtifact):
                  episode: int) -> bool:
         info = self.info(segment)
         info.named_pixels = self.filled_pixels(segment)
+        info.needs_merge_rename = False
         name, description = name or info.name, description or info.description
         if (name, description, kind) == (info.name, info.description, info.kind):
             return False
@@ -691,9 +693,11 @@ class GlobalMap(StrategistArtifact):
     def queue_grown(self) -> None:
         queued = {entry["segment"] for entry in self.naming_queue}
         for si, seg in enumerate(self.segments):
+            info = self.info(si)
             if (seg and si not in queued and si not in self.merged_into
                     and self._has_min_observations(si)
-                    and self.filled_pixels(si) - self.info(si).named_pixels >= RENAME_GROWTH_PIXELS):
+                    and (info.name is None or getattr(info, "needs_merge_rename", False))
+                    and self.filled_pixels(si) - info.named_pixels >= RENAME_GROWTH_PIXELS):
                 self.naming_queue.append({"segment": si, "exit": None, "step": self.step, "marker": None,
                                           "reason": "grew"})
                 queued.add(si)
@@ -1662,6 +1666,8 @@ class GlobalMap(StrategistArtifact):
             self.segment_info[target] = absorbed
         elif absorbed.name is not None:
             kept.aliases.append((absorbed.name, absorbed.description))
+            if absorbed.name != kept.name:
+                kept.needs_merge_rename = True
         self.merged_into[source] = (target, (dx, dy))
         self.segments[source] = {}
         self.visits[source] = Counter()

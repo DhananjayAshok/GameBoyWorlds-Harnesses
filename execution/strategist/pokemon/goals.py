@@ -452,10 +452,28 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
                                 current, parameters, explore=explore)):
                 closed.append((path, "abandoned"))
             return closed
+        completed_node = subtree.root
+        completed_path = path
         goals.set_status(path, "complete", episode_number=episode_number)
         closed.append((path, "complete"))
         checked_active = True
         subtree = goals.frontier()
+        if subtree is None:
+            break
+        next_path = goals.path_to(subtree)
+        if subtree.root.frontier_since is None:
+            break
+        if (
+            completed_node.source in ("subgoal_creation", "defeat")
+            and subtree.root.source == "initial"
+            and next_path == completed_path[:-1]
+        ):
+            child_desc = (completed_node.description or "").lower()
+            parent_desc = (subtree.root.description or "").lower()
+            if "visit the city" in parent_desc and not any(
+                kw in child_desc for kw in ("visit the city", "reach the city", "arrive in", "enter the city")
+            ):
+                break
     return closed
 
 

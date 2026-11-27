@@ -915,6 +915,8 @@ class NPCRegistry(StrategistArtifact):
         conv = self._recent_pre_battle_conversation(allow_stationary_wait=True)
         if conv is None:
             return
+        if conv.text and npc_model.is_routine_service_text(conv.text):
+            return
         if crops and not conv.crops:
             drop_prefix_crops(crops, conv.crops)
         conv.led_to, conv.map_step_end = "battle", self._gmap.step
@@ -1747,6 +1749,10 @@ class NPCRegistry(StrategistArtifact):
                         or any(npc_model.TAG.match(ln) for ln in merged_text.splitlines())):
                     c.outcome = None
             c.text, c.read = merged_text, True
+            if npc_model.is_routine_service_text(merged_text) and c.led_to == "battle":
+                c.led_to = "free_roam"
+                if c.npc in self.npcs and self.get(c.npc).kind == "trainer":
+                    self.get(c.npc).kind = "person"
             if npc_model._match_item_pickup(merged_text) is not None and c.npc is not None:
                 self._reassign_item_pickup_to_sign(c)
             self._update_sign_text(c)
@@ -2307,17 +2313,27 @@ class NPCRegistry(StrategistArtifact):
         for c in self.conversations.values():
             if c.episode != episode or c.trigger == "battle_start" or not c.text.strip():
                 continue
-            if not npc_model.is_routine_conversation(self, c):
-                return True
+            if npc_model.is_routine_conversation(self, c):
+                continue
+            if npc_model.is_repeat_conversation(self, c, before_episode=episode):
+                continue
+            return True
         return False
 
     def digest_lines(self, episode: int, gmap: GlobalMap) -> str:
         lines = []
+        seen_in_ep = set()
         for c in self.conversations.values():
             if c.episode != episode or c.trigger == "battle_start" or not c.text.strip():
                 continue
             if npc_model.is_battle_start_text(c.text) or npc_model.is_routine_conversation(self, c):
                 continue
+            if npc_model.is_repeat_conversation(self, c, before_episode=episode):
+                continue
+            norm = npc_model._same_text(c.text)
+            if norm in seen_in_ep:
+                continue
+            seen_in_ep.add(norm)
             who = (f'"{display_name(self.get(c.npc))}"' if c.npc in self.npcs else "a sign" if c.sign else "someone")
             lines.append(f'- {who} in {npc_model._area(self, gmap, gmap.resolve(c.segment, c.square)[0])}: '
                          f'"{c.text[:400].strip()}"')
