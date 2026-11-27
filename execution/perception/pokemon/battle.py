@@ -940,7 +940,13 @@ HUD_LETTER_TEMPLATES: Dict[Tuple[int, ...], str] = {
     (198, 68, 40, 16, 40, 68, 198, 0): "X",
     (130, 68, 40, 16, 16, 16, 16, 0): "Y",
     (254, 4, 8, 16, 32, 64, 254, 0): "Z",
+    (48, 192, 60, 66, 126, 64, 62, 0): "E",
     (0, 0, 0, 126, 0, 0, 0, 0): "-",
+}
+
+GEN1_POKEDOLLAR_SIGNATURE = (60, 36, 60, 32, 112, 32, 112, 32)
+HUD_DIGIT_TOP6_TEMPLATES: Dict[Tuple[int, ...], int] = {
+    sig[:6]: digit for sig, digit in HUD_DIGIT_TEMPLATES.items()
 }
 
 STATUS_CODES = ("PSN", "BRN", "PAR", "SLP", "FRZ")
@@ -1139,6 +1145,13 @@ def is_gen1_item_list_screen(frame: np.ndarray) -> bool:
         for ty in (8, 9, 10)
     ):
         return False
+    if any(
+        _tile_row_signature(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+        == GEN1_POKEDOLLAR_SIGNATURE
+        for ty in (5, 7, 9, 11)
+        for tx in (13, 14, 15)
+    ):
+        return False
     return True
 
 
@@ -1241,6 +1254,26 @@ def is_status_heal_item_name(name: str) -> bool:
     return any(up == target or target in up for target in STATUS_HEAL_ITEM_NAMES)
 
 
+STATUS_CURE_MAP: Dict[str, Tuple[str, ...]] = {
+    "PSN": ("ANTIDOTE", "PSNCUREBERRY", "FULL HEAL", "FULL RESTORE", "MIRACLEBERRY", "HEAL POWDER"),
+    "PAR": ("PARLYZ HEAL", "PRZCUREBERRY", "FULL HEAL", "FULL RESTORE", "MIRACLEBERRY", "HEAL POWDER"),
+    "SLP": ("AWAKENING", "MINT BERRY", "FULL HEAL", "FULL RESTORE", "MIRACLEBERRY", "HEAL POWDER"),
+    "BRN": ("BURN HEAL", "BURNT BERRY", "FULL HEAL", "FULL RESTORE", "MIRACLEBERRY", "HEAL POWDER"),
+    "FRZ": ("ICE HEAL", "ICE BERRY", "FULL HEAL", "FULL RESTORE", "MIRACLEBERRY", "HEAL POWDER"),
+}
+
+
+def is_status_heal_item_for_status(name: str, status: Optional[str] = None) -> bool:
+    """Return True if name cures the given status code (or any status if status is None/unknown)."""
+    up = re.sub(r"\s*\(X\d+\)\s*$", "", (name or "").strip().upper())
+    if not up or up == "CANCEL":
+        return False
+    st = (status or "").strip().upper()
+    if st in STATUS_CURE_MAP:
+        return any(up == target or target in up for target in STATUS_CURE_MAP[st])
+    return is_status_heal_item_name(up)
+
+
 def read_tile_quantity(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> Optional[int]:
     """Read an integer quantity from 8x8 digit tiles on row ty in [tx_start, tx_end)."""
     y0 = ty * TILE_SIZE
@@ -1255,6 +1288,8 @@ def read_tile_quantity(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> 
         sig = _tile_row_signature(tile)
         if sig in HUD_DIGIT_TEMPLATES:
             digits.append(str(HUD_DIGIT_TEMPLATES[sig]))
+        elif ty == 11 and sig[:6] in HUD_DIGIT_TOP6_TEMPLATES and sig[6] == 0 and sig[7] in (0, 3):
+            digits.append(str(HUD_DIGIT_TOP6_TEMPLATES[sig[:6]]))
         elif digits:
             break
     if not digits:
@@ -1289,16 +1324,54 @@ def read_bag_item_quantities(frame: np.ndarray) -> Optional[List[Tuple[str, Opti
     return None
 
 
+def read_bag_cursor_row_index(frame: np.ndarray, tracked_index: Optional[int] = None) -> Optional[int]:
+    """Return the 0-based visible window row index currently highlighted on a Gen 1 or Gen 2 bag item list, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if is_gen1_item_list_screen(img):
+        rows: List[str] = []
+        for idx, ty in enumerate((4, 6, 8, 10)):
+            name = read_tile_text(img, ty, 6, 18)
+            if name:
+                rows.append(name)
+            if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE]):
+                return idx
+        if tracked_index is not None and 0 <= tracked_index < len(rows):
+            return tracked_index
+        return None
+    if is_pack_item_list_screen(img):
+        rows = []
+        for idx, ty in enumerate((2, 4, 6, 8, 10)):
+            name = read_tile_text(img, ty, 8, 20)
+            if not name:
+                continue
+            row_name = "CANCEL" if (name == "CANCEL" or name.startswith("CANCEL ")) else name
+            rows.append(row_name)
+            if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 7 * TILE_SIZE:8 * TILE_SIZE]):
+                return idx
+        cur = read_bag_cursor_row(img, tracked_index=tracked_index)
+        if cur in rows:
+            return rows.index(cur)
+        return None
+    return None
+
+
 def read_bag_cursor_row(frame: np.ndarray, tracked_index: Optional[int] = None) -> Optional[str]:
     """Return the item name (or 'CANCEL') currently highlighted on a Gen 1 or Gen 2 bag item list, or None."""
     if frame is None:
         return None
     img = _grey_frame(frame)
     if is_gen1_item_list_screen(img):
+        rows: List[str] = []
         for ty in (4, 6, 8, 10):
+            name = read_tile_text(img, ty, 6, 18)
+            if name:
+                rows.append(name)
             if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE]):
-                name = read_tile_text(img, ty, 6, 18)
                 return name if name else None
+        if tracked_index is not None and 0 <= tracked_index < len(rows):
+            return rows[tracked_index]
         return None
     if is_pack_item_list_screen(img):
         rows: List[str] = []

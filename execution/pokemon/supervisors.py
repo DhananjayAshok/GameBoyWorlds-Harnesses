@@ -1087,8 +1087,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _update_party_hp_from_combat(self, report: ExecutorReport) -> None:
         notes = report.notes or ""
-        has_bag_tag = self._update_bag_status_from_notes(notes)
-        if getattr(self.last_executor, "_bag_unavailable", False) and not has_bag_tag:
+        self._update_bag_status_from_notes(notes)
+        bag_info = CombatExecutor.extract_bag_items_from_text(notes)
+        has_remaining_heal = bool(bag_info and any(is_healing_item_name(it) for it in bag_info[0]))
+        if getattr(self.last_executor, "_bag_unavailable", False) and not has_remaining_heal:
             self._healing_bag_empty = True
         hp = CombatExecutor.extract_player_hp_from_text(notes)
         if hp is not None:
@@ -1719,6 +1721,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
         task = instructions + (f"\nYour battle tips:\n{self._tips_text()}" if self._battle_tips else "")
         if self._zero_pp_moves and "initial_zero_pp_moves" not in executor_kwargs:
             executor_kwargs["initial_zero_pp_moves"] = list(self._zero_pp_moves)
+        if (
+            self._healing_bag_empty
+            and (not self._active_pokemon_status or self._status_heal_bag_empty)
+            and not re.search(r"\b(?:catch|capture|ball)\b", instructions or "", re.IGNORECASE)
+            and "initial_bag_unavailable" not in executor_kwargs
+        ):
+            executor_kwargs["initial_bag_unavailable"] = True
         return self.call_executor("combat", task, counted=counted, **executor_kwargs)
 
     def _record_leg_blocked_moves(self, request: str) -> Dict[Any, Any]:
