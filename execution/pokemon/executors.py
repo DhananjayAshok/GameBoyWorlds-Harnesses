@@ -23,14 +23,19 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_pack_screen, is_party_menu_screen,
                                                  is_party_menu_selection_screen, is_same_battle_frame,
                                                  is_start_menu_screen,
-                                                 is_healing_item_name, is_status_heal_item_for_status,
+                                                 is_healing_item_name, is_item_use_subbox_screen,
+                                                 is_party_boost_item_name, is_party_consumable_item_name,
+                                                 is_status_heal_item_for_status,
                                                  is_status_heal_item_name,
                                                  read_bag_cursor_row, read_bag_cursor_row_index,
                                                  read_bag_item_list,
                                                  read_bag_item_quantities, read_battle_hud_hp,
-                                                 read_battle_hud_status, read_move_menu_cursor_slot,
+                                                 read_battle_hud_status, read_menu_cursor_item_name,
+                                                 read_move_menu_cursor_slot,
                                                  read_move_menu_names, read_move_menu_pp,
-                                                 read_party_menu_hp, read_party_menu_status)
+                                                 read_party_menu_cursor_slot, read_party_menu_hp,
+                                                 read_party_menu_members, read_party_menu_status,
+                                                 read_quantity_selector_value)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
@@ -4015,9 +4020,11 @@ Press: <one of up, down, left, right, confirm, back>
         self._bag_scrolled_in_opening: bool = False
         self._bag_cursor_idx: Optional[int] = None
         self._pending_bag_item: Optional[str] = None
+        self._active_menu_item: Optional[str] = None
         self._last_consumed_bag_item: Optional[str] = None
         self._confirmed_bag_items: set = set()
         self._last_auto_scrolled_confirmed_count: Optional[int] = None
+        self._quantity_adjusted_in_box: bool = False
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
@@ -4121,6 +4128,198 @@ Press: <one of up, down, left, right, confirm, back>
             if is_status_heal_item_name(item):
                 return True
         return False
+
+    def _target_quantity_for_item(self, active_item: Optional[str] = None) -> Optional[int]:
+        raw = self._task or ""
+        if not raw:
+            return None
+        norm_task = raw.upper().replace("É", "E")
+        items_to_try: List[str] = []
+        if active_item:
+            norm_item = active_item.strip().upper().replace("É", "E")
+            if norm_item and norm_item != "CANCEL":
+                items_to_try.append(norm_item)
+                if norm_item == "POK":
+                    items_to_try.append("POKE BALL")
+        for item in items_to_try:
+            esc = re.escape(item)
+            m_to = re.search(
+                rf"\b{esc}S?\b[^,;.]{{0,40}}?\b(?:FROM\s+X?\d{{1,2}}\s+)?TO\s+X?(\d{{1,2}})\b",
+                norm_task,
+            )
+            if m_to:
+                val = int(m_to.group(1))
+                if 1 <= val <= 99:
+                    return val
+            m_before = re.search(
+                rf"\b(\d{{1,2}})(?:\s*(?:TO|-)\s*\d{{1,2}})?\s+{esc}S?\b",
+                norm_task,
+            )
+            if m_before:
+                val = int(m_before.group(1))
+                if 1 <= val <= 99:
+                    return val
+            m_after = re.search(
+                rf"\b{esc}S?\s*(?:X|\()\s*(\d{{1,2}})\b",
+                norm_task,
+            )
+            if m_after:
+                val = int(m_after.group(1))
+                if 1 <= val <= 99:
+                    return val
+        m_to_generic = re.search(
+            r"\b(?:FROM\s+X?\d{1,2}\s+TO|QUANTITY\s+TO(?:\s+THE\s+MAXIMUM[^0-9]{0,30})?)\s*\(?X?(\d{1,2})\)?\b",
+            norm_task,
+        )
+        if m_to_generic:
+            val = int(m_to_generic.group(1))
+            if 1 <= val <= 99:
+                return val
+        all_qty = re.findall(
+            r"\b(?:BUY|PURCHASE|SELL|TOSS)\s+(?:UP\s+TO\s+)?(\d{1,2})(?:\s*(?:TO|-)\s*\d{1,2})?\s+[A-Z0-9][A-Z0-9 ]*\b",
+            norm_task,
+        )
+        if len(all_qty) == 1 and not active_item:
+            val = int(all_qty[0])
+            if 1 <= val <= 99:
+                return val
+        return None
+
+    def _auto_adjust_quantity_selector(self) -> None:
+        frame = self._get_state()["core"]["current_frame"]
+        if not has_quantity_selector_box(frame):
+            self._quantity_adjusted_in_box = False
+            return
+        if self._quantity_adjusted_in_box:
+            return
+        cur_val = read_quantity_selector_value(frame)
+        if cur_val is None:
+            return
+        target_val = self._target_quantity_for_item(self._active_menu_item)
+        self._quantity_adjusted_in_box = True
+        if target_val is None or target_val == cur_val:
+            return
+        if self._current_call is None:
+            self._begin_scripted(
+                f"adjust quantity selector from x{cur_val:02d} to x{target_val:02d}"
+            )
+        start_val = cur_val
+        steps_taken = 0
+        last_dir = "up"
+        for _ in range(50):
+            if self._last_terminated or self._last_truncated:
+                return
+            cur_frame = self._get_state()["core"]["current_frame"]
+            if not has_quantity_selector_box(cur_frame):
+                break
+            cur_val = read_quantity_selector_value(cur_frame)
+            if cur_val is None or cur_val == target_val:
+                break
+            up_dist = (target_val - cur_val) % 99
+            down_dist = (cur_val - target_val) % 99
+            step_dir = "up" if up_dist <= down_dist else "down"
+            last_dir = step_dir
+            rec = self._take_action(MenuAction, menu_action=step_dir)
+            drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+            steps_taken += 1
+            if self._last_terminated or self._last_truncated:
+                return
+            after_val = read_quantity_selector_value(self._get_state()["core"]["current_frame"])
+            if after_val == cur_val:
+                break
+            if after_val == target_val:
+                cur_val = after_val
+                break
+        final_val = read_quantity_selector_value(self._get_state()["core"]["current_frame"])
+        if steps_taken > 0 and final_val is not None:
+            item_label = f" for {self._active_menu_item}" if self._active_menu_item else ""
+            if self.press_outcomes:
+                self.press_outcomes[-1] = (
+                    f"{self.press_outcomes[-1]} (adjusted quantity{item_label} from x{start_val:02d} to x{final_val:02d} — press confirm to accept x{final_val:02d})"
+                )
+            else:
+                self.presses.append(last_dir)
+                self.press_outcomes.append(
+                    f"{last_dir} (adjusted quantity{item_label} from x{start_val:02d} to x{final_val:02d} — press confirm to accept x{final_val:02d})"
+                )
+
+    def _task_allows_party_item_use(self, item_name: Optional[str]) -> bool:
+        if not item_name or not is_party_consumable_item_name(item_name):
+            return False
+        clause = self._task_bag_clause()
+        if re.search(r"\b(?:toss|discard|drop|give|hold)\b", clause, re.IGNORECASE):
+            return False
+        if re.search(r"\bsell\b", clause, re.IGNORECASE) and not re.search(
+            r"\b(?:use|heal|restore|apply)\b", clause, re.IGNORECASE
+        ):
+            return False
+        return True
+
+    def _party_slot_matches_task(
+        self,
+        selected_item: str,
+        members: List[Tuple[int, str, Optional[Tuple[int, int]]]],
+        cursor_slot: Optional[int],
+    ) -> bool:
+        if not members:
+            return True
+        if len(members) == 1 and (cursor_slot is None or cursor_slot == 0):
+            return True
+        slot_idx = 0 if cursor_slot is None else cursor_slot
+        if slot_idx < 0 or slot_idx >= len(members):
+            return False
+        _, cur_name, cur_hp = members[slot_idx]
+        clause_up = self._task_bag_clause().upper()
+        named_members = [
+            (idx, name, hp)
+            for idx, name, hp in members
+            if name and len(name) >= 3 and name.upper() in clause_up
+        ]
+        if named_members:
+            return any(idx == slot_idx for idx, _, _ in named_members)
+        if slot_idx == 0:
+            if is_healing_item_name(selected_item):
+                return cur_hp is None or cur_hp[0] < cur_hp[1]
+            return True
+        return False
+
+    def _complete_menu_party_item_application(self, selected_item: Optional[str]) -> List[str]:
+        auto_steps: List[str] = []
+        if not selected_item or selected_item == "CANCEL":
+            return auto_steps
+        if not self._task_allows_party_item_use(selected_item):
+            return auto_steps
+        cur_frame = self._get_state()["core"]["current_frame"]
+        if is_item_use_subbox_screen(cur_frame):
+            if self._current_call is None:
+                self._begin_scripted(f"confirm USE on {selected_item}")
+            use_rec = self._take_action(MenuAction, menu_action="confirm")
+            drop_prefix_crops(captured_dialogue_crops([use_rec]), self.dialogue_crops)
+            auto_steps.append("confirmed USE")
+            if self._last_terminated or self._last_truncated:
+                return auto_steps
+            cur_frame = self._get_state()["core"]["current_frame"]
+        if is_party_menu_selection_screen(cur_frame):
+            members = read_party_menu_members(cur_frame)
+            cursor_slot = read_party_menu_cursor_slot(cur_frame)
+            if self._party_slot_matches_task(selected_item, members, cursor_slot):
+                if self._current_call is None:
+                    self._begin_scripted(f"apply {selected_item} to party Pokemon")
+                target_rec = self._take_action(MenuAction, menu_action="confirm")
+                drop_prefix_crops(captured_dialogue_crops([target_rec]), self.dialogue_crops)
+                target_name = (
+                    members[cursor_slot or 0][1]
+                    if members and (cursor_slot or 0) < len(members)
+                    else "party Pokemon"
+                )
+                auto_steps.append(f"confirmed {target_name} on party screen")
+                if self._last_terminated or self._last_truncated:
+                    return auto_steps
+                after_target = self._get_state()["core"]["current_frame"]
+                if self._should_settle_menu_dialogue(cur_frame, after_target, "confirm"):
+                    self._settle_menu_dialogue()
+                    auto_steps.append("settled effect dialogue")
+        return auto_steps
 
     def _auto_scroll_bag_for_status_item(self) -> None:
         frame = self._get_state()["core"]["current_frame"]
@@ -4366,6 +4565,13 @@ Press: <one of up, down, left, right, confirm, back>
                 lines.append(
                     "Note: All bag slots were checked and there is NO Antidote or status-healing item in the bag."
                 )
+        if has_quantity_selector_box(cur_frame) and not has_menu_cursor(cur_frame):
+            q_val = read_quantity_selector_value(cur_frame)
+            if q_val is not None:
+                item_label = f" for {self._active_menu_item}" if self._active_menu_item else ""
+                lines.append(
+                    f"Current quantity selector value{item_label}: x{q_val:02d} (press confirm to accept x{q_val:02d}, or up/down to change)."
+                )
         if not lines:
             return ""
         return "\n" + "\n".join(lines) + "\n"
@@ -4419,17 +4625,18 @@ Press: <one of up, down, left, right, confirm, back>
                 return
             if not self._has_menu_bottom_box(frame) or has_menu_cursor(frame):
                 return
-            wait_rec = self._take_action(WaitAction)
-            drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
-            if self._last_terminated or self._last_truncated:
-                return
-            after_wait = self._get_state()["core"]["current_frame"]
-            state = effective_agent_state(self._agent_state(), after_wait)
-            if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_wait) or has_menu_cursor(after_wait):
-                return
-            if not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
-                stalled_dismisses = 0
-                continue
+            if is_party_menu_screen(frame) and not has_bottom_dialogue_box(frame):
+                wait_rec = self._take_action(WaitAction)
+                drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                if self._last_terminated or self._last_truncated:
+                    return
+                after_wait = self._get_state()["core"]["current_frame"]
+                state = effective_agent_state(self._agent_state(), after_wait)
+                if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_wait) or has_menu_cursor(after_wait):
+                    return
+                if not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                    stalled_dismisses = 0
+                    continue
             dismiss_rec = self._take_action(MenuAction, menu_action="back")
             drop_prefix_crops(captured_dialogue_crops([dismiss_rec]), self.dialogue_crops)
             if self._last_terminated or self._last_truncated:
@@ -4439,11 +4646,40 @@ Press: <one of up, down, left, right, confirm, back>
             if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_dismiss) or has_menu_cursor(after_dismiss):
                 return
             if is_same_battle_frame(dismiss_rec.frame_before, dismiss_rec.frame_after):
-                stalled_dismisses += 1
-                if stalled_dismisses >= self.MAX_STALLED_MENU_DISMISSES:
+                wait_rec = self._take_action(WaitAction)
+                drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                if self._last_terminated or self._last_truncated:
                     return
+                after_wait = self._get_state()["core"]["current_frame"]
+                state = effective_agent_state(self._agent_state(), after_wait)
+                if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_wait) or has_menu_cursor(after_wait):
+                    return
+                if is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                    stalled_dismisses += 1
+                    if stalled_dismisses >= self.MAX_STALLED_MENU_DISMISSES:
+                        return
+                else:
+                    stalled_dismisses = 0
             else:
                 stalled_dismisses = 0
+
+    def _consume_confirmed_bag_item(self, item_name: Optional[str]) -> None:
+        if not item_name or item_name == "CANCEL":
+            return
+        self._confirmed_bag_items.add(item_name)
+        self._last_consumed_bag_item = item_name
+        if self._party_state is not None:
+            self._party_state.consume_item(item_name)
+            self._seen_bag_items = list(self._party_state.items)
+            self._bag_item_quantities = dict(self._party_state.quantities)
+        else:
+            qty = self._bag_item_quantities.get(item_name)
+            if qty is not None and qty > 1:
+                self._bag_item_quantities[item_name] = qty - 1
+            elif qty == 1:
+                self._bag_item_quantities.pop(item_name, None)
+                if item_name in self._seen_bag_items:
+                    self._seen_bag_items.remove(item_name)
 
     def _execute(self) -> int:
         self._last_terminated = False
@@ -4472,6 +4708,11 @@ Press: <one of up, down, left, right, confirm, back>
                 code, reason = LEFT_MENU_OUTCOMES.get(state, (MENU_OK, "menu_closed"))
                 return self._finish(code, reason)
             self._auto_scroll_bag_for_status_item()
+            if self._last_terminated:
+                return self._finish(MENU_TERMINATED, "terminated")
+            if self._last_truncated:
+                return self._finish(MENU_TRUNCATED, "truncated")
+            self._auto_adjust_quantity_selector()
             if self._last_terminated:
                 return self._finish(MENU_TERMINATED, "terminated")
             if self._last_truncated:
@@ -4521,6 +4762,9 @@ Press: <one of up, down, left, right, confirm, back>
                 if bag_before is not None
                 else None
             )
+            pre_menu_item = read_menu_cursor_item_name(frame, tracked_index=self._bag_cursor_idx)
+            if press == "confirm" and pre_menu_item and not has_quantity_selector_box(frame):
+                self._active_menu_item = pre_menu_item
             if bag_before is not None:
                 if press in ("up", "down"):
                     self._bag_scrolled_in_opening = True
@@ -4563,6 +4807,39 @@ Press: <one of up, down, left, right, confirm, back>
                     if self._party_state is not None:
                         self._party_state.saw_top = True
                     self._saw_bag_end = bool(self._saw_bag_top and self._saw_bag_bottom)
+            auto_party_steps: List[str] = []
+            if (
+                press == "confirm"
+                and self._pending_bag_item
+                and (
+                    is_item_use_subbox_screen(after_frame)
+                    or is_party_menu_selection_screen(after_frame)
+                )
+            ):
+                auto_party_steps = self._complete_menu_party_item_application(self._pending_bag_item)
+                if self._last_terminated:
+                    return self._finish(MENU_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._finish(MENU_TRUNCATED, "truncated")
+                if auto_party_steps:
+                    after_frame = self._get_state()["core"]["current_frame"]
+                    bag_after = self._scan_bag_frame(after_frame)
+                    if "settled effect dialogue" in auto_party_steps or is_party_menu_screen(after_frame):
+                        self._consume_confirmed_bag_item(self._pending_bag_item)
+                        if not is_party_menu_screen(after_frame):
+                            if any(self._bag_target_matches(it) for it in self._seen_bag_items):
+                                self.press_outcomes[-1] = (
+                                    f"{press} (selected {self._pending_bag_item}, {', '.join(auto_party_steps)}, and returned to item menu)"
+                                )
+                            else:
+                                self.press_outcomes[-1] = (
+                                    f"{press} (selected {self._pending_bag_item}, {', '.join(auto_party_steps)}, and returned to item menu — press back to close the item and Start menus)"
+                                )
+                        else:
+                            self.press_outcomes[-1] = f"{press} (selected {self._pending_bag_item}, {', '.join(auto_party_steps)})"
+                        self._pending_bag_item = None
+                    else:
+                        self.press_outcomes[-1] = f"{press} (selected {self._pending_bag_item}, {', '.join(auto_party_steps)})"
             if (
                 press == "confirm"
                 and self._pending_bag_item
@@ -4572,20 +4849,7 @@ Press: <one of up, down, left, right, confirm, back>
                     or (has_bottom_dialogue_box(after_frame) and bag_after is None)
                 )
             ):
-                self._confirmed_bag_items.add(self._pending_bag_item)
-                self._last_consumed_bag_item = self._pending_bag_item
-                if self._party_state is not None:
-                    self._party_state.consume_item(self._pending_bag_item)
-                    self._seen_bag_items = list(self._party_state.items)
-                    self._bag_item_quantities = dict(self._party_state.quantities)
-                else:
-                    qty = self._bag_item_quantities.get(self._pending_bag_item)
-                    if qty is not None and qty > 1:
-                        self._bag_item_quantities[self._pending_bag_item] = qty - 1
-                    elif qty == 1:
-                        self._bag_item_quantities.pop(self._pending_bag_item, None)
-                        if self._pending_bag_item in self._seen_bag_items:
-                            self._seen_bag_items.remove(self._pending_bag_item)
+                self._consume_confirmed_bag_item(self._pending_bag_item)
                 self._pending_bag_item = None
             state = effective_agent_state(self._agent_state(), after_frame)
             if state != AgentState.IN_MENU:

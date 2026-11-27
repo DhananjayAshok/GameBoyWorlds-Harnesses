@@ -1335,6 +1335,34 @@ def is_status_heal_item_for_status(name: str, status: Optional[str] = None) -> b
     return is_status_heal_item_name(up)
 
 
+PARTY_BOOST_ITEM_NAMES = (
+    "RARE CANDY",
+    "HP UP",
+    "PROTEIN",
+    "IRON",
+    "CARBOS",
+    "CALCIUM",
+    "PP UP",
+)
+
+
+def is_party_boost_item_name(name: str) -> bool:
+    """Return True if an uppercase bag item name is a level-up or stat-boosting vitamin item used on a party Pokemon."""
+    up = re.sub(r"\s*\(X\d+\)\s*$", "", (name or "").strip().upper())
+    if not up or up == "CANCEL":
+        return False
+    return any(up == target or target in up for target in PARTY_BOOST_ITEM_NAMES)
+
+
+def is_party_consumable_item_name(name: str) -> bool:
+    """Return True if an uppercase bag item name is an HP-healing, status-healing, or stat/level-boosting party item."""
+    return (
+        is_healing_item_name(name)
+        or is_status_heal_item_name(name)
+        or is_party_boost_item_name(name)
+    )
+
+
 def read_tile_quantity(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> Optional[int]:
     """Read an integer quantity from 8x8 digit tiles on row ty in [tx_start, tx_end)."""
     y0 = ty * TILE_SIZE
@@ -1468,4 +1496,156 @@ def read_bag_cursor_row(frame: np.ndarray, tracked_index: Optional[int] = None) 
             if len(status_matches) == 1:
                 return status_matches[0]
         return non_cancel[0] if non_cancel else None
+    return None
+
+
+MULTIPLY_SIGN_SIGNATURE = (0, 0, 68, 40, 16, 40, 68, 0)
+
+
+def read_quantity_selector_value(frame: np.ndarray) -> Optional[int]:
+    """Read the integer quantity (1..99) displayed inside an open quantity selector sub-box, or None."""
+    if frame is None or not has_quantity_selector_box(frame):
+        return None
+    img = _grey_frame(frame)
+    max_ty = min(GRID_ROWS, img.shape[0] // TILE_SIZE)
+    max_tx = min(GRID_COLS, img.shape[1] // TILE_SIZE)
+    if max_ty < GRID_ROWS or max_tx < GRID_COLS:
+        return None
+    tiles = [[img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+              for tx in range(max_tx)] for ty in range(max_ty)]
+    h_border = [[is_horizontal_border_tile(tiles[ty][tx]) for tx in range(max_tx)] for ty in range(max_ty)]
+    v_border = [[is_vertical_border_tile(tiles[ty][tx]) for tx in range(max_tx)] for ty in range(max_ty)]
+    for top_ty in range(6, 11):
+        for bot_ty in range(top_ty + 2, min(top_ty + 5, 13)):
+            for left_tx in range(5, 14):
+                for right_tx in range(max(left_tx + 5, 15), 20):
+                    check_end = min(right_tx, 13)
+                    if check_end <= left_tx + 2:
+                        continue
+                    if not all(h_border[top_ty][tx] and h_border[bot_ty][tx]
+                               for tx in range(left_tx + 1, check_end)):
+                        continue
+                    if not all(v_border[ty][left_tx] for ty in range(top_ty + 1, bot_ty)):
+                        continue
+                    for ty in range(top_ty + 1, bot_ty):
+                        for tx in range(left_tx + 1, min(right_tx - 1, max_tx - 2)):
+                            sig = _tile_row_signature(tiles[ty][tx])
+                            if sig == MULTIPLY_SIGN_SIGNATURE:
+                                val = read_tile_quantity(img, ty, tx + 1, min(tx + 4, right_tx))
+                                if val is not None and 1 <= val <= 99:
+                                    return val
+                        val = read_tile_quantity(img, ty, left_tx + 1, min(left_tx + 5, right_tx))
+                        if val is not None and 1 <= val <= 99:
+                            return val
+    return None
+
+
+def read_menu_cursor_item_name(frame: np.ndarray, tracked_index: Optional[int] = None) -> Optional[str]:
+    """Return the uppercase item name currently highlighted by a cursor on a bag list or shop shelf, or None."""
+    if frame is None:
+        return None
+    bag_row = read_bag_cursor_row(frame, tracked_index=tracked_index)
+    if bag_row and bag_row != "CANCEL":
+        return bag_row
+    img = _grey_frame(frame)
+    for ty in (2, 4, 6, 8, 10):
+        for cursor_tx, text_tx in ((5, 6), (7, 8), (1, 2)):
+            if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, cursor_tx * TILE_SIZE:(cursor_tx + 1) * TILE_SIZE]):
+                name = read_tile_text(img, ty, text_tx, 19)
+                if name and name != "CANCEL" and not name.startswith("CANCEL "):
+                    return name
+    return None
+
+
+def is_gen1_item_action_subbox_screen(frame: np.ndarray) -> bool:
+    """Return True if a Generation 1 ITEM screen has its USE/TOSS action sub-box open with the cursor on USE."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < 15 * TILE_SIZE or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if is_party_menu_screen(img) or is_pack_screen(img) or has_quantity_selector_box(img):
+        return False
+    if not all(is_horizontal_border_tile(img[2 * TILE_SIZE:3 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+               for tx in range(5, 19)):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 4 * TILE_SIZE:5 * TILE_SIZE])
+               for ty in range(3, 12)):
+        return False
+    if not all(is_horizontal_border_tile(img[10 * TILE_SIZE:11 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+               for tx in range(14, 19)):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 13 * TILE_SIZE:14 * TILE_SIZE])
+               for ty in range(11, 14)):
+        return False
+    return is_cursor_tile(img[11 * TILE_SIZE:12 * TILE_SIZE, 14 * TILE_SIZE:15 * TILE_SIZE])
+
+
+def is_overworld_pack_use_subbox_screen(frame: np.ndarray) -> bool:
+    """Return True if a Generation 2 Pack screen has its action sub-box open with the cursor on the top USE option."""
+    if not is_pack_screen(frame) or has_quantity_selector_box(frame):
+        return False
+    img = _grey_frame(frame)
+    if pack_action_box_height(img) < 4:
+        return False
+    for top_ty in range(3, 10):
+        for left_tx in range(10, 16):
+            span_end = min(19, left_tx + 5)
+            if span_end <= left_tx + 2:
+                continue
+            if not all(
+                is_horizontal_border_tile(img[top_ty * TILE_SIZE:(top_ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+                for tx in range(left_tx + 1, span_end)
+            ):
+                continue
+            if is_cursor_tile(
+                img[(top_ty + 1) * TILE_SIZE:(top_ty + 2) * TILE_SIZE, (left_tx + 1) * TILE_SIZE:(left_tx + 2) * TILE_SIZE]
+            ):
+                return True
+    return False
+
+
+def is_item_use_subbox_screen(frame: np.ndarray) -> bool:
+    """Return True if a Gen 1 or Gen 2 item action sub-box (USE/TOSS or USE/GIVE/TOSS/QUIT) is open with cursor on USE."""
+    return (
+        is_pack_action_subbox_screen(frame)
+        or is_overworld_pack_use_subbox_screen(frame)
+        or is_gen1_item_action_subbox_screen(frame)
+    )
+
+
+def read_party_menu_members(frame: np.ndarray) -> List[Tuple[int, str, Optional[Tuple[int, int]]]]:
+    """Return [(slot_idx, name, hp_tuple_or_None), ...] for visible party slots on a Gen 1 or Gen 2 party menu screen."""
+    if not is_party_menu_screen(frame):
+        return []
+    img = _grey_frame(frame)
+    members: List[Tuple[int, str, Optional[Tuple[int, int]]]] = []
+    gen1_name0 = read_tile_text(img, 0, 3, 14)
+    if gen1_name0 and gen1_name0 != "CANCEL":
+        for idx, name_ty in enumerate((0, 2, 4, 6, 8, 10)):
+            name = read_tile_text(img, name_ty, 3, 14)
+            if not name or name == "CANCEL" or name.startswith("CANCEL "):
+                break
+            hp = _read_tile_hp_fraction(img, name_ty + 1, 16)
+            members.append((idx, name, hp))
+        return members
+    for idx, row_ty in enumerate((1, 3, 5, 7, 9, 11)):
+        if read_tile_text(img, row_ty, 1, 8) == "CANCEL":
+            break
+        name = read_tile_text(img, row_ty, 3, 13)
+        if not name or name == "CANCEL" or name.startswith("CANCEL "):
+            break
+        hp = _read_tile_hp_fraction(img, row_ty, 16)
+        members.append((idx, name, hp))
+    return members
+
+
+def read_party_menu_cursor_slot(frame: np.ndarray) -> Optional[int]:
+    """Return the 0-based party slot index currently highlighted by the solid cursor on a party screen, or None."""
+    if not is_party_menu_screen(frame):
+        return None
+    img = _grey_frame(frame)
+    for idx, ty in enumerate((1, 3, 5, 7, 9, 11)):
+        if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]):
+            return idx
     return None
