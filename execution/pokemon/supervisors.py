@@ -329,7 +329,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 self._zero_step_dialogue_failures = 0
             if dialogue_text:
                 self._last_failed_dialogue_text = dialogue_text
-        elif tag == "free" and (was_in_dialogue or zero_steps or tail_stalled):
+        elif tag == "free" and result.get("reason") != "move_interrupted" and (was_in_dialogue or zero_steps or tail_stalled):
             self._dialogue_clear_failed = True
             self._dialogue_failed_step = step_after
             presses = [str(p).lower() for p in (getattr(executor, "presses", None) or ())]
@@ -1729,20 +1729,44 @@ class PokemonPlayThroughSupervisor(Supervisor):
         after_place: Optional[Tuple[int, Tuple[int, int]]],
         state_chain: str,
         handled: Dict[str, Any],
+        *,
+        allow_async_dialogue: bool = False,
+        current_argument: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], bool]:
         if (
             not handled.get("succeeded")
-            or handled.get("reason") != "battle_ended"
-            or "in_battle" not in state_chain
             or self._agent_state() != AgentState.FREE_ROAM
             or self._is_in_dialogue()
             or self._battles_lost()
             or self._env_done()
-            or not self._is_wild_encounter_dialogue(handled.get("dialogue"))
-            or self._task_wants_wild_battles()
-            or not self._active_pokemon_hp_healthy()
         ):
             return False, None, False
+        is_wild_battle_clear = (
+            handled.get("reason") == "battle_ended"
+            and "in_battle" in state_chain
+            and self._is_wild_encounter_dialogue(handled.get("dialogue"))
+            and not self._task_wants_wild_battles()
+            and self._active_pokemon_hp_healthy()
+        )
+        is_async_dialogue_clear = (
+            allow_async_dialogue
+            and handled.get("reason") == "dialogue_cleared"
+            and "in_battle" not in state_chain
+            and "in_menu" not in state_chain
+        )
+        if not (is_wild_battle_clear or is_async_dialogue_clear):
+            return False, None, False
+        if action == "Free":
+            resumed_arg = current_argument if current_argument is not None else current_task
+            if not resumed_arg:
+                return False, None, False
+            gmap = self._global_map()
+            if gmap is not None and leg_start_place is not None and after_place is not None:
+                s_seg, _ = gmap.resolve(leg_start_place[0], leg_start_place[1])
+                a_seg, _ = gmap.resolve(after_place[0], after_place[1])
+                if s_seg != a_seg:
+                    return False, None, True
+            return True, resumed_arg, False
         gmap = self._global_map()
         if gmap is None or leg_start_place is None or after_place is None:
             return False, None, False
@@ -1771,7 +1795,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 new_c = (old_c[0] - dx, old_c[1] - dy)
                 wants_warp = bool(
                     re.search(
-                        r"(?:ladder|stair(?:s|case)?|door(?:way)?|entrance|exit|elevator|warp)",
+                        r"\b(?:ladder|stair(?:s|case)?|door(?:way)?|entrance|exit|elevator|warp)\b",
                         current_task,
                         re.IGNORECASE,
                     )
@@ -2161,6 +2185,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             is_move_action = ACTIONS[action][0] in MOVE_TAGS
             leg_initial_state = None
             result, task = self._run_action(action, argument, frame)
+            if action == "Free" and result.get("reason") == "move_interrupted":
+                is_move_action = True
             if "report" in result and getattr(result["report"], "initial_state", None) is not None:
                 leg_initial_state = result["report"].initial_state
             after_place = self._record_map_stop()
@@ -2182,6 +2208,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             wild_resumes = 0
             leg_start_place = before_place
             current_task = task
+            current_argument = argument if action == "Free" else task
             while (
                 is_move_action
                 and not result["succeeded"]
@@ -2196,6 +2223,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
             ):
                 if self._calls > 0:
                     self._calls -= 1
+                interrupt_frame = self._current_frame()
+                was_top_box_interrupt = (
+                    self._agent_state() == AgentState.IN_MENU
+                    and has_top_dialogue_box(interrupt_frame)
+                    and not has_menu_cursor(interrupt_frame)
+                )
                 seed_crops = getattr(self.last_executor, "dialogue_crops", None)
                 state, handled = self._handle_interruption(initial_dialogue_crops=seed_crops)
                 if leg_initial_state is not None:
@@ -2217,7 +2250,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
                     subgoal_places.append(after_place)
                 can_resume, resumed_task, already_completed = self._prepare_wild_move_resume(
-                    action, current_task, leg_start_place, after_place, state, handled
+                    action,
+                    current_task,
+                    leg_start_place,
+                    after_place,
+                    state,
+                    handled,
+                    allow_async_dialogue=bool(
+                        not exec_blocked
+                        and (was_top_box_interrupt or (action == "Free" and result.get("reason") == "move_interrupted"))
+                    ),
+                    current_argument=current_argument,
                 )
                 if already_completed:
                     handled["succeeded"] = True
@@ -2231,8 +2274,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 current_task = resumed_task
                 resume_frame = self._current_frame()
                 self._perceive(resume_frame)
-                move_tag_name = ACTIONS[action][0]
-                result = self._move(move_tag_name, current_task, counted=True)
+                if action == "Free":
+                    current_argument = resumed_task
+                    result, current_task = self._run_action(action, current_argument, resume_frame)
+                else:
+                    move_tag_name = ACTIONS[action][0]
+                    result = self._move(move_tag_name, current_task, counted=True)
                 if leg_initial_state is not None and "report" in result:
                     result["report"].initial_state = leg_initial_state
                 if handled.get("dialogue"):
@@ -2271,9 +2318,6 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if not is_move_action or not handled.get("succeeded"):
                     failed_attempts += 1
                 continue
-
-            if result["succeeded"] and self._agent_state() == AgentState.FREE_ROAM and not self._env_done():
-                step_before_settle = getattr(getattr(self._env, "_emulator", None), "step_count", None)
                 self._settle_free_roam()
                 step_after_settle = getattr(getattr(self._env, "_emulator", None), "step_count", None)
                 if step_after_settle != step_before_settle:

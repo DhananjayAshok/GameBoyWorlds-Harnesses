@@ -93,14 +93,64 @@ def is_scrolled_prefix_crop(earlier: np.ndarray, later: np.ndarray) -> bool:
     return False
 
 
+DIALOGUE_CROP_TOP = 100
+DIALOGUE_CROP_BOTTOM = 140
+DIALOGUE_CROP_LEFT = 5
+DIALOGUE_CROP_RIGHT = 155
+
+
+def extract_bottom_dialogue_crop(frame: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if frame is None or not hasattr(frame, "shape") or frame.ndim < 2:
+        return None
+    if frame.shape[0] < DIALOGUE_CROP_BOTTOM or frame.shape[1] < DIALOGUE_CROP_RIGHT:
+        return None
+    if not has_bottom_dialogue_box(frame) or is_top_box_hangup_or_blank_bottom_box(frame):
+        return None
+    grey = frame[:, :, 0:1] if frame.ndim == 3 else frame[:, :, None]
+    crop = np.ascontiguousarray(
+        grey[DIALOGUE_CROP_TOP:DIALOGUE_CROP_BOTTOM, DIALOGUE_CROP_LEFT:DIALOGUE_CROP_RIGHT]
+    )
+    if is_blank_crop(crop) or is_battle_menu_crop(crop):
+        return None
+    return crop
+
+
+def is_top_box_hangup_or_blank_bottom_box(frame: Optional[np.ndarray]) -> bool:
+    if frame is None or not hasattr(frame, "shape") or frame.ndim < 2:
+        return True
+    if not has_bottom_dialogue_box(frame):
+        return True
+    grey = frame[:, :, 0] if frame.ndim == 3 else frame
+    if grey.shape[0] < 136 or grey.shape[1] < 104:
+        return True
+    ink_mask = grey[104:136, 8:104] < 128
+    ink_count = int(ink_mask.sum())
+    if ink_count <= 16:
+        return True
+    ys = np.where(ink_mask)[0]
+    return len(ys) == 0 or (int(ys.max()) - int(ys.min()) + 1) <= 2
+
+
 def captured_dialogue_crops(records: List[EnvironmentStepRecord]) -> List[Any]:
     crops = []
     for record in records:
+        rec_crops = []
         for state in record.transition_states:
             step_crops = state.get("ocr", {}).get("ocr_regions", {}).get("dialogue")
             if step_crops is None or len(step_crops) == 0:
                 continue
-            crops.extend(step_crops)
+            rec_crops.extend(step_crops)
+        if not rec_crops:
+            for candidate_frame in (getattr(record, "frame_before", None), getattr(record, "frame_after", None)):
+                if (
+                    candidate_frame is not None
+                    and has_top_dialogue_box(candidate_frame)
+                    and not has_menu_cursor(candidate_frame)
+                ):
+                    crop = extract_bottom_dialogue_crop(candidate_frame)
+                    if crop is not None:
+                        rec_crops.append(crop)
+        crops.extend(rec_crops)
     return crops
 
 
@@ -3811,11 +3861,55 @@ class _DialogueSettlingExecutor(PolicyExecutor):
             state = self._settle_state()
         return state
 
+    def _capture_current_frame_dialogue_crop(self, frame: Optional[np.ndarray] = None) -> None:
+        fr = self._current_frame() if frame is None else frame
+        crop = extract_bottom_dialogue_crop(fr)
+        if crop is not None:
+            drop_prefix_crops([crop], self.dialogue_crops)
+
+    def _settle_top_box_hangup_or_ring(self, max_waits: int = DIALOGUE_MAX_CUTSCENE_WAIT) -> bool:
+        progressed = False
+        for _ in range(max_waits):
+            if (
+                self._agent_state() != AgentState.IN_MENU
+                or not self._is_top_box_dialogue()
+                or self._last_terminated
+                or self._last_truncated
+            ):
+                break
+            wait_rec = self._take_action(WaitAction)
+            drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+            if wait_rec.frame_changed or not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                progressed = True
+            cur_frame = self._current_frame()
+            if (
+                has_bottom_dialogue_box(cur_frame)
+                and not is_top_box_hangup_or_blank_bottom_box(cur_frame)
+                and is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after)
+            ):
+                break
+        return progressed
+
     def _advance_dialogue_box(self, button: str = "a") -> bool:
         if self._agent_state() == AgentState.IN_MENU and self._is_top_box_dialogue():
             menu_action = "back" if button == "b" else "confirm"
             progressed = False
+            self._capture_current_frame_dialogue_crop()
+            cur_frame = self._current_frame()
+            if not has_bottom_dialogue_box(cur_frame) or is_top_box_hangup_or_blank_bottom_box(cur_frame):
+                if self._settle_top_box_hangup_or_ring():
+                    progressed = True
+                if self._last_terminated or self._last_truncated:
+                    return True
+                if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
+                    self._settle_after_step()
+                    return True
+                if not has_bottom_dialogue_box(self._current_frame()) or is_top_box_hangup_or_blank_bottom_box(
+                    self._current_frame()
+                ):
+                    return progressed
             for _ in range(DIALOGUE_TOP_BOX_PRESSES):
+                self._capture_current_frame_dialogue_crop()
                 record = self._take_action(MenuAction, menu_action=menu_action)
                 drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
                 if record.frame_changed or not is_same_battle_frame(record.frame_before, record.frame_after):
@@ -3825,6 +3919,7 @@ class _DialogueSettlingExecutor(PolicyExecutor):
                 if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
                     self._settle_after_step()
                     return True
+                entered_hangup = False
                 for _ in range(DIALOGUE_TOP_BOX_SCROLL_WAITS):
                     if (self._agent_state() != AgentState.IN_MENU
                             or not self._is_top_box_dialogue()
@@ -3835,14 +3930,29 @@ class _DialogueSettlingExecutor(PolicyExecutor):
                     drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
                     if wait_rec.frame_changed or not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
                         progressed = True
-                    if (has_bottom_dialogue_box(self._current_frame())
-                            and is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after)):
+                    cur_frame = self._current_frame()
+                    if not has_bottom_dialogue_box(cur_frame) or is_top_box_hangup_or_blank_bottom_box(cur_frame):
+                        entered_hangup = True
+                        break
+                    if is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
                         break
                 if self._last_terminated or self._last_truncated:
                     return True
                 if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
                     self._settle_after_step()
                     return True
+                if entered_hangup:
+                    if self._settle_top_box_hangup_or_ring():
+                        progressed = True
+                    if self._last_terminated or self._last_truncated:
+                        return True
+                    if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
+                        self._settle_after_step()
+                        return True
+                    if not has_bottom_dialogue_box(self._current_frame()) or is_top_box_hangup_or_blank_bottom_box(
+                        self._current_frame()
+                    ):
+                        break
             if not progressed:
                 btn_rec = self._take_action_string(f"button({button})")
                 if btn_rec is not None:
@@ -4019,6 +4129,7 @@ FREE_TERMINATED = 1
 FREE_TRUNCATED = 2
 FREE_UNREADABLE = -1
 FREE_OUT_OF_STEPS = -2
+FREE_INTERRUPTED = -3
 FREE_BUTTONS = ("a", "b", "start", "up", "down", "left", "right")
 
 
@@ -4210,6 +4321,32 @@ Press: <one of a, b, start, up, down, left, right>
         return False
 
     @staticmethod
+    def _is_directional_movement_task(task: str, termination: str = "") -> bool:
+        if not task:
+            return False
+        lowered = task.lower()
+        if not re.search(r"\b(?:up|down|left|right|north|south|east|west)\b", lowered):
+            return False
+        if re.search(
+            r"\b(?:press(?:ing)?\s+(?:a|b|start)|button\s+(?:a|b|start)|talk|speak|interact|dialogue|phone|call|menu|dismiss|close|clear|event)\b",
+            lowered,
+        ):
+            return False
+        term_lowered = (termination or "").lower()
+        if re.search(r"\b(?:dialogue|text\s+box|menu|banner\s+disappears)\b", term_lowered):
+            return False
+        return True
+
+    def _is_dialogue_interruption_frame(self, frame: Optional[np.ndarray] = None) -> bool:
+        fr = self._current_frame() if frame is None else frame
+        state = self._agent_state()
+        return (
+            state == AgentState.IN_DIALOGUE
+            or has_bottom_dialogue_box(fr)
+            or (state == AgentState.IN_MENU and self._is_top_box_dialogue(fr))
+        )
+
+    @staticmethod
     def _repeated_walk_direction(task: str) -> Optional[str]:
         if not task:
             return None
@@ -4386,10 +4523,23 @@ Press: <one of a, b, start, up, down, left, right>
         self._last_truncated = False
         consecutive_invalid = 0
         walk_dir = self._repeated_walk_direction(self._task or "")
+        initial_frame = self._get_state()["core"]["current_frame"]
+        started_in_free_roam = (
+            self._agent_state() == AgentState.FREE_ROAM
+            and not has_bottom_dialogue_box(initial_frame)
+            and not self._is_top_box_dialogue(initial_frame)
+            and not is_battle_screen(initial_frame)
+        )
+        is_directional_walk = started_in_free_roam and self._is_directional_movement_task(
+            self._task or "", self.termination
+        )
         for _ in range(self._max_steps):
             frame = self._get_state()["core"]["current_frame"]
             if self.presses and (self._effective_state(frame) == AgentState.IN_BATTLE or is_battle_screen(frame)):
                 return self._finish(FREE_OK, "termination_met")
+            if self.presses and is_directional_walk and self._is_dialogue_interruption_frame(frame):
+                self._capture_current_frame_dialogue_crop(frame)
+                return self._finish(FREE_INTERRUPTED, "move_interrupted")
             template = self.STEP_PROMPT if self.presses else self.FIRST_STEP_PROMPT
             prompt = (template.replace("[TASK]", self._task.strip())
                       .replace("[TERMINATION]", self.termination)
@@ -4430,6 +4580,9 @@ Press: <one of a, b, start, up, down, left, right>
             after_frame = self._get_state()["core"]["current_frame"]
             if self._effective_state(after_frame) == AgentState.IN_BATTLE or is_battle_screen(after_frame):
                 return self._finish(FREE_OK, "termination_met")
+            if is_directional_walk and press in DIRECTIONS and self._is_dialogue_interruption_frame(after_frame):
+                self._capture_current_frame_dialogue_crop(after_frame)
+                return self._finish(FREE_INTERRUPTED, "move_interrupted")
             if (
                 walk_dir is not None
                 and press == walk_dir
@@ -4465,6 +4618,9 @@ Press: <one of a, b, start, up, down, left, right>
                         break
             if self._effective_state(after_frame) == AgentState.IN_BATTLE or is_battle_screen(after_frame):
                 return self._finish(FREE_OK, "termination_met")
+            if is_directional_walk and press in DIRECTIONS and self._is_dialogue_interruption_frame(after_frame):
+                self._capture_current_frame_dialogue_crop(after_frame)
+                return self._finish(FREE_INTERRUPTED, "move_interrupted")
             if (
                 self._repeated_blocked_presses >= self.MAX_REPEATED_BLOCKED_PRESSES
                 or self._no_displacement_directional_presses >= self.MAX_NO_DISPLACEMENT_DIRECTIONAL_PRESSES
