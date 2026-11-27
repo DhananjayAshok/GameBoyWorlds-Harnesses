@@ -3715,6 +3715,77 @@ Press: <one of a, b, start, up, down, left, right>
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _clear_blocked_direction(self, place: Tuple[int, Tuple[int, int]], direction: str) -> None:
+        blocked_list = self._blocked_at_place.get(place)
+        if blocked_list and direction in blocked_list:
+            blocked_list.remove(direction)
+            if not blocked_list:
+                self._blocked_at_place.pop(place, None)
+        zero_list = self._zero_disp_at_place.get(place)
+        if zero_list and direction in zero_list:
+            zero_list.remove(direction)
+        gmap = getattr(self._env, "_map", None)
+        if gmap is not None and isinstance(place, tuple) and len(place) == 2:
+            try:
+                r_seg, r_pos = gmap.resolve(place[0], place[1])
+                if 0 <= r_seg < len(getattr(gmap, "blocked_moves", ())):
+                    dirs = gmap.blocked_moves[r_seg].get(r_pos)
+                    if dirs and direction in dirs:
+                        dirs.discard(direction)
+                        if not dirs:
+                            gmap.blocked_moves[r_seg].pop(r_pos, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _is_wipe_or_transition_step(
+        self,
+        frame_after: Optional[np.ndarray],
+        passed_frames: Optional[Any],
+        step_status: Optional[str],
+    ) -> bool:
+        from execution.strategist.pokemon.global_map.registration import has_structure
+
+        if step_status in ("blank", "lost", "not_free_roam"):
+            return True
+        gmap = getattr(self._env, "_map", None)
+        if gmap is not None and (bool(getattr(gmap, "in_battle", False)) or bool(getattr(gmap, "faded", False))):
+            return True
+        frames_to_check = []
+        if passed_frames is not None:
+            for pf in passed_frames:
+                if pf is not None:
+                    frames_to_check.append(pf)
+        if frame_after is not None:
+            frames_to_check.append(frame_after)
+        for f in frames_to_check:
+            if not has_structure(f) or is_battle_screen(f):
+                return True
+            if gmap is not None:
+                try:
+                    if gmap._wipe_closing(f):
+                        return True
+                    if getattr(gmap, "pos", None) is not None and gmap._blacks_out(f, gmap.segment, gmap.pos):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        return False
+
+    @staticmethod
+    def _repeated_walk_direction(task: str) -> Optional[str]:
+        if not task:
+            return None
+        lowered = task.lower()
+        found_dirs = [d for d in DIRECTIONS if re.search(rf"\b{d}\b", lowered)]
+        if len(found_dirs) != 1:
+            return None
+        d = found_dirs[0]
+        if re.search(
+            rf"\b(?:press(?:ing)?\s+{d}\s+repeatedly|repeatedly\s+press(?:ing)?\s+{d}|walk\s+(?:north|south|east|west|{d})\b.*\bpress(?:ing)?\s+{d}|press(?:ing)?\s+{d}\s+to\s+walk)\b",
+            lowered,
+        ):
+            return d
+        return None
+
     @staticmethod
     def _player_sprite_turned(frame_before: Optional[np.ndarray], frame_after: Optional[np.ndarray]) -> bool:
         if frame_before is None or frame_after is None or frame_before.shape != frame_after.shape:
@@ -3746,6 +3817,13 @@ Press: <one of a, b, start, up, down, left, right>
         if self._last_terminated or self._last_truncated:
             self.press_outcomes.append(press)
             return True
+        step_ev = getattr(self._env, "last_step_event", None)
+        step_status = getattr(step_ev, "status", None) if step_ev is not None else None
+        passed = (
+            record.transition_states[-1]["core"].get("transition_passed_frames")
+            if record.transition_states
+            else (step_ev.info.get("core", {}).get("transition_passed_frames") if (step_ev is not None and step_ev.info) else None)
+        )
         scrolled_on_screen = False
         if (
             before_place is not None
@@ -3753,13 +3831,15 @@ Press: <one of a, b, start, up, down, left, right>
             and record.frame_before is not None
             and record.frame_after is not None
         ):
-            step_reg = register(record.frame_before, record.frame_after, press, 1)
-            scrolled_on_screen = step_reg is not None and step_reg[0] != (0, 0)
+            if step_status == "moved":
+                scrolled_on_screen = True
+            else:
+                step_reg = register(record.frame_before, record.frame_after, press, 1, passed_frames=passed)
+                scrolled_on_screen = step_reg is not None and step_reg[0] != (0, 0)
         mid_place = self._current_map_place() if before_place is not None else None
         displaced = (before_place is not None and mid_place is not None and mid_place != before_place) or scrolled_on_screen
         if self._agent_state() == AgentState.FREE_ROAM:
             if press in ("a", "b"):
-                passed = record.transition_states[-1]["core"].get("transition_passed_frames") if record.transition_states else None
                 box_or_emote = (
                     has_bottom_dialogue_box(record.frame_after)
                     or self._is_top_box_dialogue(record.frame_after)
@@ -3779,7 +3859,6 @@ Press: <one of a, b, start, up, down, left, right>
                 ):
                     self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
             elif press in DIRECTIONS:
-                passed = record.transition_states[-1]["core"].get("transition_passed_frames") if record.transition_states else None
                 box_or_emote = (
                     has_bottom_dialogue_box(record.frame_after)
                     or self._is_top_box_dialogue(record.frame_after)
@@ -3803,24 +3882,35 @@ Press: <one of a, b, start, up, down, left, right>
             return True
         after_place = self._current_map_place() if before_place is not None else None
         cur_frame = self._current_frame()
+        cur_ev = getattr(self._env, "last_step_event", None)
+        cur_status = getattr(cur_ev, "status", None) if cur_ev is not None else step_status
+        wipe_or_transition = self._is_wipe_or_transition_step(cur_frame, passed, cur_status)
         still_free = (
             self._agent_state() == AgentState.FREE_ROAM
             and not has_bottom_dialogue_box(cur_frame)
             and not self._is_top_box_dialogue(cur_frame)
             and not is_battle_screen(cur_frame)
+            and not wipe_or_transition
         )
         outcome_label = press
         if before_place is not None and after_place is not None and after_place != before_place:
             self._repeated_blocked_presses = 0
             self._no_displacement_directional_presses = 0
             self._last_was_turn_at_place = False
+            self._clear_blocked_direction(before_place, press)
             outcome_label = f"{press} (moved {before_place[1]} -> {after_place[1]})"
         elif before_place is not None and scrolled_on_screen:
             self._repeated_blocked_presses = 0
             self._no_displacement_directional_presses = 0
             self._last_was_turn_at_place = False
+            self._clear_blocked_direction(before_place, press)
             dx, dy = DIRECTIONS[press]
             est_after = (before_place[1][0] + dx, before_place[1][1] + dy)
+            gmap = getattr(self._env, "_map", None)
+            if gmap is not None and getattr(gmap, "pos", None) == before_place[1]:
+                gmap.pos = est_after
+                if 0 <= gmap.segment < len(gmap.visits):
+                    gmap.visits[gmap.segment][est_after] += 1
             outcome_label = f"{press} (moved {before_place[1]} -> {est_after})"
         elif before_place is not None and still_free and after_place == before_place:
             zero_list = self._zero_disp_at_place.setdefault(before_place, [])
@@ -3852,6 +3942,7 @@ Press: <one of a, b, start, up, down, left, right>
         self._last_terminated = False
         self._last_truncated = False
         consecutive_invalid = 0
+        walk_dir = self._repeated_walk_direction(self._task or "")
         for _ in range(self._max_steps):
             frame = self._get_state()["core"]["current_frame"]
             if self.presses and (self._effective_state(frame) == AgentState.IN_BATTLE or is_battle_screen(frame)):
@@ -3863,14 +3954,24 @@ Press: <one of a, b, start, up, down, left, right>
             output = self._vlm_call(self.STEP_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
             if self.presses and parse_yes_no(output, "Complete"):
-                return self._finish(FREE_OK, "termination_met")
-            answer = (parse_key_value(output, "Press") or "").strip().lower().strip(".")
-            press = answer.split()[0] if answer else ""
+                if (
+                    walk_dir is not None
+                    and len(self.presses) == 1
+                    and self._last_was_turn_at_place
+                    and self._agent_state() == AgentState.FREE_ROAM
+                ):
+                    press = walk_dir
+                else:
+                    return self._finish(FREE_OK, "termination_met")
+            else:
+                answer = (parse_key_value(output, "Press") or "").strip().lower().strip(".")
+                press = answer.split()[0] if answer else ""
             if press not in FREE_BUTTONS:
                 if not self.presses:
                     press = self._default_first_press(self._task) or ""
                 elif self._repeated_blocked_presses > 0 or self._no_displacement_directional_presses >= 2:
                     return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")
+            place_before = self._current_map_place()
             if not self._step_press(press):
                 self._record_invalid(output)
                 consecutive_invalid += 1
@@ -3884,6 +3985,41 @@ Press: <one of a, b, start, up, down, left, right>
             if self._last_truncated:
                 return self._finish(FREE_TRUNCATED, "truncated")
             after_frame = self._get_state()["core"]["current_frame"]
+            if self._effective_state(after_frame) == AgentState.IN_BATTLE or is_battle_screen(after_frame):
+                return self._finish(FREE_OK, "termination_met")
+            if (
+                walk_dir is not None
+                and press == walk_dir
+                and len(self.presses) < self._max_steps
+                and self._agent_state() == AgentState.FREE_ROAM
+                and not has_bottom_dialogue_box(after_frame)
+                and not self._is_top_box_dialogue(after_frame)
+            ):
+                batch_limit = 3 if self._last_was_turn_at_place else 2
+                for _ in range(batch_limit):
+                    if len(self.presses) >= self._max_steps:
+                        break
+                    cur_p = self._current_map_place()
+                    if cur_p is not None and press in self._blocked_at_place.get(cur_p, ()):
+                        break
+                    if not self._step_press(press):
+                        break
+                    self.presses.append(press)
+                    if self._last_terminated:
+                        return self._finish(FREE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(FREE_TRUNCATED, "truncated")
+                    after_frame = self._get_state()["core"]["current_frame"]
+                    if (
+                        self._effective_state(after_frame) != AgentState.FREE_ROAM
+                        or is_battle_screen(after_frame)
+                        or has_bottom_dialogue_box(after_frame)
+                        or self._is_top_box_dialogue(after_frame)
+                    ):
+                        break
+                    new_p = self._current_map_place()
+                    if new_p == cur_p and not self._last_was_turn_at_place:
+                        break
             if self._effective_state(after_frame) == AgentState.IN_BATTLE or is_battle_screen(after_frame):
                 return self._finish(FREE_OK, "termination_met")
             if (

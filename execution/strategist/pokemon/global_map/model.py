@@ -850,7 +850,8 @@ class GlobalMap(StrategistArtifact):
 
     def on_step(self, frame: np.ndarray, identified, free_roam: bool, direction: Optional[str] = None,
                 max_steps: int = 0, reported: Optional[int] = None, was_free_roam: bool = True,
-                faded: bool = False, in_battle: bool = False) -> str:
+                faded: bool = False, in_battle: bool = False,
+                passed_frames: Optional[Iterable[np.ndarray]] = None) -> str:
         self.step += 1
         if in_battle or (not free_roam and is_battle_screen(frame)):
             if not self.in_battle or self.battle_place is None:
@@ -888,6 +889,9 @@ class GlobalMap(StrategistArtifact):
             self.in_battle = False
             self.observe(frame, identified, shift)
             return "start"
+        was_in_battle = bool(self.in_battle)
+        pre_battle_place = self.resolve(*self.battle_place) if (was_in_battle and self.battle_place is not None) else None
+        use_passed = passed_frames if (not was_in_battle and self.pending is None) else None
         anchor_place = getattr(self, "_anchor_place", None)
         anchor_pending = getattr(self, "_anchor_pending", None)
         if self.pending is not None and direction not in DIRECTIONS:
@@ -899,8 +903,15 @@ class GlobalMap(StrategistArtifact):
             if (anchor_place is not None and anchor_place[0] == self.segment and anchor_pending is not None)
             else self.pos
         )
-        placed = None if self.faded else register(self.anchor, frame, direction, max_steps, reported,
-                                                  self.residual)
+        placed = None if self.faded else register(
+            self.anchor,
+            frame,
+            direction,
+            max_steps,
+            reported,
+            self.residual,
+            passed_frames=use_passed,
+        )
         if placed is not None:
             delta, residual, structural = placed
             prev_pos = self.pos
@@ -970,14 +981,34 @@ class GlobalMap(StrategistArtifact):
         warp_targets = self._known_warp_targets(direction, max_steps, reported) if self.faded else None
         allow_fn = lambda si, q: not self.arrival_breaks_doors(si, q)
         found = None
-        if not self.faded and 0 <= self.segment < len(self.segments) and self.segments[self.segment]:
+        if (
+            was_in_battle
+            and not self.faded
+            and pre_battle_place is not None
+            and 0 <= pre_battle_place[0] < len(self.segments)
+            and self.segments[pre_battle_place[0]]
+        ):
+            b_seg, b_pos = pre_battle_place
+            found = self.relocalise(
+                frame,
+                shift=shift,
+                allowed=lambda si, q: (
+                    si == b_seg
+                    and abs(q[0] - b_pos[0]) + abs(q[1] - b_pos[1]) <= MAX_STEP_FILL + 1
+                    and allow_fn(si, q)
+                ),
+                warp_targets=warp_targets,
+            )
+            if found is None and not self._blacks_out(frame, b_seg, b_pos, shift) and not self._wipe_closing(frame):
+                found = (b_seg, b_pos)
+        elif not self.faded and 0 <= self.segment < len(self.segments) and self.segments[self.segment]:
             found = self.relocalise(
                 frame,
                 shift=shift,
                 allowed=lambda si, q: si == self.segment and allow_fn(si, q),
                 warp_targets=warp_targets,
             )
-        if found is None:
+        if found is None and not (was_in_battle and not self.faded and pre_battle_place is not None):
             found = self.relocalise(
                 frame,
                 shift=shift,

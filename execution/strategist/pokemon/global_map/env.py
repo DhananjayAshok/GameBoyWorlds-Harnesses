@@ -77,6 +77,7 @@ class MappingEnvironment:
         self._listeners = list(listeners)
         self.marker = None
         self.facing: Optional[str] = None
+        self.last_step_event: Optional[StepEvent] = None
 
     def step_high_level_action(self, action, **kwargs):
         from execution.game_api import AgentState, MenuAction, OpenMenuAction
@@ -116,7 +117,16 @@ class MappingEnvironment:
                 identified = self._tiles.identify_tiles(frame) if free else {}
                 queued = len(self._map.naming_queue)
                 status = self._map.on_step(
-                    frame, identified, free, direction, max_steps, reported, was_free, faded, in_battle=in_battle
+                    frame,
+                    identified,
+                    free,
+                    direction,
+                    max_steps,
+                    reported,
+                    was_free,
+                    faded,
+                    in_battle=in_battle,
+                    passed_frames=passed,
                 )
                 if free and identified and hasattr(self._tiles, "backfill_masked_tiles"):
                     identified = self._tiles.backfill_masked_tiles(identified, frame, self._map)
@@ -128,9 +138,10 @@ class MappingEnvironment:
                     self.facing = None
                 for entry in self._map.naming_queue[queued:]:
                     entry["marker"] = self.marker() if self.marker is not None else None
+                event = StepEvent(action, kwargs, info, was_free, free, frame, identified, status, direction,
+                                  max_steps, reported)
+                self.last_step_event = event
                 if self._listeners:
-                    event = StepEvent(action, kwargs, info, was_free, free, frame, identified, status, direction,
-                                      max_steps, reported)
                     for listener in self._listeners:
                         try:
                             listener(event)

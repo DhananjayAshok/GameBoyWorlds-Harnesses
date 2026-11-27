@@ -142,15 +142,62 @@ def structure_diff(before_edges: np.ndarray, after_edges: np.ndarray, sx: int, s
     return float(((new ^ old) & keep).sum() / n)
 
 
+def _transition_scrolled_along(
+    before: np.ndarray,
+    after: np.ndarray,
+    passed_frames: Optional[Iterable[np.ndarray]],
+    ux: int,
+    uy: int,
+) -> Optional[bool]:
+    if passed_frames is None or (ux, uy) == (0, 0):
+        return None
+    frames = [before]
+    for pf in passed_frames:
+        if pf is None:
+            continue
+        p = _screen(pf)
+        if p.shape[0] > before.shape[0]:
+            p = p[:before.shape[0]]
+        if p.shape == before.shape:
+            frames.append(p)
+    if len(frames) < 2:
+        return None
+    if not np.array_equal(frames[-1], after):
+        frames.append(after)
+    for idx in range(1, len(frames)):
+        prev_f, cur_f = frames[idx - 1], frames[idx]
+        d0 = pixel_diff(prev_f, cur_f, 0, 0)
+        if d0 is None or d0 <= 0.04:
+            continue
+        best_sub = None
+        for s in (-14, -12, -10, -8, -6, -4, -2, 2, 4, 6, 8, 10, 12, 14):
+            ds = pixel_diff(prev_f, cur_f, ux * s, uy * s)
+            if ds is not None and (best_sub is None or ds < best_sub):
+                best_sub = ds
+        if best_sub is not None and best_sub <= PIXEL_THRESHOLD and d0 >= best_sub + 0.05:
+            return True
+    return False
+
+
 def register(before: np.ndarray, after: np.ndarray, direction: Optional[str], max_steps: int,
-             reported: Optional[int] = None, residual: Cell = (0, 0)
+             reported: Optional[int] = None, residual: Cell = (0, 0),
+             passed_frames: Optional[Iterable[np.ndarray]] = None,
              ) -> Optional[Tuple[Cell, Cell, bool]]:
     a, b = _screen(before), _screen(after)
     if has_bottom_location_banner(a) or has_bottom_location_banner(b):
         a, b = a[:BANNER_TOP], b[:BANNER_TOP]
     # pixel matching first; edge matching is the fallback that survives palette changes
     for structural in (False, True):
-        placed = _register(a, b, direction, max_steps, reported, residual, structural=structural)
+        placed = _register(
+            a,
+            b,
+            direction,
+            max_steps,
+            reported,
+            residual,
+            structural=structural,
+            passed_frames=passed_frames,
+        )
         if placed is not None:
             ux, uy = SCREEN_UNIT.get(direction, (0, 0))
             return (ux * placed[0], -uy * placed[0]), placed[1], structural
@@ -213,7 +260,8 @@ def _is_periodic_open_step(before: np.ndarray, after: np.ndarray, ux: int, uy: i
 
 
 def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], max_steps: int,
-              reported: Optional[int], residual: Cell, structural: bool) -> Optional[Tuple[int, Cell]]:
+              reported: Optional[int], residual: Cell, structural: bool,
+              passed_frames: Optional[Iterable[np.ndarray]] = None) -> Optional[Tuple[int, Cell]]:
     if direction in SCREEN_UNIT:
         ux, uy = SCREEN_UNIT[direction]
         # far shifts are where repeating textures alias, so look at most one cell past the reported count
@@ -244,11 +292,17 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
     diff, s = best_by_k[k_best]
     if diff > threshold or k_best < 0:
         return None
+    scrolled_along = (
+        _transition_scrolled_along(before, after, passed_frames, ux, uy)
+        if not structural and residual == (0, 0)
+        else None
+    )
     periodic_step = (
         not structural
         and residual == (0, 0)
         and 1 in best_by_k
         and _is_periodic_open_step(before, after, ux, uy)
+        and scrolled_along is not False
     )
     if periodic_step and reported == 0:
         k_best = 1
