@@ -22,7 +22,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_pack_action_subbox_screen, is_pack_item_list_screen,
                                                  is_pack_screen, is_party_menu_screen,
                                                  is_party_menu_selection_screen, is_same_battle_frame,
-                                                 is_start_menu_screen,
+                                                 is_start_menu_screen, is_tm_hm_pack_pocket,
                                                  is_healing_item_name, is_item_use_subbox_screen,
                                                  is_party_boost_item_name, is_party_consumable_item_name,
                                                  is_status_heal_item_for_status,
@@ -3958,7 +3958,7 @@ Objective: "[TASK]"
 
 The image is the current screen.
 [HISTORY]
-First decide whether the entire objective (including closing the Pack/Item and Start menus back to the overworld if asked) has already been achieved on screen. If it has not, answer Complete: no and choose the single button press that best moves towards it. On an item list screen after using a healing item on a party Pokemon (even if the item list cursor is invisible), do not press confirm on the item again—press back once to close the Pack/Item menu to the Start menu, and press back again to close the Start menu to the overworld.
+First decide whether the entire objective (including closing the Pack/Item and Start menus back to the overworld if asked) has already been achieved on screen. If it has not, answer Complete: no and choose the single button press that best moves towards it. On an item list screen after using a healing item or teaching a move on a party Pokemon (even if the item list cursor is invisible), do not press confirm on the item again—press back once to close the Pack/Item menu to the Start menu, and press back again to close the Start menu to the overworld. When teaching a move on the party screen, if asked whether to delete an older move to make room for the new move, select YES (confirm) and then press confirm on the move to forget.
 
 The presses you can make:
 - up, down, left, right: move the cursor
@@ -4320,6 +4320,21 @@ Press: <one of up, down, left, right, confirm, back>
                     self._settle_menu_dialogue()
                     auto_steps.append("settled effect dialogue")
         return auto_steps
+
+    def _advance_tm_hm_use_to_party_screen(self) -> bool:
+        if self._current_call is None:
+            self._begin_scripted("advance TM/HM startup prompts to party selection screen")
+        for _ in range(6):
+            if self._last_terminated or self._last_truncated:
+                return False
+            cur_frame = self._get_state()["core"]["current_frame"]
+            if is_party_menu_screen(cur_frame):
+                return True
+            if not is_tm_hm_pack_pocket(cur_frame):
+                break
+            rec = self._take_action(MenuAction, menu_action="confirm")
+            drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+        return is_party_menu_screen(self._get_state()["core"]["current_frame"])
 
     def _auto_scroll_bag_for_status_item(self) -> None:
         frame = self._get_state()["core"]["current_frame"]
@@ -4780,12 +4795,28 @@ Press: <one of up, down, left, right, confirm, back>
             self.presses.append(press)
             self.press_outcomes.append(press)
             was_party_menu = is_party_menu_screen(frame)
+            was_tm_hm_use = (
+                press == "confirm"
+                and is_tm_hm_pack_pocket(frame)
+                and is_item_use_subbox_screen(frame)
+            )
             record = self._take_action(MenuAction, menu_action=press)
             drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
             if self._last_terminated:
                 return self._finish(MENU_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(MENU_TRUNCATED, "truncated")
+            if was_tm_hm_use:
+                reached_party = self._advance_tm_hm_use_to_party_screen()
+                if self._last_terminated:
+                    return self._finish(MENU_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._finish(MENU_TRUNCATED, "truncated")
+                if reached_party:
+                    self.press_outcomes[-1] = (
+                        "confirm (confirmed USE and YES to open the party selection screen — "
+                        "select an ABLE party Pokemon with confirm to teach the move)"
+                    )
             after_frame = self._get_state()["core"]["current_frame"]
             bag_after = self._scan_bag_frame(after_frame)
             if bag_before is not None and bag_after is not None:

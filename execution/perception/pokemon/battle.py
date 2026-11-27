@@ -563,6 +563,25 @@ def has_top_dialogue_box(frame: np.ndarray) -> bool:
     return True
 
 
+LEVEL_GLYPH_SIGNATURE = (0, 0, 24, 88, 24, 88, 30, 0)
+HOLLOW_CURSOR_SIGNATURES = {
+    (96, 80, 72, 68, 72, 80, 96, 0),
+    (0, 96, 80, 72, 68, 72, 80, 96),
+}
+
+
+def is_party_cursor_tile(raw_tile: np.ndarray) -> bool:
+    """Return True if an 8x8 tile shows either a solid or hollow right-pointing party cursor."""
+    if is_cursor_tile(raw_tile):
+        return True
+    if raw_tile is None or raw_tile.shape[:2] != (TILE_SIZE, TILE_SIZE):
+        return False
+    tile_2d = _grey_frame(raw_tile)
+    if float((tile_2d >= LIGHT_BACKGROUND).mean()) < 0.50:
+        return False
+    return _tile_row_signature(tile_2d) in HOLLOW_CURSOR_SIGNATURES
+
+
 def is_party_menu_screen(frame: np.ndarray) -> bool:
     """Return True if the upper screen shows the Generation 1 or Generation 2 party menu layout."""
     if frame is None:
@@ -588,6 +607,26 @@ def is_party_menu_screen(frame: np.ndarray) -> bool:
         and float(light[14:16, 48:96].mean()) >= 0.95
         and int(dark[10:14, 32:48].sum()) >= 18
         and int(dark[0:8, 8:96].sum()) >= 40
+    ):
+        return True
+    if (
+        float(light[0:TILE_SIZE, 3 * TILE_SIZE:GRID_COLS * TILE_SIZE].mean()) >= 0.95
+        and len(read_tile_text(img, 1, 3, 13)) >= 2
+        and any(is_party_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]) for ty in (1, 3, 5, 7, 9, 11))
+        and (
+            _tile_row_signature(img[2 * TILE_SIZE:3 * TILE_SIZE, 8 * TILE_SIZE:9 * TILE_SIZE]) == LEVEL_GLYPH_SIGNATURE
+            or "ABLE" in read_tile_text(img, 2, 11, 20)
+            or any(read_tile_text(img, ty, 1, 8).startswith("CANC") for ty in (3, 5, 7, 9, 11))
+        )
+    ):
+        return True
+    if (
+        len(read_tile_text(img, 0, 3, 13)) >= 2
+        and any(is_party_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]) for ty in (1, 3, 5, 7, 9, 11))
+        and (
+            _tile_row_signature(img[0:TILE_SIZE, 13 * TILE_SIZE:14 * TILE_SIZE]) == LEVEL_GLYPH_SIGNATURE
+            or "ABLE" in read_tile_text(img, 1, 11, 20)
+        )
     ):
         return True
     return False
@@ -1216,6 +1255,18 @@ def is_gen1_item_list_screen(frame: np.ndarray) -> bool:
     return True
 
 
+def is_tm_hm_pack_pocket(frame: np.ndarray) -> bool:
+    """Return True if the Generation 2 Pack screen is displaying the TM/HM pocket (with 2-character TM/HM codes at columns 5..6)."""
+    if not is_pack_screen(frame):
+        return False
+    img = _grey_frame(frame)
+    for ty in (2, 4, 6, 8, 10):
+        code = read_tile_text(img, ty, 5, 7)
+        if code and re.match(r"^(?:\d{2}|H\d)$", code):
+            return True
+    return False
+
+
 def read_bag_item_list(frame: np.ndarray) -> Optional[Tuple[List[str], bool]]:
     """Return (visible_item_names, has_more_below) when a Generation 1 or Generation 2 bag item list is open, or None."""
     if frame is None:
@@ -1235,7 +1286,7 @@ def read_bag_item_list(frame: np.ndarray) -> Optional[Tuple[List[str], bool]]:
         arrow_sig = _tile_row_signature(img[11 * TILE_SIZE:12 * TILE_SIZE, 18 * TILE_SIZE:19 * TILE_SIZE])
         has_more = (not saw_cancel) and (bool(items) or arrow_sig in GEN1_SCROLL_ARROW_SIGNATURES)
         return (items, has_more)
-    if is_pack_item_list_screen(img):
+    if is_pack_item_list_screen(img) and not is_tm_hm_pack_pocket(img):
         items = []
         saw_cancel = False
         for ty in (2, 4, 6, 8, 10):
