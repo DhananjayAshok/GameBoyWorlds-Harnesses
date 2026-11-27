@@ -104,7 +104,24 @@ def pixel_diff(before: np.ndarray, after: np.ndarray, sx: int, sy: int) -> Optio
         r0, r1 = y0 + oy0 - ny.start, y1 + oy0 - ny.start
         c0, c1 = x0 + ox0 - nx.start, x1 + ox0 - nx.start
         keep[max(0, r0):max(0, r1), max(0, c0):max(0, c1)] = False
-    return float((new != old)[keep].mean())
+    diff_mask = (new != old) & keep
+    if sx % 8 == 0 and sy % 8 == 0 and ny.start % 8 == 0 and nx.start % 8 == 0:
+        bh, bw = new.shape[0] // 8, new.shape[1] // 8
+        if bh > 0 and bw > 0:
+            nb = new[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).swapaxes(1, 2)
+            ob = old[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).swapaxes(1, 2)
+            kb = keep[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).swapaxes(1, 2)
+            db = diff_mask[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).swapaxes(1, 2)
+            for r in range(bh):
+                for c in range(bw):
+                    if db[r, c].any() and kb[r, c].all():
+                        blk_n = nb[r, c]
+                        blk_o = ob[r, c]
+                        for shift_x in range(1, 8):
+                            if np.array_equal(np.roll(blk_o, shift_x, axis=1), blk_n):
+                                db[r, c] = False
+                                break
+    return float(diff_mask[keep].mean())
 
 
 def edges(frame: np.ndarray) -> np.ndarray:

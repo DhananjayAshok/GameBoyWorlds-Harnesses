@@ -515,11 +515,12 @@ class InteractionExecutor(PolicyExecutor):
                 if step_dx * dx + step_dy * dy > 0:
                     taken = 1
         if taken == 0 and rec.frame_before is not None and rec.frame_after is not None:
-            from execution.strategist.pokemon.global_map.registration import register
+            from execution.strategist.pokemon.global_map.registration import _sprite_turned, register
 
-            placed = register(rec.frame_before, rec.frame_after, direction, 1)
-            if placed is not None and (placed[0][0] * dx + placed[0][1] * dy) > 0:
-                taken = 1
+            if not _sprite_turned(rec.frame_before, rec.frame_after):
+                placed = register(rec.frame_before, rec.frame_after, direction, 1)
+                if placed is not None and (placed[0][0] * dx + placed[0][1] * dy) > 0:
+                    taken = 1
         return taken
 
     def _align_to_target(self, target_cell: Tuple[int, int], records: List[EnvironmentStepRecord]) -> Optional[str]:

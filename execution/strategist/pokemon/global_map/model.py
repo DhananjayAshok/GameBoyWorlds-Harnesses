@@ -134,7 +134,9 @@ def _quarter_rank_signature(pixels: Optional[np.ndarray]) -> Optional[Tuple[byte
             if len(u) == 1:
                 sig = b"D" if int(u[0]) <= BLACK_LEVEL else b"L"
             else:
-                sig = bytes([len(u)]) + idx.astype(np.uint8).tobytes()
+                idx2d = idx.astype(np.uint8).reshape(qp.shape)
+                min_roll = min(np.roll(idx2d, s, axis=1).tobytes() for s in range(idx2d.shape[1]))
+                sig = bytes([len(u)]) + min_roll
             _QUARTER_RANK_CACHE[key] = sig
         sigs.append(sig)
     return tuple(sigs)
@@ -167,8 +169,24 @@ def _quarter_recolour_matches(
     elif len(u1) == len(u2) and np.array_equal(idx1, idx2):
         res = True
     else:
-        bank = shade_bank([p2])
-        res = len(shade_candidates(bank, p1, min_shades=2, ordered=True)) > 0
+        a2d = np.squeeze(np.asarray(p1))
+        b2d = np.squeeze(np.asarray(p2))
+        if (
+            len(u1) == len(u2)
+            and a2d.ndim == 2
+            and a2d.shape == b2d.shape
+            and any(
+                np.array_equal(
+                    np.roll(idx2.reshape(b2d.shape), s, axis=1),
+                    idx1.reshape(a2d.shape),
+                )
+                for s in range(1, b2d.shape[1])
+            )
+        ):
+            res = True
+        else:
+            bank = shade_bank([p2])
+            res = len(shade_candidates(bank, p1, min_shades=2, ordered=True)) > 0
     _QUARTER_RECOLOUR_CACHE[key] = res
     _QUARTER_RECOLOUR_CACHE[(b2, b1)] = res
     return res
@@ -1085,6 +1103,18 @@ class GlobalMap(StrategistArtifact):
                 allowed=allow_fn,
                 warp_targets=warp_targets,
             )
+            if (
+                found is None
+                and not self.faded
+                and 0 <= self.segment < len(self.segments)
+                and self.segments[self.segment]
+                and self.pos is not None
+                and not self._blacks_out(frame, self.segment, self.pos, shift)
+                and not self._wipe_closing(frame)
+            ):
+                m_cur, ov_cur = self._placement_screen_agreement(frame, self.segment, self.pos, shift)
+                if ov_cur >= 16 and m_cur >= 0.65 * ov_cur:
+                    found = (self.segment, self.pos)
         if found is not None and self._blacks_out(frame, *found, shift):
             if direction in DIRECTIONS and self.pending is None:
                 self.pending = (direction, max_steps, reported)
@@ -1925,6 +1955,83 @@ class GlobalMap(StrategistArtifact):
         self.stats["merges_judged_same" if same else "merges_judged_different"] += 1
         return bool(same)
 
+    def _trail_anchored_overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
+        src_seg = self.segments[source] if 0 <= source < len(self.segments) else {}
+        dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
+        if not src_seg or not dst_seg:
+            return None
+        _, _, src_uniform, _, _, _ = self._segment_index(source)
+        _, _, dst_uniform, _, _, _ = self._segment_index(target)
+        base_offsets: List[Cell] = []
+        for idx in range(1, len(self.trail)):
+            t_prev, s_prev, p_prev = self.trail[idx - 1]
+            t_cur, s_cur, p_cur = self.trail[idx]
+            if s_prev == s_cur:
+                continue
+            rs_prev, rp_prev = self.resolve(s_prev, p_prev)
+            rs_cur, rp_cur = self.resolve(s_cur, p_cur)
+            if {rs_prev, rs_cur} != {source, target}:
+                continue
+            has_warp = any(
+                t_prev <= wt <= t_cur
+                and (
+                    self.resolve(wa, (0, 0))[0] in (source, target)
+                    or self.resolve(wb, (0, 0))[0] in (source, target)
+                )
+                for wt, wa, _, wb, _ in self.warps
+            )
+            if has_warp:
+                continue
+            has_defeat = any(t_prev <= int(d.get("step", 0)) <= t_cur for d in getattr(self, "defeats", ()))
+            if has_defeat:
+                continue
+            if rs_prev == target and rs_cur == source:
+                base_off = (rp_prev[0] - rp_cur[0], rp_prev[1] - rp_cur[1])
+            else:
+                base_off = (rp_cur[0] - rp_prev[0], rp_cur[1] - rp_prev[1])
+            if base_off not in base_offsets:
+                base_offsets.append(base_off)
+        if not base_offsets:
+            return None
+        best = None
+        for bx, by in base_offsets:
+            for dx in range(-2, 3):
+                for dy in range(-5, 6):
+                    if abs(dx) + abs(dy) > 5:
+                        continue
+                    ox, oy = bx + dx, by + dy
+                    matches = total = 0
+                    for g, u_src in src_uniform.items():
+                        if g == (0, 0) and src_seg[g].tags == ("player",):
+                            continue
+                        g_dst = (g[0] + ox, g[1] + oy)
+                        u_dst = dst_uniform.get(g_dst)
+                        if u_dst is None or (u_src and u_dst):
+                            continue
+                        total += 1
+                        if not u_src and not u_dst:
+                            c = src_seg[g]
+                            c_dst = dst_seg[g_dst]
+                            if _cells_match(c.hashes, c.pixels, c_dst):
+                                matches += 1
+                    needed_shared = min(CONSOLIDATE_MIN_CELLS, max(15, int(0.4 * len(src_uniform))))
+                    if total >= needed_shared and matches >= 0.65 * total:
+                        score = (matches, matches / total, -abs(dx) - abs(dy))
+                        if best is None or score > best[0]:
+                            best = (score, (ox, oy), matches, total)
+        if best is None:
+            return None
+        _, offset, matches, shared = best
+        return {
+            "offset": offset,
+            "matches": matches,
+            "shared": shared,
+            "agreement": matches / shared,
+            "votes": matches,
+            "rival": 0,
+            "rival_agreement": 0.0,
+        }
+
     def _warp_anchored_overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
         src_seg = self.segments[source] if 0 <= source < len(self.segments) else {}
         dst_seg = self.segments[target] if 0 <= target < len(self.segments) else {}
@@ -2501,6 +2608,8 @@ class GlobalMap(StrategistArtifact):
                     if not valid_o:
                         o = self._warp_anchored_overlap(source, target)
                         if o is None:
+                            o = self._trail_anchored_overlap(source, target)
+                        if o is None:
                             continue
                     if best is not None and o["matches"] <= best["matches"]:
                         continue
@@ -2623,16 +2732,19 @@ class GlobalMap(StrategistArtifact):
                         and self.pos is not None
                     ):
                         near_cur = [
-                            (abs(o[0] - self.pos[0]) + abs(o[1] - self.pos[1]), -m, o, overlap, m)
+                            (abs(o[0] - self.pos[0]) + abs(o[1] - self.pos[1]), -m, -(m / overlap), o, overlap, m)
                             for o, overlap, m in close
                             if overlap > 0
-                            and m >= 0.90 * overlap
+                            and m >= 0.85 * overlap
                             and abs(o[0] - self.pos[0]) + abs(o[1] - self.pos[1]) <= MAX_STEP_FILL
                         ]
-                        if near_cur and (len(near_cur) == 1 or near_cur[0][1] < near_cur[1][1]):
+                        if near_cur:
                             near_cur.sort()
-                            _, _, n_o, n_ov, n_m = near_cur[0]
-                            close = [(n_o, n_ov, n_m)]
+                            if len(near_cur) == 1 or near_cur[0][0] < near_cur[1][0] or near_cur[0][1] < near_cur[1][1]:
+                                _, _, _, n_o, n_ov, n_m = near_cur[0]
+                                close = [(n_o, n_ov, n_m)]
+                            else:
+                                continue
                         else:
                             continue
                     else:
