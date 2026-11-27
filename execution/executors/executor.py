@@ -66,7 +66,9 @@ You are playing a GameBoy game. The current screen is shown in the image.
         obs, reward, terminated, truncated, info = self._env.step_high_level_action(
             action_class, **kwargs
         )
-        if "previous_action_details" in info.get("core", {}):
+        if info.get("invalid_action"):
+            transition_states, action_success = [], -1
+        elif "previous_action_details" in info.get("core", {}):
             _, _, transition_states, action_success, _ = info["core"]["previous_action_details"]
         else:
             transition_states, action_success = [], -1

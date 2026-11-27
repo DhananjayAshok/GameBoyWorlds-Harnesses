@@ -170,6 +170,11 @@ class RemoteEnvironment:
         if not out.get("valid"):
             self._absorb(out, frame_changed=False)
             self._info["invalid_action"] = True
+            self._info["core"].update({
+                "action_return": None,
+                "transition_passed_frames": None,
+                "previous_action_details": (action, kwargs, [], -1, None),
+            })
             return self.get_observation(), 0.0, False, False, self.get_info()
         transition = out["obs"].get("transition") or {}
         self._absorb(out, frame_changed=bool(transition.get("frame_changed")))

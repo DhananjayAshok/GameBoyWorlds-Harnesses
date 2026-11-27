@@ -3799,41 +3799,49 @@ class _DialogueSettlingExecutor(PolicyExecutor):
         if self._agent_state() == AgentState.IN_MENU and self._is_top_box_dialogue():
             menu_action = "back" if button == "b" else "confirm"
             progressed = False
-            if has_bottom_dialogue_box(self._current_frame()):
-                pass_rec = self._take_action(PassDialogueAction)
-                drop_prefix_crops(captured_dialogue_crops([pass_rec]), self.dialogue_crops)
-                if self._last_terminated or self._last_truncated:
-                    return True
-                if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
-                    self._settle_after_step()
-                    return True
-                if pass_rec.action_success != -1 or pass_rec.frame_changed:
-                    return True
             for _ in range(DIALOGUE_TOP_BOX_PRESSES):
                 record = self._take_action(MenuAction, menu_action=menu_action)
                 drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
-                if record.action_success != -1 or record.frame_changed:
+                if record.frame_changed or not is_same_battle_frame(record.frame_before, record.frame_after):
                     progressed = True
                 if self._last_terminated or self._last_truncated:
                     return True
                 if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
                     self._settle_after_step()
                     return True
-                if has_bottom_dialogue_box(self._current_frame()) and (
-                    record.frame_changed or not is_same_battle_frame(record.frame_before, record.frame_after)
-                ):
-                    for _ in range(DIALOGUE_TOP_BOX_SCROLL_WAITS):
-                        if (self._agent_state() != AgentState.IN_MENU
-                                or not self._is_top_box_dialogue()
-                                or self._last_terminated
-                                or self._last_truncated):
-                            break
-                        wait_rec = self._take_action(WaitAction)
-                        drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
-                        if wait_rec.frame_changed:
-                            progressed = True
-                        if is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
-                            break
+                for _ in range(DIALOGUE_TOP_BOX_SCROLL_WAITS):
+                    if (self._agent_state() != AgentState.IN_MENU
+                            or not self._is_top_box_dialogue()
+                            or self._last_terminated
+                            or self._last_truncated):
+                        break
+                    wait_rec = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                    if wait_rec.frame_changed or not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                        progressed = True
+                    if (has_bottom_dialogue_box(self._current_frame())
+                            and is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after)):
+                        break
+                if self._last_terminated or self._last_truncated:
+                    return True
+                if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
+                    self._settle_after_step()
+                    return True
+            if not progressed:
+                btn_rec = self._take_action_string(f"button({button})")
+                if btn_rec is not None:
+                    drop_prefix_crops(captured_dialogue_crops([btn_rec]), self.dialogue_crops)
+                    if btn_rec.frame_changed or not is_same_battle_frame(btn_rec.frame_before, btn_rec.frame_after):
+                        progressed = True
+                    if self._last_terminated or self._last_truncated:
+                        return True
+                    if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
+                        self._settle_after_step()
+                        return True
+                    wait_rec = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                    if wait_rec.frame_changed or not is_same_battle_frame(wait_rec.frame_before, wait_rec.frame_after):
+                        progressed = True
                     if self._last_terminated or self._last_truncated:
                         return True
                     if self._agent_state() != AgentState.IN_MENU or not self._is_top_box_dialogue():
@@ -4010,7 +4018,7 @@ What you have been asked to do: "[TASK]"
 Stop when: [TERMINATION]
 
 The image is the current screen.
-Choose the single button press that best moves towards what you have been asked to do. Note: a thin 2-tile-tall area/location name banner at the bottom of the screen is a non-blocking overlay that disappears automatically as you walk—do not press a or b to dismiss an area/location name banner when your task is to walk.
+Choose the single button press that best moves towards what you have been asked to do. Note: a 3-tile-tall bordered dialogue box at the bottom of the screen or a 4-tile-tall bordered dialogue box at the top of the screen means dialogue is open and must be advanced with a or b before walking, whereas a thin 2-tile-tall area/location name banner at the bottom of the screen is a non-blocking overlay that disappears automatically as you walk—do not press a or b to dismiss an area/location name banner when your task is to walk.
 
 The buttons are: a, b, start, up, down, left, right.
 
@@ -4027,7 +4035,7 @@ Stop when: [TERMINATION]
 
 The image is the current screen.
 [HISTORY]
-First decide, from this screen, whether the condition to stop at has been met (a 3-tile-tall bordered dialogue box at the bottom of the screen—even if blank or mid-text—means dialogue is still open, whereas a thin 2-tile-tall area/location name banner is a non-blocking overlay that does not block walking and should not be dismissed with a or b). If it has not, choose the single button press that best moves towards it. Keep Reasoning concise (at most 3-4 sentences) and never repeat a direction listed as blocked at your current position.
+First decide, from this screen, whether the condition to stop at has been met (a 3-tile-tall bordered dialogue box at the bottom of the screen or a 4-tile-tall bordered dialogue box at the top of the screen—even if blank or mid-text—means dialogue is still open, whereas a thin 2-tile-tall area/location name banner is a non-blocking overlay that does not block walking and should not be dismissed with a or b). If it has not, choose the single button press that best moves towards it. Keep Reasoning concise (at most 3-4 sentences) and never repeat a direction listed as blocked at your current position.
 
 The buttons are: a, b, start, up, down, left, right.
 
@@ -4213,10 +4221,14 @@ Press: <one of a, b, start, up, down, left, right>
         from execution.strategist.pokemon.global_map.registration import register
 
         state = self._agent_state()
-        if press in ("a", "b") and (state == AgentState.IN_DIALOGUE
-                                    or (state == AgentState.IN_MENU and self._is_top_box_dialogue())):
+        in_top_box_dialogue = state == AgentState.IN_MENU and self._is_top_box_dialogue()
+        if press in ("a", "b") and (state == AgentState.IN_DIALOGUE or in_top_box_dialogue):
             self._advance_dialogue_box(press)
             self.press_outcomes.append(f"{press} (advanced dialogue)")
+            return True
+        if press in DIRECTIONS and in_top_box_dialogue:
+            self._advance_dialogue_box("a")
+            self.press_outcomes.append(f"{press} (blocked by open dialogue; advanced dialogue)")
             return True
         was_free = (
             state == AgentState.FREE_ROAM
