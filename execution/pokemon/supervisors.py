@@ -1589,6 +1589,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
         reached_index = (reached - 1) if (complete and reached is not None) else subgoal_index
         if complete and reached_index >= len(self.plan) - 1:
             unfinished_note = self._unfinished_room_exploration_note(subgoal, after_kinds)
+            if unfinished_note is None:
+                unfinished_note = self._unfinished_open_corridor_target_note(subgoal, after_kinds)
+            if unfinished_note is None:
+                unfinished_note = self._budget_exhausted_unfinished_subgoal_note(subgoal, output, after_kinds)
             if unfinished_note:
                 complete = False
                 replan_needed = False
@@ -1607,6 +1611,85 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return "quit", reason or "No new plan was given.", []
         return "replan", None, subgoals
 
+    def _unfinished_open_corridor_target_note(
+        self,
+        subgoal: str,
+        local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
+    ) -> Optional[str]:
+        remaining_calls = max(0, self._max_steps - self._calls)
+        if remaining_calls < 1 or local_kinds is None:
+            return None
+        if self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue():
+            return None
+        combined = f"{self._task or ''} {subgoal or ''}"
+        if not re.search(r"\b(?:ladder|stair(?:s|case)?|door(?:way)?|exit)\b", combined, re.IGNORECASE):
+            return None
+        gmap = self._global_map()
+        if gmap is not None and self._start_place is not None:
+            cur_place = self._current_map_place()
+            if cur_place is not None:
+                c_seg, _ = gmap.resolve(cur_place[0], cur_place[1])
+                s_seg, _ = gmap.resolve(self._start_place[0], self._start_place[1])
+                if c_seg != s_seg:
+                    return None
+        for (lx, ly), info in (self._identified or {}).items():
+            tags = info if isinstance(info, (set, list, tuple)) else getattr(info, "tags", ())
+            if any(t in ("door", "staircase", "entrance", "exit") for t in (tags or ())):
+                if (lx, ly) != (0, 0) and shortest_path(local_kinds, (0, 0), [(lx, ly)], people=self._people_now()) is not None:
+                    return None
+        last_move_dir = None
+        for _, dep_req, _ in reversed(self._leg_departures):
+            if dep_req.startswith("MoveOff("):
+                last_move_dir = parse_edge_direction(dep_req[len("MoveOff("):-1])
+                if last_move_dir in DIRECTIONS:
+                    break
+        if last_move_dir not in DIRECTIONS:
+            return None
+        cells = edge_cells(local_kinds, last_move_dir)
+        if not cells:
+            return None
+        runs = edge_runs(cells, last_move_dir)
+        if not any(self._run_pocket_bounds(last_move_dir, r) is None for r in runs):
+            return None
+        return (
+            f"the target ladder/stairs/door has not been reached on the current screen while the {last_move_dir} "
+            f"screen edge ({', '.join(str(c) for c in cells[:3])}) continues open and {remaining_calls} action "
+            f"call(s) remain — continue along the open {last_move_dir} screen edge toward the target"
+        )
+
+    def _budget_exhausted_unfinished_subgoal_note(
+        self,
+        subgoal: str,
+        judge_output: str,
+        local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
+    ) -> Optional[str]:
+        if not self._out_of_calls():
+            return None
+        if not re.search(
+            r"\b(?:action\s+budget|budget\s*\(\s*\d+\s*/\s*\d+\s*\)|exhausted|out\s+of\s+(?:action\s+)?calls|no\s+actions?\s+remaining)\b",
+            judge_output or "",
+            re.IGNORECASE,
+        ):
+            return None
+        combined = f"{self._task or ''} {subgoal or ''}"
+        gmap = self._global_map()
+        if gmap is not None and re.search(r"\b(?:explore|reveal|sweep|unexplored)\b", combined, re.IGNORECASE):
+            targets, _ = frontier_targets(gmap, local_kinds, blocked_moves=self._current_segment_blocked_moves())
+            if targets:
+                nearest = targets[0]
+                return (
+                    f"exhausting the episode action budget ({self._calls}/{self._max_steps}) does not complete an "
+                    f"exploration/reveal subgoal while reachable unexplored map edges remain "
+                    f"(nearest at ({nearest['dx']}, {nearest['dy']}), {nearest['steps']} steps {nearest['sector']})"
+                )
+        if re.search(r"\b(?:catch|catching|capture|capturing)\b", combined, re.IGNORECASE):
+            if not re.search(r"\b(?:caught|captured|gotcha)\b", judge_output or "", re.IGNORECASE):
+                return (
+                    f"exhausting the episode action budget ({self._calls}/{self._max_steps}) without catching the "
+                    f"target wild Pokemon does not complete the subgoal"
+                )
+        return None
+
     def _unfinished_corridor_traversal_note(
         self,
         local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
@@ -1622,18 +1705,33 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return None
         cur_seg, cur_pos = place
         s_seg, s_pos = gmap.resolve(self._start_place[0], self._start_place[1])
-        if cur_seg != s_seg:
-            return None
-        move_legs = sum(
-            1 for rep in self.report.executor_reports
-            if rep.executor_name in ("OffScreenMoveExecutor", "OnScreenMoveExecutor")
-        )
+        same_seg = cur_seg == s_seg
+        if not same_seg:
+            cur_kind = gmap.info(cur_seg).kind
+            start_kind = gmap.info(s_seg).kind
+            if cur_kind == "building" or start_kind == "building":
+                return None
+        move_legs = 0
+        net_steps = 0
+        for b_place, _, a_place in self._leg_departures:
+            try:
+                b_seg, b_pos = gmap.resolve(b_place[0], b_place[1])
+                a_seg, a_pos = gmap.resolve(a_place[0], a_place[1])
+            except Exception:  # noqa: BLE001
+                continue
+            if (b_seg, b_pos) == (a_seg, a_pos):
+                continue
+            move_legs += 1
+            if b_seg == a_seg:
+                net_steps += abs(a_pos[0] - b_pos[0]) + abs(a_pos[1] - b_pos[1])
+            else:
+                net_steps += 5
+        if same_seg:
+            net_steps = abs(cur_pos[0] - s_pos[0]) + abs(cur_pos[1] - s_pos[1])
         if move_legs == 0 or move_legs >= 3:
             return None
-        net_steps = abs(cur_pos[0] - s_pos[0]) + abs(cur_pos[1] - s_pos[1])
         if net_steps >= 15:
             return None
-        task_text = (self._task or "") + " " + (self._guidance or "")
         if re.search(r"\b(?:heal|potion|menu|poke\s*mart|pokemon\s*center|talk|speak|interact|pick\s+up|collect)\b",
                      self._task or "", re.IGNORECASE):
             return None
@@ -1680,7 +1778,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if targets:
             nearest = targets[0]
             dist = nearest.get("path_steps") if nearest.get("path_steps") is not None else nearest.get("steps")
-            if dist is not None and dist <= 6 and nearest.get("on_screen"):
+            if same_seg and dist is not None and dist <= 6 and nearest.get("on_screen"):
                 return None
             leg_str = f" [next on-screen leg: {nearest['next_leg']}]" if nearest.get("next_leg") else ""
             route_info = (
@@ -1689,8 +1787,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
             )
         else:
             route_info = f"{len(unentered_doors)} unentered door(s)/stairs remain in this area"
+        span_desc = f"from {s_pos} to {cur_pos}" if same_seg else f"to {cur_pos} across area boundary"
         return (
-            f"only {move_legs} movement leg(s) ({net_steps} net steps from {s_pos} to {cur_pos}) completed so far "
+            f"only {move_legs} movement leg(s) ({net_steps} net steps {span_desc}) completed so far "
             f"with {remaining_calls} action calls remaining in this episode's budget, while the {', '.join(open_task_dirs)} "
             f"corridor edge continues open and {route_info} — continue advancing along the corridor/route in this episode"
         )
@@ -1708,6 +1807,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         unfinished_note = self._unfinished_room_exploration_note(self._task, local_kinds)
         if unfinished_note is None:
             unfinished_note = self._unfinished_corridor_traversal_note(local_kinds)
+        if unfinished_note is None and self.plan:
+            unfinished_note = self._unfinished_open_corridor_target_note(self.plan[-1], local_kinds)
         return unfinished_note
 
     def _task_check(self, frame, *, can_continue: bool = True) -> Tuple[bool, str]:

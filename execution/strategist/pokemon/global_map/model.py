@@ -851,6 +851,7 @@ class GlobalMap(StrategistArtifact):
                 and len(set(hashes)) == 1
                 and hashes[0] is not None
                 and self.visits[self.segment].get(g, 0) == 0
+                and self.visits[self.segment].get(self.pos, 0) == 0
                 and not (abs(x) <= 2 and abs(y) <= 2)
                 and old.hashes != hashes
                 and old.pixels is not None
