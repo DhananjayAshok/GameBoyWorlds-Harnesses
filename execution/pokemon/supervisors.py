@@ -1542,8 +1542,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 s_seg, _ = gmap.resolve(self._start_place[0], self._start_place[1])
                 if c_seg != s_seg:
                     return None
-        for (lx, ly), info in (self._identified or {}).items():
-            tags = info if isinstance(info, (set, list, tuple)) else getattr(info, "tags", ())
+        for key, info in (self._identified or {}).items():
+            if not isinstance(key, tuple) or len(key) < 2:
+                continue
+            lx, ly = key[0], key[1]
+            tag = getattr(info, "tag", None)
+            tags = (tag,) if tag else (info if isinstance(info, (set, list, tuple)) else getattr(info, "tags", ()))
             if any(t in ("door", "staircase", "entrance", "exit") for t in (tags or ())):
                 if (lx, ly) != (0, 0) and shortest_path(local_kinds, (0, 0), [(lx, ly)], people=self._people_now()) is not None:
                     return None
@@ -1669,8 +1673,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if not targets and not unentered_doors:
             return None
         if local_kinds is not None:
-            for (lx, ly), info in (self._identified or {}).items():
-                tags = info if isinstance(info, (set, list, tuple)) else getattr(info, "tags", ())
+            for key, info in (self._identified or {}).items():
+                if not isinstance(key, tuple) or len(key) < 2:
+                    continue
+                lx, ly = key[0], key[1]
+                tag = getattr(info, "tag", None)
+                tags = (tag,) if tag else (info if isinstance(info, (set, list, tuple)) else getattr(info, "tags", ()))
                 if any(t in ("door", "staircase", "entrance", "exit") for t in (tags or ())):
                     if (lx, ly) != (0, 0) and abs(lx) + abs(ly) <= 6:
                         return None
