@@ -234,6 +234,79 @@ def is_cutscene_frame_changing(
     if n_rows == 0 or n_cols == 0:
         return raw_sum >= CUTSCENE_DIFF_MIN_PIXELS
     ty, tx = n_rows // TILE_SIZE, n_cols // TILE_SIZE
+
+    a_tiles = a[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).swapaxes(1, 2)
+    b_tiles = b[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).swapaxes(1, 2)
+
+    pair_counts: Dict[Tuple[bytes, bytes], int] = {}
+    pair_keys: Dict[Tuple[int, int], Tuple[bytes, bytes]] = {}
+    roll_tiles = set()
+    roll_shade_pairs = set()
+    n_two_shade_roll_tiles = 0
+    for iy in range(ty):
+        for ix in range(tx):
+            at = a_tiles[iy, ix]
+            bt = b_tiles[iy, ix]
+            tile_diff = np.abs(at - bt) > CUTSCENE_DIFF_THRESHOLD
+            if not np.any(tile_diff):
+                continue
+            if int(bt.max()) - int(bt.min()) <= CUTSCENE_DIFF_THRESHOLD:
+                continue
+            for s in range(1, TILE_SIZE):
+                if not np.any(np.abs(np.roll(at, s, axis=1) - bt) > CUTSCENE_DIFF_THRESHOLD):
+                    roll_tiles.add((iy, ix))
+                    if len(set((at // 32).flatten().tolist())) <= 2 and len(set((bt // 32).flatten().tolist())) <= 2:
+                        n_two_shade_roll_tiles += 1
+                        for sa, sb in zip((at[tile_diff] // 32).tolist(), (bt[tile_diff] // 32).tolist()):
+                            roll_shade_pairs.add((sa, sb))
+                    break
+            key = ((at // 16).tobytes(), (bt // 16).tobytes())
+            pair_keys[(iy, ix)] = key
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+
+    bg_anim_pairs: List[Tuple[np.ndarray, np.ndarray]] = []
+    seen_bg_keys = set()
+    for (iy, ix), key in pair_keys.items():
+        if pair_counts[key] >= 2 or (iy, ix) in roll_tiles:
+            if key not in seen_bg_keys:
+                seen_bg_keys.add(key)
+                bg_anim_pairs.append((a_tiles[iy, ix], b_tiles[iy, ix]))
+
+    bg_mask = np.zeros_like(diff, dtype=bool)
+    if bg_anim_pairs:
+        use_roll_shades = n_two_shade_roll_tiles >= 2 and bool(roll_shade_pairs)
+        bg_mask_tiles = np.zeros((ty, tx, TILE_SIZE, TILE_SIZE), dtype=bool)
+        for iy in range(ty):
+            for ix in range(tx):
+                if not np.any(np.abs(a_tiles[iy, ix] - b_tiles[iy, ix]) > CUTSCENE_DIFF_THRESHOLD):
+                    continue
+                key = pair_keys.get((iy, ix))
+                if (key is not None and pair_counts.get(key, 0) >= 2) or (iy, ix) in roll_tiles:
+                    bg_mask_tiles[iy, ix] = True
+                    continue
+                at = a_tiles[iy, ix]
+                bt = b_tiles[iy, ix]
+                bg_pixel_match = np.zeros((TILE_SIZE, TILE_SIZE), dtype=bool)
+                for a_bg, b_bg in bg_anim_pairs:
+                    bg_changed = np.abs(a_bg - b_bg) > CUTSCENE_DIFF_THRESHOLD
+                    match_rc = (
+                        bg_changed
+                        & (np.abs(at - a_bg) <= CUTSCENE_DIFF_THRESHOLD)
+                        & (np.abs(bt - b_bg) <= CUTSCENE_DIFF_THRESHOLD)
+                    )
+                    bg_pixel_match |= match_rc
+                if use_roll_shades:
+                    qa = at // 32
+                    qb = bt // 32
+                    for sa, sb in roll_shade_pairs:
+                        bg_pixel_match |= (qa == sa) & (qb == sb)
+                bg_mask_tiles[iy, ix] = bg_pixel_match
+        bg_mask[:n_rows, :n_cols] = bg_mask_tiles.swapaxes(1, 2).reshape(n_rows, n_cols)
+        diff = diff & ~bg_mask
+
+    if int(diff.sum()) < CUTSCENE_DIFF_MIN_PIXELS:
+        return False
+
     t_min = diff[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
     for d in range(1, CUTSCENE_MAX_TILE_SHIFT + 1):
         if d < n_cols:
@@ -242,11 +315,13 @@ def is_cutscene_frame_changing(
             diff_l[96:, 104:] = False
             if ignore_player_box:
                 diff_l[56:80, 64:80] = False
+            diff_l &= ~bg_mask
             diff_r = np.ones_like(diff)
             diff_r[:, :-d] = np.abs(b[:, :-d] - a[:, d:]) > CUTSCENE_DIFF_THRESHOLD
             diff_r[96:, 104:] = False
             if ignore_player_box:
                 diff_r[56:80, 64:80] = False
+            diff_r &= ~bg_mask
             tl = diff_l[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             tr = diff_r[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             t_min = np.minimum(t_min, np.minimum(tl, tr))
@@ -256,31 +331,17 @@ def is_cutscene_frame_changing(
             diff_u[96:, 104:] = False
             if ignore_player_box:
                 diff_u[56:80, 64:80] = False
+            diff_u &= ~bg_mask
             diff_d = np.ones_like(diff)
             diff_d[:-d, :] = np.abs(b[:-d, :] - a[d:, :]) > CUTSCENE_DIFF_THRESHOLD
             diff_d[96:, 104:] = False
             if ignore_player_box:
                 diff_d[56:80, 64:80] = False
+            diff_d &= ~bg_mask
             tu = diff_u[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             td = diff_d[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             t_min = np.minimum(t_min, np.minimum(tu, td))
-    a_tiles = a[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).swapaxes(1, 2)
-    b_tiles = b[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).swapaxes(1, 2)
-    pair_counts = {}
-    pair_keys = {}
-    for iy in range(ty):
-        for ix in range(tx):
-            if t_min[iy, ix] < CUTSCENE_TILE_MIN_PIXELS:
-                continue
-            bt = b_tiles[iy, ix]
-            if int(bt.min()) == int(bt.max()):
-                continue
-            key = (a_tiles[iy, ix].tobytes(), bt.tobytes())
-            pair_keys[(iy, ix)] = key
-            pair_counts[key] = pair_counts.get(key, 0) + 1
-    for (iy, ix), key in pair_keys.items():
-        if pair_counts[key] >= 2:
-            t_min[iy, ix] = 0
+
     if int(t_min[t_min >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_DIFF_MIN_PIXELS:
         return True
     if not ignore_player_box:

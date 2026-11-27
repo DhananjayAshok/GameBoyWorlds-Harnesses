@@ -178,6 +178,7 @@ INTERACT_POST_DIALOGUE_SETTLE_WAIT = 4
 INTERACT_MAX_CUTSCENE_WAIT = 30
 INTERACT_POST_MOTION_WAIT = 5
 INTERACT_POST_WARP_BANNER_WAIT = 6
+PURE_DIFF_MAX_CUTSCENE_WAIT = 10
 INTERACT_MODAL_MAX_PRESSES = 8
 MAX_INTERACT_DIALOGUE_STEPS = 10
 
@@ -263,7 +264,9 @@ def settle_overworld_free_roam(
     waited = 0
     post_motion_remaining = 0
     saw_fade = False
+    saw_overlay_or_fade = False
     saw_activity = False
+    pure_move_settle = not record_dialogue_settled and not stop_on_overlay
 
     def _is_overlay(fr) -> bool:
         return (
@@ -290,6 +293,9 @@ def settle_overworld_free_roam(
             )
         if box_open:
             saw_activity = True
+            saw_overlay_or_fade = True
+        if pure_move_settle and not saw_overlay_or_fade and waited >= min(max_cutscene_wait, PURE_DIFF_MAX_CUTSCENE_WAIT):
+            break
         if waited >= settle_wait and not box_open and post_motion_remaining <= 0:
             break
         before_frame, after_frame = step_wait_fn()
@@ -302,17 +308,22 @@ def settle_overworld_free_roam(
         fade_now = is_blank_or_fade_frame(before_frame) or is_blank_or_fade_frame(after_frame)
         if fade_now:
             saw_fade = True
-        active_now = (
-            is_cutscene_frame_changing(before_frame, after_frame)
-            or has_emote_bubble(after_frame)
+        overlay_or_emote_now = (
+            has_emote_bubble(after_frame)
             or fade_now
             or (not stop_on_overlay and has_bottom_dialogue_box(after_frame))
             or (not stop_on_overlay and include_top_box and has_top_dialogue_box(after_frame) and not has_menu_cursor(after_frame))
         )
+        if overlay_or_emote_now:
+            saw_overlay_or_fade = True
+        frame_changing = is_cutscene_frame_changing(before_frame, after_frame)
+        active_now = frame_changing or overlay_or_emote_now
         if active_now:
             saw_activity = True
             if saw_fade and has_bottom_location_banner(after_frame):
                 post_motion_remaining = max(post_motion_remaining, post_warp_banner_wait)
+            elif pure_move_settle and not saw_overlay_or_fade:
+                post_motion_remaining = max(post_motion_remaining, 1)
             else:
                 post_motion_remaining = max(post_motion_remaining, post_motion_wait)
         elif post_motion_remaining > 0:
@@ -1053,6 +1064,7 @@ class GridMoveExecutor(PolicyExecutor):
             post_warp_banner_wait=MOVE_POST_WARP_BANNER_WAIT,
             include_top_box=False,
             record_dialogue_settled=False,
+            respect_last_settled=True,
             settle_menu_fn=self._settle_menu_state,
         )
         self._saw_cutscene_activity = saw_activity
