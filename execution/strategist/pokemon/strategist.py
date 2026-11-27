@@ -27,7 +27,9 @@ from execution.strategist.pokemon.goals import (GoalNode, GoalSubtree, PokemonGo
 from execution.strategist.pokemon.guide import (NEW_TOWN, StrategyGuide, battle_tips, guide_block, load_seeds,
                                                 record_events, record_new_town, reflect_on_defeat, town_question,
                                                 update_guide)
-from execution.strategist.pokemon.knowledge import PokemonKnowledgeTree, remember, remember_all
+from execution.strategist.pokemon.knowledge import (DEFAULT_CATEGORY_DESCRIPTIONS, PokemonKnowledgeTree,
+                                                    compact_active_story, has_recorded_knowledge, remember,
+                                                    remember_all, tree_entries)
 from execution.strategist.pokemon.notepad import ThoughtNotepad
 from execution.strategist.pokemon.party_state import PartyInventoryState
 from execution.strategist.pokemon.npc_map import with_people
@@ -1121,6 +1123,47 @@ class PokemonStrategist:
                 return True
         return False
 
+    def _knowledge_context_block(self) -> str:
+        if not has_recorded_knowledge(self.knowledge):
+            return ""
+        current_place = self._current_place() or ""
+        place_words = [
+            w.lower()
+            for w in re.split(r"[^A-Za-z0-9]+", current_place)
+            if len(w) >= 3 and w.lower() not in {"the", "and", "area", "overworld", "city", "town", "route", "floor"}
+        ]
+        place_phrases = [
+            m.group(0).lower()
+            for m in re.finditer(
+                r"\b(?:route\s+\d+|[a-z]+\s+(?:city|town|forest|cave|tower|well|gym|house|lab|island|road|mountain|mt\.?\s*[a-z]+))\b",
+                current_place.lower(),
+            )
+        ]
+        lines: List[str] = []
+        for path, node in tree_entries(self.knowledge):
+            if len(path) < 2:
+                continue
+            desc = (node.description or "").strip()
+            if not desc or (len(path) == 2 and desc in DEFAULT_CATEGORY_DESCRIPTIONS):
+                continue
+            top = path[1]
+            include = False
+            if top in ("Active Story", "NPCs", "Game Lore"):
+                include = True
+            elif top == "Locations" or len(path) >= 2:
+                path_str = " > ".join(path).lower()
+                text_str = f"{path_str} {desc.lower()}"
+                if top not in ("Items", "Pokemon", "Game Control Meta") and (
+                    any(ph in text_str for ph in place_phrases) or any(w in path_str for w in place_words)
+                ):
+                    include = True
+            if include:
+                rendered_desc = compact_active_story(desc) if top == "Active Story" else desc
+                lines.append(f"- {' > '.join(path[1:])}: {rendered_desc}")
+        if not lines:
+            return ""
+        return "\nWhat you know from your knowledge database:\n" + "\n".join(lines) + "\n"
+
     def _fill(self, prompt: str) -> str:
         notepad_text = self.notepad.text.strip()
         if notepad_text and self.global_map.current:
@@ -1136,6 +1179,7 @@ class PokemonStrategist:
                 .replace("[CURRENT]", self._current_place())
                 .replace("[PARTY_BLOCK]", self._party_status_block())
                 .replace("[NOTEPAD]", notepad_text or "(empty)")
+                .replace("[KNOWLEDGE_BLOCK]", self._knowledge_context_block())
                 .replace("[GUIDE]", guide_block(self.guide, self.global_map, self.start_episode + self._episodes_run,
                                                 goal_completed_since_entry=self._goal_completed_since_building_entry())))
 
