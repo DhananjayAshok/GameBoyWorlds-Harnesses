@@ -10,8 +10,9 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  has_menu_cursor, has_modal_preview_box,
                                                  has_top_dialogue_box, is_battle_screen,
                                                  is_blank_or_fade_frame,
-                                                 is_cutscene_frame_changing, is_overworld_pack_menu,
-                                                 is_pack_screen, is_party_menu_screen,
+                                                 is_cutscene_frame_changing, is_healing_item_name,
+                                                 is_overworld_pack_menu, is_pack_screen,
+                                                 is_party_menu_screen, is_status_heal_item_name,
                                                  read_battle_hud_hp)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      boundary_exit_direction, cell_kinds, compress_path, edge_cells,
@@ -1069,10 +1070,26 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             location_failed=report.outcome in LOCATION_FAIL_CODES,
                             ambiguous=report.outcome == MOVE_TARGET_AMBIGUOUS)
 
-    def _update_party_hp_from_combat(self, report: ExecutorReport) -> None:
-        if getattr(self.last_executor, "_bag_unavailable", False):
+    def _update_bag_status_from_notes(self, notes: str) -> bool:
+        bag_info = CombatExecutor.extract_bag_items_from_text(notes)
+        if bag_info is None:
+            return False
+        bag_items, all_checked = bag_info
+        if any(is_healing_item_name(it) for it in bag_items):
+            self._healing_bag_empty = False
+        elif all_checked:
             self._healing_bag_empty = True
+        if any(is_status_heal_item_name(it) for it in bag_items):
+            self._status_heal_bag_empty = False
+        elif all_checked:
+            self._status_heal_bag_empty = True
+        return True
+
+    def _update_party_hp_from_combat(self, report: ExecutorReport) -> None:
         notes = report.notes or ""
+        has_bag_tag = self._update_bag_status_from_notes(notes)
+        if getattr(self.last_executor, "_bag_unavailable", False) and not has_bag_tag:
+            self._healing_bag_empty = True
         hp = CombatExecutor.extract_player_hp_from_text(notes)
         if hp is not None:
             self._last_seen_battle_hp = hp
@@ -1090,6 +1107,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _update_party_hp_from_menu(self, report: ExecutorReport) -> None:
         notes = report.notes or ""
+        self._update_bag_status_from_notes(notes)
         if "No healing item was used in menu" in notes:
             self._healing_bag_empty = True
         if "No status-healing item was used in menu" in notes:

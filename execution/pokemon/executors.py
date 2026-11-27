@@ -23,7 +23,9 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_pack_screen, is_party_menu_screen,
                                                  is_party_menu_selection_screen, is_same_battle_frame,
                                                  is_start_menu_screen,
-                                                 read_bag_item_list, read_battle_hud_hp,
+                                                 is_healing_item_name, is_status_heal_item_name,
+                                                 read_bag_cursor_row, read_bag_item_list,
+                                                 read_bag_item_quantities, read_battle_hud_hp,
                                                  read_battle_hud_status, read_move_menu_cursor_slot,
                                                  read_move_menu_names, read_move_menu_pp,
                                                  read_party_menu_hp, read_party_menu_status)
@@ -2259,6 +2261,12 @@ Press: <one of up, down, left, right, confirm, back>
         self._move_pp: Dict[int, Tuple[int, int]] = {}
         self._zero_pp_slots: Dict[int, str] = {}
         self._known_zero_pp_names: set = set()
+        self._seen_bag_items: List[str] = []
+        self._bag_item_quantities: Dict[str, Optional[int]] = {}
+        self._saw_bag_end: bool = False
+        self._opened_bag_in_battle: bool = False
+        self._bag_cursor_idx: Optional[int] = None
+        self._selected_bag_item: Optional[str] = None
         for entry in (initial_zero_pp_moves or ()):
             text = str(entry).strip()
             if not text:
@@ -2600,9 +2608,92 @@ Press: <one of up, down, left, right, confirm, back>
         self._scan_move_menu_frame(self._current_frame())
         return dismissed
 
+    def _scan_bag_menu_frame(self, frame: Optional[np.ndarray]) -> Optional[Tuple[List[str], bool, Optional[str]]]:
+        if frame is None:
+            return None
+        info = read_bag_item_list(frame)
+        if info is None:
+            return None
+        self._opened_bag_in_battle = True
+        items, has_more = info
+        quantities = dict(read_bag_item_quantities(frame) or ())
+        for name in items:
+            if name and name not in self._seen_bag_items:
+                self._seen_bag_items.append(name)
+            if name in quantities:
+                self._bag_item_quantities[name] = quantities[name]
+        if not has_more:
+            self._saw_bag_end = True
+            for existing in list(self._seen_bag_items):
+                if existing not in items and len(items) < 4:
+                    self._seen_bag_items.remove(existing)
+                    self._bag_item_quantities.pop(existing, None)
+        cursor_row = read_bag_cursor_row(frame, tracked_index=self._bag_cursor_idx)
+        if cursor_row == "CANCEL":
+            self._bag_cursor_idx = len(items)
+        elif cursor_row in items:
+            self._bag_cursor_idx = items.index(cursor_row)
+        return items, has_more, cursor_row
+
+    def _consume_selected_bag_item(self, item_name: Optional[str]) -> None:
+        if not item_name or item_name == "CANCEL":
+            return
+        qty = self._bag_item_quantities.get(item_name)
+        if qty is not None and qty > 1:
+            self._bag_item_quantities[item_name] = qty - 1
+        elif qty == 1:
+            self._bag_item_quantities.pop(item_name, None)
+            if item_name in self._seen_bag_items:
+                self._seen_bag_items.remove(item_name)
+            if self._saw_bag_end and not any(is_healing_item_name(it) for it in self._seen_bag_items):
+                live_status = self._last_seen_player_status()
+                if not live_status or not any(is_status_heal_item_name(it) for it in self._seen_bag_items):
+                    self._bag_unavailable = True
+
+    def _complete_in_battle_item_application(
+        self,
+        selected_item: Optional[str],
+        turn_records: List[EnvironmentStepRecord],
+    ) -> List[str]:
+        auto_steps: List[str] = []
+        if not selected_item or selected_item == "CANCEL":
+            return auto_steps
+        if not (is_healing_item_name(selected_item) or is_status_heal_item_name(selected_item)):
+            return auto_steps
+        cur_frame = self._current_frame()
+        if is_pack_action_subbox_screen(cur_frame):
+            self._ensure_scripted("confirm USE on in-battle bag item")
+            use_rec = self._take_battle_menu_press("confirm")
+            turn_records.append(use_rec)
+            auto_steps.append("confirmed USE")
+            if self._last_terminated or self._last_truncated:
+                return auto_steps
+            cur_frame = self._current_frame()
+        if is_party_menu_selection_screen(cur_frame):
+            party_hp = read_party_menu_hp(cur_frame)
+            party_st = read_party_menu_status(cur_frame)
+            needs_heal = is_healing_item_name(selected_item) and (
+                party_hp is None or party_hp[0] < party_hp[1]
+            )
+            needs_status = is_status_heal_item_name(selected_item) and bool(
+                party_st or self._last_seen_player_status()
+            )
+            if needs_heal or needs_status:
+                self._ensure_scripted("confirm active Pokemon on party screen")
+                target_rec = self._take_battle_menu_press("confirm")
+                turn_records.append(target_rec)
+                auto_steps.append("confirmed active Pokemon on party screen")
+                if self._last_terminated or self._last_truncated:
+                    return auto_steps
+                after_target = self._current_frame()
+                if is_party_menu_screen(after_target) and not has_menu_cursor(after_target):
+                    self._party_effect_pending = True
+        return auto_steps
+
     def _history_block(self) -> str:
         cur_frame = self._current_frame()
         self._scan_move_menu_frame(cur_frame)
+        bag_info = self._scan_bag_menu_frame(cur_frame)
         lines = list(self.history)
         live_hp = (
             read_party_menu_hp(cur_frame)
@@ -2626,6 +2717,26 @@ Press: <one of up, down, left, right, confirm, back>
             )
         elif live_status:
             lines.append(f"Active Pokemon status: {live_status}.")
+        if bag_info is not None:
+            vis_items, has_more, cursor_row = bag_info
+            formatted_rows = [
+                f"{it} (x{self._bag_item_quantities[it]})"
+                if self._bag_item_quantities.get(it) is not None
+                else it
+                for it in vis_items
+            ]
+            if not has_more:
+                formatted_rows.append("CANCEL")
+            more_note = " (more items below)" if has_more else ""
+            if formatted_rows:
+                lines.append(f"Visible bag rows in order: {', '.join(formatted_rows)}{more_note}.")
+            if cursor_row == "CANCEL":
+                lines.append(
+                    "Current bag cursor row: CANCEL (bottom description box is blank — "
+                    "press up to move onto an item above CANCEL; do NOT press confirm on CANCEL)."
+                )
+            elif cursor_row:
+                lines.append(f"Current bag cursor row: {cursor_row}.")
         zero_pp_items = self._format_zero_pp_list()
         if zero_pp_items:
             avail = [
@@ -2670,6 +2781,39 @@ Press: <one of up, down, left, right, confirm, back>
         r"\[Moves at 0 PP:\s*([^\]]+)\]",
         re.IGNORECASE,
     )
+
+    BAG_ITEMS_TAG_PATTERN = re.compile(
+        r"\[Bag items seen:\s*([^\]]+)\]",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def extract_bag_items_from_text(cls, text: str) -> Optional[Tuple[List[str], bool]]:
+        if not text:
+            return None
+        last_result: Optional[Tuple[List[str], bool]] = None
+        for m in cls.BAG_ITEMS_TAG_PATTERN.finditer(text):
+            raw = m.group(1).strip()
+            all_checked = False
+            if re.search(r"\((?:all\s+bag\s+slots\s+checked|end\s+of\s+bag\s+reached)\)", raw, re.IGNORECASE):
+                all_checked = True
+                raw = re.sub(
+                    r"\s*\((?:all\s+bag\s+slots\s+checked|end\s+of\s+bag\s+reached)\)\s*",
+                    "",
+                    raw,
+                    flags=re.IGNORECASE,
+                ).strip()
+            if not raw or raw.lower() == "none":
+                items: List[str] = []
+            else:
+                items = [
+                    re.sub(r"\s*\(x\d+\)\s*$", "", part.strip(), flags=re.IGNORECASE)
+                    for part in raw.split(",")
+                    if part.strip()
+                ]
+                items = [it for it in items if it and it.lower() != "none"]
+            last_result = (items, all_checked)
+        return last_result
 
     @classmethod
     def extract_player_hp_from_text(cls, text: str) -> Optional[Tuple[int, int]]:
@@ -2845,6 +2989,10 @@ Press: <one of up, down, left, right, confirm, back>
             zero_pp_items = self._format_zero_pp_list()
             if zero_pp_items:
                 notes_lines.append(f"[Moves at 0 PP: {', '.join(zero_pp_items)}]")
+            if self._seen_bag_items or self._opened_bag_in_battle:
+                end_note = " (all bag slots checked)" if self._saw_bag_end else ""
+                items_str = ", ".join(self._seen_bag_items) if self._seen_bag_items else "none"
+                notes_lines.append(f"[Bag items seen: {items_str}{end_note}]")
         self.report.notes = "\n".join(notes_lines)
         return code
 
@@ -3004,6 +3152,10 @@ Press: <one of up, down, left, right, confirm, back>
                         return self._fail(BATTLE_TERMINATED, "terminated")
                     if self._last_truncated:
                         return self._fail(BATTLE_TRUNCATED, "truncated")
+                    self._opened_bag_in_battle = True
+                    self._saw_bag_end = True
+                    self._seen_bag_items.clear()
+                    self._bag_item_quantities.clear()
                     self._bag_unavailable = True
                     self._in_bag_menu = False
                     self.history.append(
@@ -3011,6 +3163,7 @@ Press: <one of up, down, left, right, confirm, back>
                     )
                     continue
 
+                bag_before_info = self._scan_bag_menu_frame(frame)
                 prompt = (self.MENU_STEP_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
                           .replace("[HISTORY]", self._history_block()))
                 output = self._vlm_call(self.MENU_STEP_TAG, texts=prompt, images=[frame],
@@ -3024,6 +3177,26 @@ Press: <one of up, down, left, right, confirm, back>
                         return self._fail(BATTLE_UNREADABLE, "action_unreadable", output)
                     continue
                 consecutive_invalid = 0
+                pre_cursor_row = bag_before_info[2] if bag_before_info is not None else None
+                intercepted_cancel = False
+                if (
+                    press == "confirm"
+                    and bag_before_info is not None
+                    and pre_cursor_row == "CANCEL"
+                    and any(
+                        is_healing_item_name(it) or is_status_heal_item_name(it)
+                        for it in bag_before_info[0]
+                    )
+                ):
+                    press = "up"
+                    intercepted_cancel = True
+                if bag_before_info is not None and self._bag_cursor_idx is not None:
+                    n_vis = len(bag_before_info[0])
+                    max_idx = n_vis if not bag_before_info[1] else max(0, n_vis - 1)
+                    if press == "down":
+                        self._bag_cursor_idx = min(max_idx, self._bag_cursor_idx + 1)
+                    elif press == "up":
+                        self._bag_cursor_idx = max(0, self._bag_cursor_idx - 1)
                 was_party_selection = is_party_menu_selection_screen(frame)
                 record = self._take_battle_menu_press(press)
                 if self._last_terminated:
@@ -3031,6 +3204,7 @@ Press: <one of up, down, left, right, confirm, back>
                 if self._last_truncated:
                     return self._fail(BATTLE_TRUNCATED, "truncated")
                 after_press_frame = self._current_frame()
+                self._scan_bag_menu_frame(after_press_frame)
                 if (
                     press == "confirm"
                     and was_party_selection
@@ -3040,6 +3214,29 @@ Press: <one of up, down, left, right, confirm, back>
                     self._party_effect_pending = True
                 turn_records = [record]
                 entry = f"- step {step + 1}: pressed {press} in battle menu"
+                if intercepted_cancel:
+                    entry += " (cursor was on CANCEL, so pressed up instead of confirm to move onto an item)"
+                elif press == "confirm" and pre_cursor_row and pre_cursor_row != "CANCEL":
+                    self._selected_bag_item = pre_cursor_row
+                    entry += f" (selected {pre_cursor_row})"
+                auto_item_steps: List[str] = []
+                if (
+                    press == "confirm"
+                    and self._in_bag_menu
+                    and self._selected_bag_item
+                    and record.action_success != -1
+                ):
+                    auto_item_steps = self._complete_in_battle_item_application(
+                        self._selected_bag_item,
+                        turn_records,
+                    )
+                    if self._last_terminated:
+                        return self._fail(BATTLE_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._fail(BATTLE_TRUNCATED, "truncated")
+                    if auto_item_steps:
+                        after_press_frame = self._current_frame()
+                        entry += ", " + " and ".join(auto_item_steps)
                 if record.action_success == -1:
                     entry += " (the game did not accept it)"
                     consecutive_failures += 1
@@ -3061,9 +3258,10 @@ Press: <one of up, down, left, right, confirm, back>
                         or is_battle_command_menu(self._current_frame())
                     ):
                         self._in_bag_menu = False
-                        bag_before = read_bag_item_list(frame)
+                        bag_before = bag_before_info[:2] if bag_before_info is not None else read_bag_item_list(frame)
                         had_bag_items = bool(bag_before and bag_before[0])
                         if (presses == 0
+                                and not auto_item_steps
                                 and self._agent_state() == AgentState.IN_BATTLE
                                 and is_battle_decision_screen(self._current_frame())):
                             if press == "confirm" and had_bag_items:
@@ -3071,9 +3269,14 @@ Press: <one of up, down, left, right, confirm, back>
                                     " (cursor was on CANCEL so confirm closed the bag without using an item; "
                                     "items are still available in the bag)"
                                 )
+                            elif any(is_healing_item_name(it) for it in self._seen_bag_items):
+                                entry += " (closed the bag without using an item; healing items are still in the bag)"
                             else:
                                 self._bag_unavailable = True
                                 entry += " (closed the bag without using an item; do not choose bag again)"
+                        elif presses > 0 or auto_item_steps:
+                            self._consume_selected_bag_item(self._selected_bag_item)
+                        self._selected_bag_item = None
                     if self._in_pokemon_menu and (
                         self._agent_state() != AgentState.IN_MENU
                         or is_battle_command_menu(self._current_frame())
@@ -3211,17 +3414,22 @@ Press: <one of up, down, left, right, confirm, back>
                     consecutive_failures = 0
 
                 if option == "bag" and record.action_success != -1:
+                    self._opened_bag_in_battle = True
                     if is_empty_battle_bag_menu(self._current_frame()):
                         back_rec = self._take_action(MenuAction, menu_action="back")
                         if self._last_terminated:
                             return self._fail(BATTLE_TERMINATED, "terminated")
                         if self._last_truncated:
                             return self._fail(BATTLE_TRUNCATED, "truncated")
+                        self._saw_bag_end = True
+                        self._seen_bag_items.clear()
+                        self._bag_item_quantities.clear()
                         self._bag_unavailable = True
                         self._in_bag_menu = False
                         entry += " (the bag is empty — only CANCEL — so closed it; do not choose bag again)"
                     elif self._agent_state() == AgentState.IN_MENU:
                         self._in_bag_menu = True
+                        self._scan_bag_menu_frame(self._current_frame())
 
                 elif option == "pokemon" and record.action_success != -1 and self._agent_state() == AgentState.IN_MENU:
                     self._in_pokemon_menu = True

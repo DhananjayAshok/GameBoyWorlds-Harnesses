@@ -1175,3 +1175,163 @@ def read_bag_item_list(frame: np.ndarray) -> Optional[Tuple[List[str], bool]]:
         has_more = (not saw_cancel) and bool(items)
         return (items, has_more)
     return None
+
+
+HEALING_ITEM_NAMES = (
+    "POTION",
+    "SUPER POTION",
+    "HYPER POTION",
+    "MAX POTION",
+    "FULL RESTORE",
+    "FRESH WATER",
+    "SODA POP",
+    "LEMONADE",
+    "MOOMOO MILK",
+    "GOLD BERRY",
+    "ENERGYPOWDER",
+    "ENERGY ROOT",
+    "BERRY",
+    "BERRY JUICE",
+)
+
+STATUS_HEAL_ITEM_NAMES = (
+    "ANTIDOTE",
+    "FULL HEAL",
+    "FULL RESTORE",
+    "PARLYZ HEAL",
+    "AWAKENING",
+    "BURN HEAL",
+    "ICE HEAL",
+    "PSNCUREBERRY",
+    "PRZCUREBERRY",
+    "MINT BERRY",
+    "BURNT BERRY",
+    "ICE BERRY",
+    "MIRACLEBERRY",
+    "HEAL POWDER",
+)
+
+HP_RESTORE_AMOUNT_ITEMS: Dict[int, Tuple[str, ...]] = {
+    10: ("BERRY",),
+    20: ("POTION", "BERRY JUICE"),
+    30: ("GOLD BERRY",),
+    50: ("SUPER POTION", "FRESH WATER", "ENERGYPOWDER"),
+    60: ("SODA POP",),
+    80: ("LEMONADE",),
+    100: ("MOOMOO MILK",),
+    200: ("HYPER POTION", "ENERGY ROOT"),
+}
+
+
+def is_healing_item_name(name: str) -> bool:
+    """Return True if an uppercase bag item name is an HP-restoring item."""
+    up = re.sub(r"\s*\(X\d+\)\s*$", "", (name or "").strip().upper())
+    if not up or up == "CANCEL":
+        return False
+    if any(b in up for b in ("PSNCURE", "PRZCURE", "MINT BERRY", "BURNT BERRY", "ICE BERRY", "MIRACLEBERRY")):
+        return False
+    return any(up == target or target in up for target in HEALING_ITEM_NAMES)
+
+
+def is_status_heal_item_name(name: str) -> bool:
+    """Return True if an uppercase bag item name is a status-curing item."""
+    up = re.sub(r"\s*\(X\d+\)\s*$", "", (name or "").strip().upper())
+    if not up or up == "CANCEL":
+        return False
+    return any(up == target or target in up for target in STATUS_HEAL_ITEM_NAMES)
+
+
+def read_tile_quantity(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> Optional[int]:
+    """Read an integer quantity from 8x8 digit tiles on row ty in [tx_start, tx_end)."""
+    y0 = ty * TILE_SIZE
+    if img.shape[0] < y0 + TILE_SIZE:
+        return None
+    max_tx = min(tx_end, img.shape[1] // TILE_SIZE)
+    digits: List[str] = []
+    for tx in range(tx_start, max_tx):
+        tile = img[y0:y0 + TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+        if float((tile >= LIGHT_BACKGROUND).mean()) < 0.45:
+            continue
+        sig = _tile_row_signature(tile)
+        if sig in HUD_DIGIT_TEMPLATES:
+            digits.append(str(HUD_DIGIT_TEMPLATES[sig]))
+        elif digits:
+            break
+    if not digits:
+        return None
+    val = int("".join(digits))
+    return val if 1 <= val <= 999 else None
+
+
+def read_bag_item_quantities(frame: np.ndarray) -> Optional[List[Tuple[str, Optional[int]]]]:
+    """Return [(item_name, quantity_or_None), ...] for visible items on a Gen 1 or Gen 2 bag item list, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if is_gen1_item_list_screen(img):
+        out: List[Tuple[str, Optional[int]]] = []
+        for ty in (4, 6, 8, 10):
+            name = read_tile_text(img, ty, 6, 18)
+            if not name or name == "CANCEL":
+                continue
+            qty = read_tile_quantity(img, ty + 1, 14, 18)
+            out.append((name, qty))
+        return out
+    if is_pack_item_list_screen(img):
+        out = []
+        for ty in (2, 4, 6, 8, 10):
+            name = read_tile_text(img, ty, 8, 20)
+            if not name or name == "CANCEL" or name.startswith("CANCEL "):
+                continue
+            qty = read_tile_quantity(img, ty + 1, 17, 20)
+            out.append((name, qty))
+        return out
+    return None
+
+
+def read_bag_cursor_row(frame: np.ndarray, tracked_index: Optional[int] = None) -> Optional[str]:
+    """Return the item name (or 'CANCEL') currently highlighted on a Gen 1 or Gen 2 bag item list, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if is_gen1_item_list_screen(img):
+        for ty in (4, 6, 8, 10):
+            if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE]):
+                name = read_tile_text(img, ty, 6, 18)
+                return name if name else None
+        return None
+    if is_pack_item_list_screen(img):
+        rows: List[str] = []
+        for ty in (2, 4, 6, 8, 10):
+            name = read_tile_text(img, ty, 8, 20)
+            if not name:
+                continue
+            row_name = "CANCEL" if (name == "CANCEL" or name.startswith("CANCEL ")) else name
+            rows.append(row_name)
+            if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 7 * TILE_SIZE:8 * TILE_SIZE]):
+                return row_name
+        if not rows:
+            return None
+        desc_box = img[13 * TILE_SIZE:17 * TILE_SIZE, TILE_SIZE:14 * TILE_SIZE]
+        if int((desc_box < DARK_INK).sum()) <= 10:
+            if "CANCEL" in rows:
+                return "CANCEL"
+            return None
+        non_cancel = [r for r in rows if r != "CANCEL"]
+        if len(non_cancel) == 1:
+            return non_cancel[0]
+        line16_hp = read_tile_text(img, 16, 1, 3)
+        line16_num = read_tile_quantity(img, 16, 5, 11)
+        if line16_hp == "HP" and line16_num is not None:
+            candidates = HP_RESTORE_AMOUNT_ITEMS.get(line16_num, ())
+            matches = [r for r in non_cancel if any(c == r or r.startswith(c) or c.startswith(r) for c in candidates)]
+            if len(matches) == 1:
+                return matches[0]
+        if tracked_index is not None and 0 <= tracked_index < len(rows) and rows[tracked_index] != "CANCEL":
+            return rows[tracked_index]
+        if line16_hp != "HP":
+            status_matches = [r for r in non_cancel if not is_healing_item_name(r) or is_status_heal_item_name(r)]
+            if len(status_matches) == 1:
+                return status_matches[0]
+        return non_cancel[0] if non_cancel else None
+    return None

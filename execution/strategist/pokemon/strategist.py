@@ -12,7 +12,8 @@ from tqdm import tqdm
 from execution.artifact import episode_dirs
 from execution.game_api import AgentState, WaitAction
 from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_modal_preview_box,
-                                                 has_player_pokemon_fainted_text, is_battle_defeat_text)
+                                                 has_player_pokemon_fainted_text, is_battle_defeat_text,
+                                                 is_healing_item_name, is_status_heal_item_name)
 from execution.perception.pokemon.tiles import TileRecognizer, describe_state_screen, verbalize_tiles
 from execution.pokemon.executors import CombatExecutor
 from execution.pokemon.supervisors import PokemonPlayThroughSupervisor
@@ -79,7 +80,7 @@ HEALING_ITEM_USED_PATTERN = re.compile(
 HEALING_BAG_EMPTY_PATTERN = re.compile(
     r"(?:No\s+healing\s+item\s+was\s+used\s+in\s+menu"
     r"|bag\s+is\s+empty\s*\(only\s+CANCEL\)"
-    r"|closed\s+the\s+bag\s+without\s+using\s+an\s+item)",
+    r"|closed\s+the\s+bag\s+without\s+using\s+an\s+item;\s*do\s+not\s+choose\s+bag\s+again)",
     re.IGNORECASE,
 )
 
@@ -95,6 +96,13 @@ def is_healing_item_bought_digest(digest: str) -> bool:
 def is_healing_bag_empty_digest(digest: str) -> bool:
     if not digest or is_healing_digest(digest) or is_healing_item_bought_digest(digest):
         return False
+    bag_info = CombatExecutor.extract_bag_items_from_text(digest)
+    if bag_info is not None:
+        bag_items, all_checked = bag_info
+        if any(is_healing_item_name(it) for it in bag_items):
+            return False
+        if all_checked:
+            return True
     if HEALING_BAG_EMPTY_PATTERN.search(digest):
         return True
     if "Text seen along the way, in order:" in digest:
@@ -468,6 +476,30 @@ def sanitize_false_loss_notepad(text: str) -> str:
     return "\n".join(cleaned_lines)
 
 
+def sanitize_stale_notepad_bag_status(text: str, healing_bag_empty: bool) -> str:
+    if not text or healing_bag_empty:
+        return text
+    out = re.sub(
+        r",\s*no\s+(?:usable\s+)?healing\s+items\s+in\s+(?:the\s+)?(?:bag|pack)",
+        ", healing items available in bag",
+        text,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"\bno\s+(?:usable\s+)?healing\s+items\s+in\s+(?:the\s+)?(?:bag|pack)\b",
+        "healing items available in bag",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"\b(?:the\s+)?(?:bag|pack)\s+has\s+no\s+(?:usable\s+)?healing\s+items\b",
+        "healing items available in bag",
+        out,
+        flags=re.IGNORECASE,
+    )
+    return out
+
+
 def treat_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", name)
 
@@ -668,9 +700,20 @@ class PokemonStrategist:
     def _record_party_episode(self, record: EpisodeRecord,
                               strategist_calls: Optional[List[StrategistVLMCallRecord]] = None) -> None:
         digest = record.supervisor_report.digest if record.supervisor_report is not None else ""
+        bag_info = CombatExecutor.extract_bag_items_from_text(digest)
         if is_healing_item_bought_digest(digest):
             self._healing_bag_empty = False
             self._status_heal_bag_empty = False
+        elif bag_info is not None:
+            bag_items, all_checked = bag_info
+            if any(is_healing_item_name(it) for it in bag_items):
+                self._healing_bag_empty = False
+            elif all_checked:
+                self._healing_bag_empty = True
+            if any(is_status_heal_item_name(it) for it in bag_items):
+                self._status_heal_bag_empty = False
+            elif all_checked:
+                self._status_heal_bag_empty = True
         elif is_healing_bag_empty_digest(digest):
             self._healing_bag_empty = True
         if "No status-healing item was used in menu" in digest:
@@ -932,6 +975,10 @@ class PokemonStrategist:
                     self.notepad.text,
                     self.global_map,
                     self._current_segment_blocked_moves(),
+                )
+                sanitized = sanitize_stale_notepad_bag_status(
+                    sanitized,
+                    self._healing_bag_empty,
                 )
                 if sanitized != self.notepad.text:
                     self.notepad.update(sanitized, episode_number=self.start_episode)
@@ -1418,6 +1465,7 @@ class PokemonStrategist:
                 self.global_map,
                 self._current_segment_blocked_moves(),
             )
+            notes = sanitize_stale_notepad_bag_status(notes, self._healing_bag_empty)
         frontier = self.goals.frontier()
         goal_line = goal_path_text(self.goals.path_to(frontier)) if frontier is not None else "(every goal is finished)"
         place = self._current_place()
@@ -1454,6 +1502,7 @@ class PokemonStrategist:
                 self.global_map,
                 self._current_segment_blocked_moves(),
             )
+        notes = sanitize_stale_notepad_bag_status(notes, self._healing_bag_empty)
         if action == "APPEND":
             self.notepad.add(notes, episode_number=n)
         else:
