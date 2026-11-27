@@ -817,14 +817,21 @@ class PokemonStrategist:
         self.party.reconstruct_from_episode(record, strategist_calls)
 
     def _bag_inventory_suffix(self) -> str:
-        if not self._known_bag_items:
-            return ""
-        complete_note = (
-            " (all bag slots checked — do NOT open the Start menu just to search for an item not listed here)"
-            if self._known_bag_complete
-            else ""
-        )
-        return f"\nBag items currently known: {', '.join(self._known_bag_items)}{complete_note}."
+        parts: List[str] = []
+        if self._known_bag_items:
+            complete_note = (
+                " (all bag slots checked — do NOT open the Start menu just to search for an item not listed here)"
+                if self._known_bag_complete
+                else ""
+            )
+            parts.append(f"\nBag items currently known: {', '.join(self._known_bag_items)}{complete_note}.")
+        if getattr(self.party, "learned_moves", None):
+            formatted_moves = self.party.format_learned_moves()
+            parts.append(
+                f"\nParty moves learned / confirmed known: {', '.join(formatted_moves)} "
+                f"(already learned — do NOT instruct the player to open the Pack or ITEM menu to teach {', '.join(self.party.learned_moves)} again)."
+            )
+        return "".join(parts)
 
     def _party_status_block(self) -> str:
         fought = self._fought_since_heal

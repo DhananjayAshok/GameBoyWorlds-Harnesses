@@ -13,7 +13,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_cutscene_frame_changing, is_healing_item_name,
                                                  is_overworld_pack_menu, is_pack_screen,
                                                  is_party_menu_screen, is_status_heal_item_name,
-                                                 read_battle_hud_hp)
+                                                 read_battle_hud_hp, read_move_learning_dialogue_status)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      boundary_exit_direction, cell_kinds, compress_path, edge_cells,
                                                      edge_runs, filter_open_lane_edge_cells, format_path_runs,
@@ -436,6 +436,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
     @_zero_pp_moves.setter
     def _zero_pp_moves(self, value: List[str]) -> None:
         self.party_state.zero_pp_moves = list(value or [])
+
+    @property
+    def _learned_moves(self) -> List[str]:
+        return getattr(self.party_state, "learned_moves", [])
+
+    def _scan_frame_for_party_move_status(self, frame) -> None:
+        st = read_move_learning_dialogue_status(frame)
+        if st is None:
+            return
+        kind, pokemon, move = st
+        if kind in ("learned", "knows"):
+            self.party_state.record_learned_move(move, pokemon, episode_number=self._episode_number)
+        elif kind == "forgot":
+            self.party_state.record_forgotten_move(move, pokemon, episode_number=self._episode_number)
 
     @property
     def _known_bag_items(self) -> List[str]:
@@ -1149,6 +1163,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             and not self._active_pokemon_status
             and not self._zero_pp_moves
             and not self._known_bag_items
+            and not self._learned_moves
         ):
             return ""
         lines: List[str] = []
@@ -1197,6 +1212,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if self._known_bag_items:
             complete_note = " (all bag slots checked)" if self._known_bag_complete else ""
             lines.append(f"Bag items currently known: {', '.join(self._known_bag_items)}{complete_note}.")
+        if self._learned_moves:
+            formatted_moves = self.party_state.format_learned_moves()
+            lines.append(
+                f"Party moves learned / confirmed known: {', '.join(formatted_moves)} "
+                f"(already learned — do NOT open the Pack or ITEM menu to teach {', '.join(self._learned_moves)} again)."
+            )
         return "\n".join(lines)
 
     def _process_combat(self, report: ExecutorReport) -> Dict[str, Any]:
@@ -1497,6 +1518,48 @@ class PokemonPlayThroughSupervisor(Supervisor):
             complete = True
             replan_needed = False
         reached_index = (reached - 1) if (complete and reached is not None) else subgoal_index
+        combined_report_text = f"{text}\n{executor_report}"
+        if (
+            self._is_unconditional_move_teaching_subgoal(subgoal)
+            and "[No move was taught in menu:" in combined_report_text
+            and not self._subgoal_target_move_is_learned(subgoal)
+            and not re.search(r"\[Move (?:taught|already known) in menu:", combined_report_text, re.IGNORECASE)
+        ):
+            if complete or reached_index > subgoal_index:
+                complete = False
+                reached_index = subgoal_index
+                replan_needed = False
+                summary = (
+                    f"{summary} [Note: no move was taught to any party Pokemon before the menu closed — "
+                    f"reopen the menu and complete teaching the move on the party screen.]"
+                )
+        elif (
+            self._is_pure_move_teaching_subgoal(subgoal)
+            and after_state == AgentState.FREE_ROAM
+            and self._subgoal_target_move_is_learned(subgoal)
+            and not complete
+        ):
+            complete = True
+            replan_needed = False
+            learned_str = ", ".join(self.party_state.format_learned_moves())
+            summary = f"{summary} [Note: {learned_str} is already confirmed learned and the menu is closed in free roam.]"
+        elif (
+            not self._is_pure_move_teaching_subgoal(subgoal)
+            and after_state == AgentState.FREE_ROAM
+            and request.startswith("Menu(")
+            and (self._subgoal_target_move_is_learned(request) or self._subgoal_target_move_is_learned(subgoal))
+        ):
+            replan_needed = False
+            if re.search(
+                r"\b(?:without\s+teaching|not\s+(?:yet\s+)?(?:been\s+)?taught|has\s+not\s+learned|no\s+party\s+pok[eé]mon\s+knows)\b",
+                summary,
+                re.IGNORECASE,
+            ):
+                learned_str = ", ".join(self.party_state.format_learned_moves())
+                summary = (
+                    f"{summary} [Note: {learned_str} is already confirmed learned on the party — "
+                    f"do NOT reopen the Pack or ITEM menu to teach it again; interact directly with the obstacle or use the field move.]"
+                )
         if complete and reached_index >= len(self.plan) - 1:
             unfinished_note = self._unfinished_room_exploration_note(subgoal, after_kinds)
             if unfinished_note is None:
@@ -1509,6 +1572,52 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 summary = f"{summary} [Note: {unfinished_note}.]"
         return complete, summary, reached_index, replan_needed
 
+    @staticmethod
+    def _is_move_teaching_subgoal(text: str) -> bool:
+        if not text:
+            return False
+        return bool(
+            re.search(r"\b(?:teach|taught|learn(?:ed)?)\b", text, re.IGNORECASE)
+            and re.search(
+                r"\b(?:hm\s*\d*|tm\s*\d*|tm\s*pocket|pack|bag|item|move|cut|flash|surf|strength|fly|whirlpool|waterfall|rock\s+smash|headbutt)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _is_unconditional_move_teaching_subgoal(cls, text: str) -> bool:
+        if not cls._is_move_teaching_subgoal(text):
+            return False
+        return not bool(
+            re.search(
+                r"\b(?:if\s+(?:present|available|you\s+have|in\s+(?:the\s+)?bag)|check\s+(?:your\s+|the\s+)?(?:item|bag|pack)\b.*\bfor)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _is_pure_move_teaching_subgoal(cls, text: str) -> bool:
+        if not cls._is_move_teaching_subgoal(text):
+            return False
+        return not bool(
+            re.search(
+                r"\b(?:cut\s+down|chop\s+down|walk(?:ed)?\s+(?:to|north|south|east|west|up|down|left|right|past|through|along)"
+                r"|stand(?:ing)?\s+(?:at|below|above|beside|in\s+front)|talk(?:ed)?\s+to|speak|spoken|defeat(?:ed)?)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    def _subgoal_target_move_is_learned(self, text: str) -> bool:
+        if not text or not self._learned_moves:
+            return False
+        for move in self._learned_moves:
+            if re.search(r"\b" + re.escape(move) + r"\b", text, re.IGNORECASE):
+                return True
+        return False
+
     def _reconsider(self, subgoal: str, attempts: List[str], frame) -> Tuple[str, Optional[str], List[str]]:
         prompt = (self._fill_prompt(PLAYTHROUGH_ACHIEVABLE_PROMPT)
                   .replace("[SUBGOAL]", subgoal)
@@ -1517,6 +1626,18 @@ class PokemonPlayThroughSupervisor(Supervisor):
         decision = (parse_key_value(output, "Decision") or "").strip().lower()
         reason = (parse_key_value(output, "Reason") or "").strip()
         subgoals = [line.strip() for line in parse_list(output, "Subgoals") if line.strip()]
+        if (
+            subgoals
+            and self._effective_state(frame) == AgentState.FREE_ROAM
+            and not self._is_in_dialogue(frame)
+            and self._learned_moves
+        ):
+            while (
+                len(subgoals) > 1
+                and self._is_pure_move_teaching_subgoal(subgoals[0])
+                and self._subgoal_target_move_is_learned(subgoals[0])
+            ):
+                subgoals.pop(0)
         if "quit" in decision or not subgoals:
             return "quit", reason or "No new plan was given.", []
         return "replan", None, subgoals
@@ -1766,6 +1887,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return clarified.strip().strip("\"'")
 
     def _menu_objective(self, instruction: str, frame) -> Tuple[str, bool]:
+        self._scan_frame_for_party_move_status(frame)
         state = self._effective_state(frame).name.lower().replace("_", " ")
         hp_line = self._party_hp_block()
         inst_text = f"{instruction}\n({hp_line})" if hp_line else instruction
@@ -1783,6 +1905,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return "\n".join(f"- {tip}" for tip in self._battle_tips)
 
     def _battle_instructions(self, frame) -> str:
+        self._scan_frame_for_party_move_status(frame)
         tips = PLAYTHROUGH_BATTLE_TIPS_BLOCK.replace("[TIPS]", self._tips_text()) if self._battle_tips else ""
         hp_line = self._party_hp_block()
         if hp_line:
@@ -2040,6 +2163,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         earlier["reason"] = later.get("reason")
         if later.get("notes"):
             earlier["notes"] = "\n".join(filter(None, [earlier.get("notes"), later.get("notes")]))
+            earlier["report"].notes = earlier["notes"]
         return earlier
 
     def _handle_interruption(self, *, dialogue_task: str = "clear the dialogue that interrupted what the player was doing",
@@ -2056,6 +2180,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if self._agent_state() == AgentState.IN_MENU:
                 self._settle_menu_state()
             frame = self._current_frame()
+            self._scan_frame_for_party_move_status(frame)
             state = self._effective_state(frame)
             if state == AgentState.FREE_ROAM and combined is not None:
                 break
@@ -2135,10 +2260,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if step_after_settle != step_before_settle and combined is not None:
                     combined["report"].final_state = self._env.get_info()
             next_frame = self._current_frame()
+            self._scan_frame_for_party_move_status(next_frame)
             next_state = self._effective_state(next_frame)
             if next_state == AgentState.FREE_ROAM:
                 break
-            if not handled.get("succeeded") and next_state == state:
+            if (
+                not handled.get("succeeded")
+                and next_state == state
+                and handled.get("reason") not in ("left_battle_to_menu", "left_battle_to_dialogue")
+            ):
                 break
         if combined is None:
             frame = self._current_frame()
@@ -2211,7 +2341,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     @staticmethod
     def _dialogue_snippet(handled: Dict[str, Any], limit: int = 160) -> str:
-        text = " ".join((handled.get("dialogue") or "").split())
+        raw = handled.get("dialogue") or ""
+        if not raw:
+            return ""
+        non_press_lines = [
+            ln.strip()
+            for ln in str(raw).splitlines()
+            if ln.strip() and not ln.strip().lower().startswith("presses:")
+        ]
+        text = " ".join(" ".join(non_press_lines if non_press_lines else [str(raw)]).split())
         return f": \"{text[:limit]}\"" if text else ""
 
     def _clear_pending_dialogue(self, attempts: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
@@ -2532,6 +2670,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     initial_dialogue_crops=seed_crops,
                     initial_battle_instructions=seed_battle_instructions,
                 )
+                combined_text = "\n".join(filter(None, [result.get("dialogue"), handled.get("dialogue")]))
+                if combined_text:
+                    handled["dialogue"] = combined_text
+                combined_notes = "\n".join(filter(None, [result.get("notes"), handled.get("notes")]))
+                if combined_notes:
+                    handled["notes"] = combined_notes
+                    handled["report"].notes = combined_notes
                 if leg_initial_state is not None:
                     handled["report"].initial_state = leg_initial_state
                 after_place = self._record_map_stop()

@@ -82,6 +82,8 @@ class PartyInventoryState(StrategistArtifact):
         active_pokemon_status: Optional[str] = None,
         poison_step_remainder: int = 0,
         zero_pp_moves: Optional[List[str]] = None,
+        learned_moves: Optional[List[str]] = None,
+        learned_move_holders: Optional[Dict[str, str]] = None,
     ) -> None:
         self.items: List[str] = []
         self.quantities: Dict[str, Optional[int]] = {}
@@ -110,6 +112,142 @@ class PartyInventoryState(StrategistArtifact):
         self.active_pokemon_status: Optional[str] = active_pokemon_status or None
         self.poison_step_remainder: int = int(poison_step_remainder)
         self.zero_pp_moves: List[str] = [m for m in (zero_pp_moves or ()) if m]
+        self.learned_moves: List[str] = []
+        self.learned_move_holders: Dict[str, str] = {}
+        for m in (learned_moves or ()):
+            self.record_learned_move(m)
+        for raw_m, raw_p in (learned_move_holders or {}).items():
+            self.record_learned_move(raw_m, raw_p)
+
+    def __setstate__(self, state: dict) -> None:
+        super().__setstate__(state)
+        if not hasattr(self, "learned_moves") or self.learned_moves is None:
+            self.learned_moves = []
+        if not hasattr(self, "learned_move_holders") or self.learned_move_holders is None:
+            self.learned_move_holders = {}
+
+    @staticmethod
+    def normalize_move_name(move_name: Optional[str]) -> str:
+        if not move_name:
+            return ""
+        clean = " ".join(str(move_name).strip().strip('!.?"\'').split()).upper()
+        if len(clean) < 3 or clean in ("NONE", "CANCEL", "YES", "NO", "USE", "QUIT", "TOSS"):
+            return ""
+        if not re.match(r"^[A-Z][A-Z0-9 -]{2,14}$", clean):
+            return ""
+        return clean
+
+    def record_learned_move(
+        self,
+        move_name: Optional[str],
+        pokemon_name: Optional[str] = None,
+        episode_number: Optional[int] = None,
+    ) -> bool:
+        norm_move = self.normalize_move_name(move_name)
+        if not norm_move:
+            return False
+        norm_poke = " ".join(str(pokemon_name or "").strip().strip('!.?"\'').split()).upper()
+        if norm_poke in ("", "ENEMY", "WILD", "FOE"):
+            norm_poke = ""
+        for existing in list(self.learned_moves):
+            ex_holder = self.learned_move_holders.get(existing, "")
+            if existing != norm_move and (not norm_poke or not ex_holder or ex_holder == norm_poke):
+                if norm_move.startswith(existing):
+                    idx = self.learned_moves.index(existing)
+                    self.learned_moves[idx] = norm_move
+                    self.learned_move_holders.pop(existing, None)
+                    if norm_poke:
+                        self.learned_move_holders[norm_move] = norm_poke
+                    elif ex_holder:
+                        self.learned_move_holders[norm_move] = ex_holder
+                    if episode_number is not None:
+                        self.last_written = episode_number
+                    return True
+                if existing.startswith(norm_move):
+                    if norm_poke and not ex_holder:
+                        self.learned_move_holders[existing] = norm_poke
+                    return False
+        if norm_move not in self.learned_moves:
+            self.learned_moves.append(norm_move)
+        if norm_poke:
+            self.learned_move_holders[norm_move] = norm_poke
+        if episode_number is not None:
+            self.last_written = episode_number
+        return True
+
+    def record_forgotten_move(
+        self,
+        move_name: Optional[str],
+        pokemon_name: Optional[str] = None,
+        episode_number: Optional[int] = None,
+    ) -> bool:
+        norm_move = self.normalize_move_name(move_name)
+        if not norm_move:
+            return False
+        norm_poke = " ".join(str(pokemon_name or "").strip().strip('!.?"\'').split()).upper()
+        removed = False
+        for existing in list(self.learned_moves):
+            ex_holder = self.learned_move_holders.get(existing, "")
+            if existing == norm_move or existing.startswith(norm_move):
+                if not norm_poke or not ex_holder or ex_holder == norm_poke:
+                    self.learned_moves.remove(existing)
+                    self.learned_move_holders.pop(existing, None)
+                    removed = True
+        if removed and episode_number is not None:
+            self.last_written = episode_number
+        return removed
+
+    def format_learned_moves(self) -> List[str]:
+        out: List[str] = []
+        for move in getattr(self, "learned_moves", ()) or ():
+            holder = (getattr(self, "learned_move_holders", None) or {}).get(move)
+            out.append(f"{holder} knows {move}" if holder else move)
+        return out
+
+    def update_learned_moves_from_text(
+        self,
+        text: Optional[str],
+        episode_number: Optional[int] = None,
+    ) -> bool:
+        if not text:
+            return False
+        changed = False
+        for m_tag in re.finditer(
+            r"\[Move (?:taught|already known) in menu:\s*([A-Z0-9♀♂.'-]+)\s+(?:learned|knows)\s+([A-Z][A-Z0-9 -]{2,14})\]",
+            text,
+            re.IGNORECASE,
+        ):
+            if self.record_learned_move(m_tag.group(2), m_tag.group(1), episode_number=episode_number):
+                changed = True
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.lower().startswith("presses:") or line.lower().startswith("reasoning:"):
+                continue
+            m_forgot = re.match(
+                r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+forgo(?:t)?\s+([A-Z][A-Z0-9 -]{2,14})[!.]?$",
+                line,
+            )
+            if m_forgot:
+                if self.record_forgotten_move(m_forgot.group(2), m_forgot.group(1), episode_number=episode_number):
+                    changed = True
+                continue
+            m_learn = re.match(
+                r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+(?:learned|(?:already\s+)?knows)\s+([A-Z][A-Z0-9 -]{2,14})[!.]?$",
+                line,
+            )
+            if m_learn:
+                if self.record_learned_move(m_learn.group(2), m_learn.group(1), episode_number=episode_number):
+                    changed = True
+                continue
+            m_field = re.match(
+                r"^(?!Enemy\b|Wild\b|Foe\b)([A-Z][A-Z0-9♀♂.'-]{1,10})\s+used\s+"
+                r"(CUT|FLASH|SURF|STRENGTH|FLY|WHIRLPOOL|WATERFALL|ROCK SMASH|HEADBUTT|DIG|TELEPORT|SOFTBOILED|MILK DRINK|SWEET SCENT)[!.]?$",
+                line,
+            )
+            if m_field:
+                if self.record_learned_move(m_field.group(2), m_field.group(1), episode_number=episode_number):
+                    changed = True
+        return changed
 
     def touch(self, episode_number: Optional[int]) -> None:
         if episode_number is not None:
@@ -759,6 +897,7 @@ class PartyInventoryState(StrategistArtifact):
     def update_from_dialogue_notes(self, notes: Optional[str], episode_number: Optional[int] = None) -> None:
         if not notes:
             return
+        self.update_learned_moves_from_text(notes, episode_number=episode_number)
         if re.search(
             r"\b(?:fighting\s+fit|fully\s+healed|restored\s+(?:your\s+POK[eé]MON\s+)?to\s+full\s+health)\b",
             notes,
@@ -793,6 +932,7 @@ class PartyInventoryState(StrategistArtifact):
         episode_number: Optional[int] = None,
     ) -> None:
         notes = getattr(report, "notes", None) or ""
+        self.update_learned_moves_from_text(notes, episode_number=episode_number)
         self.update_from_bag_notes(notes, getattr(report, "task", None))
         bag_info = self.extract_bag_items_from_text(notes)
         has_remaining_heal = bool(bag_info and any(is_healing_item_name(it) for it in bag_info[0]))
@@ -824,6 +964,7 @@ class PartyInventoryState(StrategistArtifact):
     ) -> None:
         notes = getattr(report, "notes", None) or ""
         task_str = getattr(report, "task", None) or ""
+        self.update_learned_moves_from_text(notes, episode_number=episode_number)
         had_bag_tag = self.update_from_bag_notes(notes, task_str)
         if "No healing item was used in menu" in notes:
             self.mark_healing_bag_empty()
@@ -955,6 +1096,8 @@ class PartyInventoryState(StrategistArtifact):
         if "No status-healing item was used in menu" in digest:
             self.mark_status_heal_bag_empty()
 
+        self.update_learned_moves_from_text(digest, episode_number=getattr(record, "n", None))
+
         if self.is_real_battle_loss(record) or self.is_healing_digest(digest):
             self.record_full_heal(episode_number=record.n)
             return
@@ -1042,4 +1185,5 @@ class PartyInventoryState(StrategistArtifact):
             "last_battle_hp": (old.last_battle_hp, self.last_battle_hp),
             "active_pokemon_status": (old.active_pokemon_status, self.active_pokemon_status),
             "zero_pp_moves": (old.zero_pp_moves, self.zero_pp_moves),
+            "learned_moves": (getattr(old, "learned_moves", []), self.learned_moves),
         }

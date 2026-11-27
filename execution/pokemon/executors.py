@@ -39,6 +39,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  read_move_menu_names, read_move_menu_pp,
                                                  read_party_menu_cursor_slot, read_party_menu_hp,
                                                  read_party_menu_members, read_party_menu_status,
+                                                 read_move_learning_dialogue_status,
                                                  read_party_move_forget_list, read_quantity_selector_value,
                                                  read_tm_hm_pocket_rows)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
@@ -3340,6 +3341,40 @@ Press: <one of up, down, left, right, confirm, back>
                 if self._party_state is not None:
                     self._party_state.record_zero_pp(zero_pp_items)
                 notes_lines.append(f"[Moves at 0 PP: {', '.join(zero_pp_items)}]")
+        move_outcome: Optional[Tuple[str, str, str]] = None
+        for step in self.report.steps:
+            if isinstance(step, EnvironmentStepRecord):
+                for frame in (step.frame_before, step.frame_after):
+                    st = read_move_learning_dialogue_status(frame)
+                    if st is None:
+                        continue
+                    s_kind, s_poke, s_move = st
+                    if s_kind in ("learned", "knows"):
+                        if (
+                            move_outcome is not None
+                            and move_outcome[0] in ("learned", "knows")
+                            and move_outcome[1] == s_poke
+                        ):
+                            p_kind, _, p_move = move_outcome
+                            b_kind = "learned" if "learned" in (p_kind, s_kind) else s_kind
+                            if s_move.startswith(p_move):
+                                move_outcome = (b_kind, s_poke, s_move)
+                            elif p_move.startswith(s_move):
+                                move_outcome = (b_kind, s_poke, p_move)
+                            else:
+                                move_outcome = (s_kind, s_poke, s_move)
+                        else:
+                            move_outcome = (s_kind, s_poke, s_move)
+                        if self._party_state is not None:
+                            self._party_state.record_learned_move(move_outcome[2], s_poke)
+                    elif s_kind == "forgot" and self._party_state is not None:
+                        self._party_state.record_forgotten_move(s_move, s_poke)
+        if move_outcome is not None:
+            m_kind, m_poke, m_move = move_outcome
+            if m_kind == "learned":
+                notes_lines.append(f"[Move taught in menu: {m_poke} learned {m_move}]")
+            elif m_kind == "knows":
+                notes_lines.append(f"[Move already known in menu: {m_poke} knows {m_move}]")
         if self._opened_bag_in_battle:
             all_checked = (
                 self._saw_bag_end
@@ -4031,6 +4066,7 @@ Press: <one of up, down, left, right, confirm, back>
         self._last_auto_scrolled_confirmed_count: Optional[int] = None
         self._quantity_adjusted_in_box: bool = False
         self._completed_tm_hm_party_attempt: bool = False
+        self._last_move_teaching_outcome: Optional[Tuple[str, str, str]] = None
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
@@ -4100,6 +4136,51 @@ Press: <one of up, down, left, right, confirm, back>
 
     def _task_wants_status_heal(self) -> bool:
         return bool(self.STATUS_HEAL_TASK_PATTERN.search(self._task or ""))
+
+    def _task_wants_move_teaching(self) -> bool:
+        raw = self._task or ""
+        if not re.search(r"\b(?:teach|learn)\b", raw, re.IGNORECASE):
+            return False
+        return bool(
+            re.search(
+                r"\b(?:hm\s*\d*|tm\s*\d*|tm\s*pocket|pack|bag|item|move|cut|flash|surf|strength|fly|whirlpool|waterfall|rock\s+smash|headbutt)\b",
+                raw,
+                re.IGNORECASE,
+            )
+        )
+
+    def _scan_move_learning_frame(self, frame: Optional[np.ndarray]) -> Optional[Tuple[str, str, str]]:
+        status_info = read_move_learning_dialogue_status(frame)
+        if status_info is None:
+            return None
+        kind, pokemon, move = status_info
+        if kind in ("learned", "knows"):
+            if (
+                self._last_move_teaching_outcome is not None
+                and self._last_move_teaching_outcome[0] in ("learned", "knows")
+                and self._last_move_teaching_outcome[1] == pokemon
+            ):
+                prev_kind, _, prev_move = self._last_move_teaching_outcome
+                best_kind = "learned" if "learned" in (prev_kind, kind) else kind
+                if move.startswith(prev_move):
+                    self._last_move_teaching_outcome = (best_kind, pokemon, move)
+                elif prev_move.startswith(move):
+                    self._last_move_teaching_outcome = (best_kind, pokemon, prev_move)
+                else:
+                    self._last_move_teaching_outcome = (kind, pokemon, move)
+            else:
+                self._last_move_teaching_outcome = (kind, pokemon, move)
+            self._completed_tm_hm_party_attempt = True
+            if self._party_state is not None:
+                self._party_state.record_learned_move(self._last_move_teaching_outcome[2], pokemon)
+        elif kind == "forgot":
+            if self._party_state is not None:
+                self._party_state.record_forgotten_move(move, pokemon)
+        elif kind == "did_not_learn":
+            if self._last_move_teaching_outcome is None or self._last_move_teaching_outcome[0] == "did_not_learn":
+                self._last_move_teaching_outcome = (kind, pokemon, move)
+            self._completed_tm_hm_party_attempt = False
+        return self._last_move_teaching_outcome
 
     def _task_bag_clause(self) -> str:
         raw = self._task or ""
@@ -4494,6 +4575,23 @@ Press: <one of up, down, left, right, confirm, back>
         if self.dialogue_crops:
             self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
                                                parameters=self._parameters))
+        for step in self.report.steps:
+            if isinstance(step, EnvironmentStepRecord):
+                self._scan_move_learning_frame(step.frame_before)
+                self._scan_move_learning_frame(step.frame_after)
+        if self.dialogue_text:
+            if self._party_state is not None:
+                self._party_state.update_learned_moves_from_text(self.dialogue_text)
+            if self._last_move_teaching_outcome is None or self._last_move_teaching_outcome[0] == "did_not_learn":
+                for raw_line in self.dialogue_text.splitlines():
+                    line = raw_line.strip()
+                    m_learn = re.match(
+                        r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+(learned|(?:already\s+)?knows)\s+([A-Z][A-Z0-9 -]{2,14})[!.]?$",
+                        line,
+                    )
+                    if m_learn:
+                        kind = "learned" if m_learn.group(2).lower() == "learned" else "knows"
+                        self._last_move_teaching_outcome = (kind, m_learn.group(1), m_learn.group(3).strip())
         notes_lines = [f"Presses: {', '.join(self.presses) or 'none'}"]
         if self.dialogue_text:
             notes_lines.append(self.dialogue_text)
@@ -4516,6 +4614,14 @@ Press: <one of up, down, left, right, confirm, back>
             end_note = " (all bag slots checked)" if all_checked else ""
             items_str = ", ".join(self._seen_bag_items) if self._seen_bag_items else "none"
             notes_lines.append(f"[Bag items seen: {items_str}{end_note}]")
+        if self._last_move_teaching_outcome is not None and self._last_move_teaching_outcome[0] in ("learned", "knows"):
+            m_kind, m_poke, m_move = self._last_move_teaching_outcome
+            if m_kind == "learned":
+                notes_lines.append(f"[Move taught in menu: {m_poke} learned {m_move}]")
+            else:
+                notes_lines.append(f"[Move already known in menu: {m_poke} knows {m_move}]")
+        elif self._task_wants_move_teaching():
+            notes_lines.append("[No move was taught in menu: menu closed without teaching the move to any party Pokemon]")
         if (
             self.is_start_menu
             and re.search(r"\b(?:item|bag|potion|restore\s+hp)\b", self._task or "", re.IGNORECASE)
@@ -4609,9 +4715,15 @@ Press: <one of up, down, left, right, confirm, back>
             or is_gen1_item_list_screen(cur_frame)
             or is_start_menu_screen(cur_frame)
         ):
-            lines.append(
-                "Status: TM/HM move teaching on the party screen is finished and the screen has returned to the menu — do NOT press confirm on the item again; press back to close the Pack/Item and Start menus."
-            )
+            if self._last_move_teaching_outcome and self._last_move_teaching_outcome[0] in ("learned", "knows"):
+                _, m_poke, m_move = self._last_move_teaching_outcome
+                lines.append(
+                    f"Status: {m_poke} knows {m_move} (TM/HM move teaching on the party screen is finished and the screen has returned to the menu) — do NOT press confirm on the item again; press back to close the Pack/Item and Start menus."
+                )
+            else:
+                lines.append(
+                    "Status: TM/HM move teaching on the party screen is finished and the screen has returned to the menu — do NOT press confirm on the item again; press back to close the Pack/Item and Start menus."
+                )
         forget_info = read_party_move_forget_list(cur_frame)
         if forget_info is not None:
             f_moves, f_cur = forget_info
@@ -4684,6 +4796,7 @@ Press: <one of up, down, left, right, confirm, back>
             if self._last_terminated or self._last_truncated:
                 return
             frame = self._get_state()["core"]["current_frame"]
+            self._scan_move_learning_frame(frame)
             state = effective_agent_state(self._agent_state(), frame)
             if state != AgentState.IN_MENU:
                 return
@@ -4699,6 +4812,7 @@ Press: <one of up, down, left, right, confirm, back>
                 if self._last_terminated or self._last_truncated:
                     return
                 after_wait = self._get_state()["core"]["current_frame"]
+                self._scan_move_learning_frame(after_wait)
                 state = effective_agent_state(self._agent_state(), after_wait)
                 if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_wait) or has_menu_cursor(after_wait):
                     return
@@ -4707,9 +4821,12 @@ Press: <one of up, down, left, right, confirm, back>
                     continue
             dismiss_rec = self._take_action(MenuAction, menu_action="back")
             drop_prefix_crops(captured_dialogue_crops([dismiss_rec]), self.dialogue_crops)
+            self._scan_move_learning_frame(dismiss_rec.frame_before)
+            self._scan_move_learning_frame(dismiss_rec.frame_after)
             if self._last_terminated or self._last_truncated:
                 return
             after_dismiss = self._get_state()["core"]["current_frame"]
+            self._scan_move_learning_frame(after_dismiss)
             state = effective_agent_state(self._agent_state(), after_dismiss)
             if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_dismiss) or has_menu_cursor(after_dismiss):
                 return
@@ -4987,10 +5104,31 @@ Press: <one of up, down, left, right, confirm, back>
                 self._scan_bag_frame(after_settle)
                 if was_party_menu and not is_party_menu_screen(after_settle):
                     if is_tm_hm_pack_pocket(after_settle) or is_tm_hm_item_name(self._active_menu_item):
-                        self._completed_tm_hm_party_attempt = True
-                        self.press_outcomes[-1] = (
-                            f"{press} (completed TM/HM move teaching on party Pokemon, settled move-learning text, and returned to item menu — do NOT press confirm again; press back to close the Pack/Item and Start menus)"
-                        )
+                        if self._last_move_teaching_outcome and self._last_move_teaching_outcome[0] == "learned":
+                            _, m_poke, m_move = self._last_move_teaching_outcome
+                            self._completed_tm_hm_party_attempt = True
+                            self.press_outcomes[-1] = (
+                                f"{press} ({m_poke} learned {m_move}, settled move-learning text, and returned to item menu — do NOT press confirm again; press back to close the Pack/Item and Start menus)"
+                            )
+                        elif self._last_move_teaching_outcome and self._last_move_teaching_outcome[0] == "knows":
+                            _, m_poke, m_move = self._last_move_teaching_outcome
+                            self._completed_tm_hm_party_attempt = True
+                            self.press_outcomes[-1] = (
+                                f"{press} ({m_poke} already knows {m_move}, settled text, and returned to item menu — do NOT press confirm again; press back to close the Pack/Item and Start menus)"
+                            )
+                        elif (
+                            press == "back"
+                            or (self._last_move_teaching_outcome and self._last_move_teaching_outcome[0] == "did_not_learn")
+                        ):
+                            self._completed_tm_hm_party_attempt = False
+                            self.press_outcomes[-1] = (
+                                f"{press} (returned from party screen to item menu without teaching the move)"
+                            )
+                        else:
+                            self._completed_tm_hm_party_attempt = True
+                            self.press_outcomes[-1] = (
+                                f"{press} (completed TM/HM move teaching on party Pokemon, settled move-learning text, and returned to item menu — do NOT press confirm again; press back to close the Pack/Item and Start menus)"
+                            )
                     elif any(self._bag_target_matches(it) for it in self._seen_bag_items):
                         self.press_outcomes[-1] = (
                             f"{press} (used on party Pokemon, settled healing/effect text, and returned to item menu)"

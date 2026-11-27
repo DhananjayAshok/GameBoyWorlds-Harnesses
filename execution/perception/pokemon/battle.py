@@ -721,11 +721,11 @@ def is_pack_action_subbox_screen(frame: np.ndarray) -> bool:
 
 
 def is_overworld_pack_menu(frame: np.ndarray) -> bool:
-    """Return True if a Generation 2 Pack screen has an overworld-only multi-row action box (3+ options) or quantity selector open."""
+    """Return True if a Generation 2 Pack screen has an overworld-only multi-row action box (3+ options), quantity selector, or TM/HM pocket open."""
     if not is_pack_screen(frame):
         return False
     img = _grey_frame(frame)
-    if has_quantity_selector_box(img):
+    if has_quantity_selector_box(img) or is_tm_hm_pack_pocket(img) or is_tm_hm_startup_dialogue_frame(img):
         return True
     return pack_action_box_height(img) >= 6
 
@@ -1867,4 +1867,33 @@ def read_party_menu_cursor_slot(frame: np.ndarray) -> Optional[int]:
     for idx, ty in enumerate((1, 3, 5, 7, 9, 11)):
         if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]):
             return idx
+    return None
+
+
+def read_move_learning_dialogue_status(frame: np.ndarray) -> Optional[Tuple[str, str, str]]:
+    """Return (status, pokemon_name, move_name) from a move-learning dialogue box ('learned', 'knows', 'forgot', 'did_not_learn'), or None."""
+    if frame is None or not has_bottom_dialogue_box(frame):
+        return None
+    l1, l2 = read_dialogue_box_lines(frame, tx_start=1, tx_end=19)
+    if not l1 or not l2:
+        return None
+    m_learned = re.match(r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+learn(?:ed)?$", l1)
+    if m_learned and re.match(r"^[A-Z][A-Z0-9 -]{2,14}$", l2):
+        return ("learned", m_learned.group(1).strip(), l2.strip())
+    m_knows = re.match(r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+knows$", l1)
+    if m_knows and re.match(r"^[A-Z][A-Z0-9 -]{2,14}$", l2):
+        return ("knows", m_knows.group(1).strip(), l2.strip())
+    m_already = re.match(r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+already$", l1)
+    if m_already:
+        m_k2 = re.match(r"^knows\s+([A-Z][A-Z0-9 -]{2,14})$", l2)
+        if m_k2:
+            return ("knows", m_already.group(1).strip(), m_k2.group(1).strip())
+    m_forgot = re.match(r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+forgo(?:t)?$", l1)
+    if m_forgot and re.match(r"^[A-Z][A-Z0-9 -]{2,14}$", l2):
+        return ("forgot", m_forgot.group(1).strip(), l2.strip())
+    m_did_not = re.match(r"^([A-Z][A-Z0-9♀♂.'-]{1,10})\s+did\s+not$", l1)
+    if m_did_not:
+        m_dn2 = re.match(r"^learn\s+([A-Z][A-Z0-9 -]{2,14})$", l2)
+        if m_dn2:
+            return ("did_not_learn", m_did_not.group(1).strip(), m_dn2.group(1).strip())
     return None
