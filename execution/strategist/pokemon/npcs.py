@@ -974,7 +974,8 @@ class NPCRegistry(StrategistArtifact):
 
     def _sign_at(self, target: Cell, ev: Optional[StepEvent] = None) -> Optional[Cell]:
         g = self._gmap
-        square = (g.pos[0] + target[0], g.pos[1] + target[1])
+        _, rpos = g.resolve(g.segment, g.pos)
+        square = (rpos[0] + target[0], rpos[1] + target[1])
         return square if (self._cell_tags(target, ev) & SIGN_TAGS) else None
 
     def _merge_look_and_npc(self, keep: NPC, drop: NPC) -> NPC:
@@ -1520,13 +1521,19 @@ class NPCRegistry(StrategistArtifact):
             if conv.id not in npc.conversations:
                 npc.conversations.append(conv.id)
             seen = self.last_seen(g, npc)
-            conv.target = seen[1] if seen else None
+            if seen is not None:
+                conv.segment, conv.square = g.resolve(conv.segment, conv.square)
+                conv.target = seen[1]
+            else:
+                conv.target = None
             for extra_id in extra_speakers:
                 extra_npc = self.get(extra_id)
                 if conv.id not in extra_npc.conversations:
                     extra_npc.conversations.append(conv.id)
         elif sign_square is not None:
-            sign = self._sign_for(g.segment, sign_square)
+            rseg, rsq = g.resolve(g.segment, g.pos)
+            conv.segment, conv.square = rseg, rsq
+            sign = self._sign_for(rseg, sign_square)
             conv.sign = sign.id
             if conv.id not in sign.conversations:
                 sign.conversations.append(conv.id)
@@ -1572,7 +1579,8 @@ class NPCRegistry(StrategistArtifact):
         for sign in self.signs.values():
             if g.resolve(sign.segment, sign.square) == here:
                 return sign
-        sign = Sign(id=self._next("sign"), segment=segment, square=square, episode=self._episode)
+        rseg, rsq = here
+        sign = Sign(id=self._next("sign"), segment=rseg, square=rsq, episode=self._episode)
         self.signs[sign.id] = sign
         return sign
 
@@ -1753,8 +1761,8 @@ class NPCRegistry(StrategistArtifact):
                 c.led_to = "free_roam"
                 if c.npc in self.npcs and self.get(c.npc).kind == "trainer":
                     self.get(c.npc).kind = "person"
-            if npc_model._match_item_pickup(merged_text) is not None and c.npc is not None:
-                self._reassign_item_pickup_to_sign(c)
+            if npc_model._match_item_pickup(merged_text) is not None:
+                self._detach_item_pickup_conversation(c)
             self._update_sign_text(c)
             self._attribute_by_text(c)
             self.stats["conversations_read"] += 1
@@ -1791,31 +1799,58 @@ class NPCRegistry(StrategistArtifact):
         self._stack = None
         self.stats["looks_merged"] += 1
 
-    def _reassign_item_pickup_to_sign(self, conv: Conversation) -> None:
+    def _is_item_pickup_conversation(self, conv: Optional[Conversation]) -> bool:
+        return bool(conv is not None and conv.text and npc_model._match_item_pickup(conv.text) is not None)
+
+    def _is_item_pickup_sign(self, sign: Sign) -> bool:
+        convs = [self.conversations[c] for c in sign.conversations if c in self.conversations]
+        if convs and all(self._is_item_pickup_conversation(c) for c in convs):
+            return True
+        if not convs and sign.text and sign.text.strip().lower().startswith("the player found "):
+            return True
+        return False
+
+    def _detach_item_pickup_conversation(self, conv: Conversation) -> None:
         old_npc = self.get(conv.npc) if conv.npc in self.npcs else None
-        target_sq = conv.target or conv.square
-        self._detach_conversation(conv)
-        sign = self._sign_for(conv.segment, target_sq)
-        conv.sign, conv.target, conv.how = sign.id, target_sq, "seen"
-        if conv.id not in sign.conversations:
-            sign.conversations.append(conv.id)
-        sign.episode = max(sign.episode, conv.episode)
+        target_sq = conv.target
+        for npc in self.npcs.values():
+            while conv.id in npc.conversations:
+                npc.conversations.remove(conv.id)
+        for sign_id, sign in list(self.signs.items()):
+            while conv.id in sign.conversations:
+                sign.conversations.remove(conv.id)
+            if not sign.conversations:
+                self.signs.pop(sign_id, None)
+        conv.npc, conv.sign, conv.target, conv.how = None, None, target_sq, "seen"
+        if conv.id in self.unattributed:
+            self.unattributed.remove(conv.id)
         if old_npc is not None and not old_npc.conversations:
             old_npc.needs = None
             if old_npc.hidden == "conversation":
                 self.look_of(old_npc).kind_hint = "object"
                 old_npc.sightings.clear()
 
+    def _reassign_item_pickup_to_sign(self, conv: Conversation) -> None:
+        self._detach_item_pickup_conversation(conv)
+
     def _reconcile_conversations(self) -> None:
         gmap = self._gmap
         if gmap is None:
             return
+        for sign_id, sign in list(self.signs.items()):
+            if self._is_item_pickup_sign(sign):
+                for cid in list(sign.conversations):
+                    c = self.conversations.get(cid)
+                    if c is not None and c.sign == sign_id:
+                        c.sign = None
+                self.signs.pop(sign_id, None)
         convs = sorted(self.conversations.values(), key=lambda c: c.map_step_start)
         for idx, conv in enumerate(convs):
             if conv.trigger == "battle_start":
                 continue
-            if conv.text and npc_model._match_item_pickup(conv.text) is not None and conv.npc is not None:
-                self._reassign_item_pickup_to_sign(conv)
+            if self._is_item_pickup_conversation(conv):
+                if conv.npc is not None or conv.sign is not None or conv.id in self.unattributed:
+                    self._detach_item_pickup_conversation(conv)
                 continue
             rseg, rsq = gmap.resolve(conv.segment, conv.square)
             end_step = conv.map_step_end if conv.map_step_end is not None else conv.map_step_start
@@ -1917,7 +1952,9 @@ class NPCRegistry(StrategistArtifact):
                 if conv.id in self.unattributed:
                     self.unattributed.remove(conv.id)
                 seen = self.last_seen(gmap, npc)
-                conv.target = seen[1] if seen else conv.target
+                if seen is not None:
+                    conv.segment, conv.square = rseg, rsq
+                    conv.target = seen[1]
                 if conv.led_to == "battle" and npc.kind in ("unknown", "person"):
                     npc.kind = "trainer"
                 elif npc.kind == "unknown" and npc_model.is_routine_service_text(conv.text):
@@ -2082,6 +2119,8 @@ class NPCRegistry(StrategistArtifact):
         found = []
         here = gmap.resolve(gmap.segment, gmap.pos)[0]
         for sign in self.signs.values():
+            if self._is_item_pickup_sign(sign):
+                continue
             seg, square = gmap.resolve(sign.segment, sign.square)
             if seg == here and sign.conversations:
                 found.append((sign, square))
@@ -2247,11 +2286,26 @@ class NPCRegistry(StrategistArtifact):
             name = (f'who gave the name "{npc.real_name}"' if npc.real_name
                     else f'labelled "{npc.name}" (the label is {LABEL_NOTE})')
             out[cell] = f'{kind} {name}{facing_note} ({status})'[:320]
+        _, rpos = gmap.resolve(gmap.segment, gmap.pos)
         for sign, square in self.signs_here(gmap):
-            cell = (square[0] - gmap.pos[0], square[1] - gmap.pos[1])
+            cell = (square[0] - rpos[0], square[1] - rpos[1])
             if cell in out:
                 continue
             if LEFT_COL <= cell[0] <= LEFT_COL + 9 and TOP_ROW - 8 <= cell[1] <= TOP_ROW:
+                mcell = seg_cells.get(square)
+                mtags = set(mcell.tags) if (mcell is not None and mcell.tags) else set()
+                live_tags = {
+                    getattr(tile, "tag", None)
+                    for (x, y, _), tile in (self._free_identified or {}).items()
+                    if (x, y) == cell
+                }
+                if (
+                    mcell is not None
+                    and getattr(mcell, "kind", None) == WALKABLE
+                    and not (mtags & SIGN_TAGS)
+                    and not (live_tags & SIGN_TAGS)
+                ):
+                    continue
                 ep, heard = self._sign_heard(sign)
                 said = f': "{heard[:60]}"' if heard else ""
                 out[cell] = f"sign:already inspected in episode {ep}{said}"[:320]

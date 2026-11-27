@@ -775,6 +775,10 @@ def cell_kinds(
         lower = (label or "").lower()
         if "remembered here" in lower or "seen only in part" in lower:
             continue
+        if lower.startswith("sign:"):
+            cell_q = quarter_tags.get(cell, {})
+            if len(cell_q) == 4 and set(cell_q.values()) <= WALKABLE_TAGS:
+                continue
         confirmed_occupied.add(cell)
     empirical_blocked = set(blocked_cells or ())
     kinds = {}

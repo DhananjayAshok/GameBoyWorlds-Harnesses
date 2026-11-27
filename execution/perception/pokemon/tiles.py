@@ -361,6 +361,10 @@ def verbalize_tiles(
             continue
         if isinstance(label, str) and label.startswith("sign:"):
             sign_note = label[len("sign:"):].strip()
+            if kinds is not None and kinds.get(cell) == WALKABLE and not any(
+                tag in by_cell.get(cell, {}) for tag in SIGN_OBJECT_TAGS
+            ):
+                continue
             cell_entries = by_cell.setdefault(cell, {})
             matched = False
             for tag in SIGN_OBJECT_TAGS:
