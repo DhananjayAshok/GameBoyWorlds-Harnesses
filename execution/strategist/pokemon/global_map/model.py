@@ -15,6 +15,7 @@ from execution.perception.pokemon.battle import (
     has_bottom_location_banner,
     has_modal_preview_box,
     is_battle_screen,
+    is_wavy_scanline_wipe_against,
 )
 from execution.perception.pokemon.grid import GRID_SKIP
 from execution.perception.pokemon.navigation import (LEDGE_LEFT, LEDGE_TAGS, OVERHANG_TOP_TAGS, WALKABLE_TAGS,
@@ -1513,6 +1514,8 @@ class GlobalMap(StrategistArtifact):
             and (int(piece.min()) > BLACK_LEVEL or np.any((piece > BLACK_LEVEL) & (piece < WHITE_LEVEL)))
         )
         if cells_by_xy and mid_tone < MIN_MID_TONE_CELLS:
+            return True
+        if self.anchor is not None and is_wavy_scanline_wipe_against(self.anchor, a):
             return True
         return False
 

@@ -16,6 +16,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_battle_defeat_text, is_battle_menu_crop,
                                                  is_battle_screen, is_blank_or_fade_frame,
                                                  is_cutscene_frame_changing,
+                                                 is_screen_wide_cutscene_change,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
                                                  is_gen1_item_list_screen, is_move_selection_screen,
                                                  is_no_pp_dialogue_frame, is_overworld_pack_menu,
@@ -328,6 +329,8 @@ def settle_overworld_free_roam(
         if overlay_or_emote_now:
             saw_overlay_or_fade = True
         frame_changing = is_cutscene_frame_changing(before_frame, after_frame)
+        if frame_changing and is_screen_wide_cutscene_change(before_frame, after_frame):
+            saw_overlay_or_fade = True
         active_now = frame_changing or overlay_or_emote_now
         if active_now:
             saw_activity = True

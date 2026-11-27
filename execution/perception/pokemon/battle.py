@@ -166,8 +166,18 @@ CUTSCENE_TILE_MIN_PIXELS = 7
 CUTSCENE_MAX_TILE_SHIFT = 2
 CUTSCENE_DIFF_MIN_PIXELS = 45
 CUTSCENE_PLAYER_SPIN_MIN_PIXELS = 40
+CUTSCENE_MEAN_SHIFT_MAX = 18.0
+CUTSCENE_SCREEN_WIDE_MIN_TILES = 20
+CUTSCENE_SCREEN_WIDE_MIN_PIXELS = 450
 FADE_UPPER_BOTTOM = 88
 FADE_MAX_RANGE = 16
+FADE_SPRITE_MAX_P95 = 230
+WAVY_WIPE_MAX_SHIFT = 48
+WAVY_WIPE_ROW_TOLERANCE = 24
+WAVY_WIPE_ROW_MATCH_FRACTION = 0.78
+WAVY_WIPE_MIN_MATCHED_ROWS_FRACTION = 0.65
+WAVY_WIPE_MAX_UNIFORM_ROWS_FRACTION = 0.45
+WAVY_WIPE_MIN_SPREAD_ROWS_FRACTION = 0.35
 
 
 def is_blank_or_fade_frame(frame: np.ndarray) -> bool:
@@ -178,7 +188,56 @@ def is_blank_or_fade_frame(frame: np.ndarray) -> bool:
     if img.shape[0] < FADE_UPPER_BOTTOM:
         return False
     upper = img[:FADE_UPPER_BOTTOM, :]
-    return int(upper.max()) - int(upper.min()) <= FADE_MAX_RANGE
+    if int(upper.max()) - int(upper.min()) <= FADE_MAX_RANGE:
+        return True
+    p5, p95 = np.percentile(upper, (5, 95))
+    return bool((p95 - p5) <= FADE_MAX_RANGE and p95 < FADE_SPRITE_MAX_P95)
+
+
+def is_wavy_scanline_wipe_against(ref_frame: np.ndarray, cur_frame: np.ndarray) -> bool:
+    """Return True if cur_frame is a horizontal wavy scanline-shifted battle-wipe distortion of ref_frame."""
+    if ref_frame is None or cur_frame is None:
+        return False
+    ref_full = _grey_frame(ref_frame).astype(np.int16)
+    cur_full = _grey_frame(cur_frame).astype(np.int16)
+    if ref_full.shape != cur_full.shape or ref_full.shape[0] < FADE_UPPER_BOTTOM:
+        return False
+    H = FADE_UPPER_BOTTOM
+    cur = cur_full[:H, :]
+    n_shifts = 2 * WAVY_WIPE_MAX_SHIFT + 1
+    for vy in (0, -16, 16):
+        if vy == 0:
+            ref = ref_full[:H, :]
+            c_sub = cur
+            y_len = H
+        elif vy > 0:
+            ref = ref_full[vy:H, :]
+            c_sub = cur[:H - vy, :]
+            y_len = H - vy
+        else:
+            va = -vy
+            ref = ref_full[:H - va, :]
+            c_sub = cur[va:H, :]
+            y_len = H - va
+        match_mat = np.zeros((n_shifts, y_len), dtype=bool)
+        for idx_s, s in enumerate(range(-WAVY_WIPE_MAX_SHIFT, WAVY_WIPE_MAX_SHIFT + 1)):
+            if s == 0:
+                m = np.mean(np.abs(c_sub - ref) <= WAVY_WIPE_ROW_TOLERANCE, axis=1)
+            elif s > 0:
+                m = np.mean(np.abs(c_sub[:, s:] - ref[:, :-s]) <= WAVY_WIPE_ROW_TOLERANCE, axis=1)
+            else:
+                sa = -s
+                m = np.mean(np.abs(c_sub[:, :-sa] - ref[:, sa:]) <= WAVY_WIPE_ROW_TOLERANCE, axis=1)
+            match_mat[idx_s] = m >= WAVY_WIPE_ROW_MATCH_FRACTION
+        best_uniform = int(match_mat.sum(axis=1).max())
+        per_row_matched = int(match_mat.any(axis=0).sum())
+        if (
+            per_row_matched >= int(WAVY_WIPE_MIN_MATCHED_ROWS_FRACTION * y_len)
+            and best_uniform <= int(WAVY_WIPE_MAX_UNIFORM_ROWS_FRACTION * y_len)
+            and (per_row_matched - best_uniform) >= int(WAVY_WIPE_MIN_SPREAD_ROWS_FRACTION * y_len)
+        ):
+            return True
+    return False
 
 
 def has_bottom_dialogue_box(frame: np.ndarray) -> bool:
@@ -212,14 +271,14 @@ def has_bottom_dialogue_box(frame: np.ndarray) -> bool:
     return True
 
 
-def is_cutscene_frame_changing(
+def _evaluate_cutscene_frame_change(
     earlier: np.ndarray, later: np.ndarray, ignore_player_box: bool = False
-) -> bool:
-    """Return True if sprite movement, emote animation, or box transitions changed between frames."""
+) -> Tuple[bool, bool]:
+    """Return (is_changing, is_screen_wide) between two overworld frames."""
     if earlier is None or later is None or earlier.shape != later.shape:
-        return False
+        return False, False
     if np.array_equal(earlier, later):
-        return False
+        return False, False
     a = _grey_frame(earlier).astype(int)
     b = _grey_frame(later).astype(int)
     diff = np.abs(a - b) > CUTSCENE_DIFF_THRESHOLD
@@ -228,11 +287,14 @@ def is_cutscene_frame_changing(
         diff[56:80, 64:80] = False
     raw_sum = int(diff.sum())
     if raw_sum < CUTSCENE_DIFF_MIN_PIXELS:
-        return False
+        return False, False
+    if is_wavy_scanline_wipe_against(earlier, later):
+        return True, True
     n_rows = (diff.shape[0] // TILE_SIZE) * TILE_SIZE
     n_cols = (diff.shape[1] // TILE_SIZE) * TILE_SIZE
     if n_rows == 0 or n_cols == 0:
-        return raw_sum >= CUTSCENE_DIFF_MIN_PIXELS
+        changing = raw_sum >= CUTSCENE_DIFF_MIN_PIXELS
+        return changing, raw_sum >= CUTSCENE_SCREEN_WIDE_MIN_PIXELS
     ty, tx = n_rows // TILE_SIZE, n_cols // TILE_SIZE
 
     a_tiles = a[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).swapaxes(1, 2)
@@ -250,7 +312,11 @@ def is_cutscene_frame_changing(
             tile_diff = np.abs(at - bt) > CUTSCENE_DIFF_THRESHOLD
             if not np.any(tile_diff):
                 continue
-            if int(bt.max()) - int(bt.min()) <= CUTSCENE_DIFF_THRESHOLD:
+            if (
+                int(at.max()) - int(at.min()) <= CUTSCENE_DIFF_THRESHOLD
+                or int(bt.max()) - int(bt.min()) <= CUTSCENE_DIFF_THRESHOLD
+                or abs(float(at.mean()) - float(bt.mean())) > CUTSCENE_MEAN_SHIFT_MAX
+            ):
                 continue
             for s in range(1, TILE_SIZE):
                 if not np.any(np.abs(np.roll(at, s, axis=1) - bt) > CUTSCENE_DIFF_THRESHOLD):
@@ -286,6 +352,12 @@ def is_cutscene_frame_changing(
                     continue
                 at = a_tiles[iy, ix]
                 bt = b_tiles[iy, ix]
+                if (
+                    int(at.max()) - int(at.min()) <= CUTSCENE_DIFF_THRESHOLD
+                    or int(bt.max()) - int(bt.min()) <= CUTSCENE_DIFF_THRESHOLD
+                    or abs(float(at.mean()) - float(bt.mean())) > CUTSCENE_MEAN_SHIFT_MAX
+                ):
+                    continue
                 bg_pixel_match = np.zeros((TILE_SIZE, TILE_SIZE), dtype=bool)
                 for a_bg, b_bg in bg_anim_pairs:
                     bg_changed = np.abs(a_bg - b_bg) > CUTSCENE_DIFF_THRESHOLD
@@ -305,7 +377,7 @@ def is_cutscene_frame_changing(
         diff = diff & ~bg_mask
 
     if int(diff.sum()) < CUTSCENE_DIFF_MIN_PIXELS:
-        return False
+        return False, False
 
     t_min = diff[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
     for d in range(1, CUTSCENE_MAX_TILE_SHIFT + 1):
@@ -342,13 +414,35 @@ def is_cutscene_frame_changing(
             td = diff_d[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             t_min = np.minimum(t_min, np.minimum(tu, td))
 
-    if int(t_min[t_min >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_DIFF_MIN_PIXELS:
-        return True
-    if not ignore_player_box:
+    sig_tiles = t_min >= CUTSCENE_TILE_MIN_PIXELS
+    n_sig_tiles = int(sig_tiles.sum())
+    sig_sum = int(t_min[sig_tiles].sum())
+    changing = sig_sum >= CUTSCENE_DIFF_MIN_PIXELS
+    if not changing and not ignore_player_box:
         player_tiles = t_min[7:10, 8:10]
         if int(player_tiles[player_tiles >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_PLAYER_SPIN_MIN_PIXELS:
-            return True
-    return False
+            changing = True
+    screen_wide = changing and (
+        n_sig_tiles >= CUTSCENE_SCREEN_WIDE_MIN_TILES
+        or sig_sum >= CUTSCENE_SCREEN_WIDE_MIN_PIXELS
+    )
+    return changing, screen_wide
+
+
+def is_cutscene_frame_changing(
+    earlier: np.ndarray, later: np.ndarray, ignore_player_box: bool = False
+) -> bool:
+    """Return True if sprite movement, emote animation, or box transitions changed between frames."""
+    changing, _ = _evaluate_cutscene_frame_change(earlier, later, ignore_player_box=ignore_player_box)
+    return changing
+
+
+def is_screen_wide_cutscene_change(
+    earlier: np.ndarray, later: np.ndarray, ignore_player_box: bool = False
+) -> bool:
+    """Return True if a screen-wide palette flash, battle wipe, or camera scroll occurred between frames."""
+    _, screen_wide = _evaluate_cutscene_frame_change(earlier, later, ignore_player_box=ignore_player_box)
+    return screen_wide
 
 
 BANNER_TOP = 112
