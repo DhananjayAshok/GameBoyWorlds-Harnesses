@@ -2124,7 +2124,7 @@ Choose what to do next:
 - fight: attack, and say which of the four moves to use (1 is the top one)
 - progress: press through battle text, or continue when there is no choice to make
 - run: try to escape. This never works against another trainer
-- bag: open the bag to use an item; choose this in a trainer battle when your active Pokemon's HP is critically low (at or below ~35-50% of max HP) and you cannot safely knock out the opponent first, unless a note below says the bag has no usable item
+- bag: open the bag to use an item; choose this in a trainer battle whenever your active Pokemon's HP is at or below 50% of max HP (do not gamble on knocking out the opponent first when your HP is at or below 50%), unless a note below says the bag has no usable item
 - pokemon: open your team to switch; only choose it if switching is needed
 
 Respond in exactly this format:
@@ -2161,6 +2161,7 @@ The image is the current screen.
 [HISTORY]
 Choose the single button press that best moves towards completing this menu or choice box so the battle can continue (or press back to cancel and return to the battle menu if nothing is needed here).
 If you opened the bag/pack to heal your active Pokemon:
+- Check the description box at the bottom of the Pack/Item screen to see which row the cursor is currently on (when the cursor is on an item, the bottom box describes that item, e.g. "Restores POKeMON HP by 20."; when the bottom description box is blank while items are listed above CANCEL, the cursor is on CANCEL—press up to move the cursor onto an item instead of pressing confirm on CANCEL).
 - Check your active Pokemon's current/max HP and missing HP shown below: when your active Pokemon is missing 30 or more HP and a stronger healing item (such as one restoring 50 HP instead of 20 HP) is listed in the bag, move the cursor to the stronger healing item and press confirm so you recover enough HP to survive the opponent's next hit in one turn.
 - Once the 2-option USE / QUIT action box opens on the healing item, press confirm on USE.
 - Once the party selection screen opens, move the cursor to the Pokemon that needs healing (usually your active lead Pokemon at the top) and press confirm to use the item on it.
@@ -2562,9 +2563,16 @@ Press: <one of up, down, left, right, confirm, back>
         if live_hp is not None:
             cur_hp, max_hp = live_hp
             deficit = max(0, max_hp - cur_hp)
+            pct = int(round(100.0 * cur_hp / max_hp)) if max_hp > 0 else 100
             status_suffix = f", status: {live_status}" if live_status else ""
+            low_hp_note = ""
+            if max_hp > 0 and cur_hp * 2 <= max_hp and not self._bag_unavailable:
+                low_hp_note = (
+                    " — LOW HP (<= 50% max HP): in a trainer battle, choose bag to heal now "
+                    "rather than gambling on fight"
+                )
             lines.append(
-                f"Active Pokemon HP: {cur_hp}/{max_hp} HP (missing {deficit} HP{status_suffix})."
+                f"Active Pokemon HP: {cur_hp}/{max_hp} HP ({pct}%, missing {deficit} HP{status_suffix}){low_hp_note}."
             )
         elif live_status:
             lines.append(f"Active Pokemon status: {live_status}.")
@@ -3003,11 +3011,19 @@ Press: <one of up, down, left, right, confirm, back>
                         or is_battle_command_menu(self._current_frame())
                     ):
                         self._in_bag_menu = False
+                        bag_before = read_bag_item_list(frame)
+                        had_bag_items = bool(bag_before and bag_before[0])
                         if (presses == 0
                                 and self._agent_state() == AgentState.IN_BATTLE
                                 and is_battle_decision_screen(self._current_frame())):
-                            self._bag_unavailable = True
-                            entry += " (closed the bag without using an item; do not choose bag again)"
+                            if press == "confirm" and had_bag_items:
+                                entry += (
+                                    " (cursor was on CANCEL so confirm closed the bag without using an item; "
+                                    "items are still available in the bag)"
+                                )
+                            else:
+                                self._bag_unavailable = True
+                                entry += " (closed the bag without using an item; do not choose bag again)"
                     if self._in_pokemon_menu and (
                         self._agent_state() != AgentState.IN_MENU
                         or is_battle_command_menu(self._current_frame())
