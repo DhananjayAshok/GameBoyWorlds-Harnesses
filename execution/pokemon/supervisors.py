@@ -203,6 +203,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._max_total_calls = max(self.MAX_TOTAL_EXECUTOR_CALLS, max_steps * 3)
         self._start_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self._leg_stops: List[Tuple[int, Tuple[int, int]]] = []
+        self._leg_departures: List[Tuple[Tuple[int, Tuple[int, int]], str, Tuple[int, Tuple[int, int]]]] = []
         self._blocked_moves: Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]] = {
             k: {d: list(notes) for d, notes in by_dir.items()}
             for k, by_dir in (initial_blocked_moves or {}).items()
@@ -337,13 +338,39 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 return g[0] < gx_min
             return g[0] > gx_max
 
+        door_leads: Dict[Tuple[int, int], Optional[int]] = {}
+        if hasattr(gmap, "reachable_door_list"):
+            try:
+                for d in gmap.reachable_door_list(cur_seg):
+                    for cell in d.get("cells", ()):
+                        door_leads[cell] = d.get("leads_to")
+            except Exception:  # noqa: BLE001
+                door_leads = {}
+
+        def _is_open_door_cell(g: Tuple[int, int], c: Any) -> bool:
+            if c is None or not is_door(c):
+                return False
+            if g not in door_leads:
+                return True
+            leads = door_leads[g]
+            if leads is None:
+                return True
+            try:
+                if getattr(gmap.info(leads), "explored", None) is not None and not gmap.frontier(leads):
+                    return False
+                if hasattr(gmap, "branch_exploration") and gmap.branch_exploration(cur_seg, leads).get("exhausted"):
+                    return False
+            except Exception:  # noqa: BLE001
+                return True
+            return True
+
         seeds = []
         for lx, ly in run_cells:
             eg = (px + lx, py + ly)
             if eg in blocked_targets:
                 continue
             c = seg.get(eg)
-            if c is None or c.kind == UNKNOWN or is_door(c):
+            if c is None or c.kind == UNKNOWN or _is_open_door_cell(eg, c):
                 return None
             if c.kind == WALKABLE:
                 seeds.append(eg)
@@ -360,7 +387,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if strictly_beyond(cur):
                 beyond_cells.add(cur)
             c = seg.get(cur)
-            if c is not None and is_door(c):
+            if _is_open_door_cell(cur, c):
                 half_plane_open = True
                 break
             cur_blocked_dirs = seg_blocked_moves.get(cur, set())
@@ -375,18 +402,18 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         continue
                 if not in_half_plane(nxt):
                     nc = seg.get(nxt)
-                    if nc is None or nc.kind in (WALKABLE, UNKNOWN) or is_door(nc):
+                    if nc is None or nc.kind in (WALKABLE, UNKNOWN) or _is_open_door_cell(nxt, nc):
                         half_plane_open = True
                         break
                     continue
                 nc = seg.get(nxt)
-                if nc is None or nc.kind == UNKNOWN or is_door(nc):
+                if nc is None or nc.kind == UNKNOWN or _is_open_door_cell(nxt, nc):
                     half_plane_open = True
                     break
                 if nc.kind == WALKABLE and nxt not in visited:
                     visited.add(nxt)
                     queue.append(nxt)
-                    if len(visited) > 60:
+                    if len(visited) > 80:
                         half_plane_open = True
                         break
             if half_plane_open:
@@ -413,7 +440,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if strictly_beyond(cur):
                     beyond2.add(cur)
                 c = seg.get(cur)
-                if c is not None and is_door(c):
+                if _is_open_door_cell(cur, c):
                     open2 = True
                     break
                 cur_blocked_dirs = seg_blocked_moves.get(cur, set())
@@ -424,7 +451,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     if nxt in blocked_targets or not in_forward_offset(nxt):
                         continue
                     nc = seg.get(nxt)
-                    if nc is None or nc.kind == UNKNOWN or is_door(nc):
+                    if nc is None or nc.kind == UNKNOWN or _is_open_door_cell(nxt, nc):
                         open2 = True
                         break
                     if nc.kind == WALKABLE and nxt not in visited2:
@@ -560,6 +587,22 @@ class PokemonPlayThroughSupervisor(Supervisor):
             lines.append(
                 f"Leg positions visited in this area during this episode: {trail_str} "
                 f"(x span [{min(xs)}, {max(xs)}], y span [{min(ys)}, {max(ys)}])."
+            )
+        prior_departures = []
+        for dep_place, dep_req, dst_place in self._leg_departures:
+            try:
+                d_seg, d_pos = gmap.resolve(dep_place[0], dep_place[1])
+                t_seg, t_pos = gmap.resolve(dst_place[0], dst_place[1])
+            except Exception:  # noqa: BLE001
+                continue
+            if d_seg == cur_seg and d_pos == cur_pos and (d_seg, d_pos) != (t_seg, t_pos):
+                entry = f"{dep_req} -> {t_pos}" if t_seg == cur_seg else f"{dep_req} -> entered another area"
+                if entry not in prior_departures:
+                    prior_departures.append(entry)
+        if prior_departures:
+            lines.append(
+                f"Actions already taken from your current coordinate {cur_pos} earlier in this episode "
+                f"(do NOT repeat a leg that led into a dead-end pocket): {'; '.join(prior_departures)}."
             )
         seg_blocked_moves = self._current_segment_blocked_moves()
         lines.append(
@@ -1461,6 +1504,33 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if len(coords) == 1:
                 old_c = coords[0]
                 new_c = (old_c[0] - dx, old_c[1] - dy)
+                wants_warp = bool(
+                    re.search(
+                        r"(?:ladder|stair(?:s|case)?|door(?:way)?|entrance|exit|elevator|warp)",
+                        current_task,
+                        re.IGNORECASE,
+                    )
+                )
+                if wants_warp:
+                    frame_now = self._current_frame()
+                    self._perceive(frame_now)
+                    kinds_now = self._current_local_kinds() or {}
+                    warps_now = warp_cells(identified=self._identified, global_map=gmap) - {(0, 0)}
+                    if new_c not in warps_now:
+                        nearby_warps = sorted(
+                            (
+                                abs(wx - new_c[0]) + abs(wy - new_c[1]),
+                                abs(wx) + abs(wy),
+                                (wx, wy),
+                            )
+                            for (wx, wy) in warps_now
+                            if abs(wx - new_c[0]) + abs(wy - new_c[1]) <= 2
+                            and shortest_path(kinds_now, (0, 0), [(wx, wy)], people=self._people_now()) is not None
+                        )
+                        if nearby_warps:
+                            new_c = nearby_warps[0][2]
+                        elif new_c == (0, 0):
+                            return False, None, False
                 if new_c == (0, 0):
                     return False, None, True
                 if in_bounds(new_c):
@@ -2012,6 +2082,19 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if not is_move_action or not handled.get("succeeded"):
                     failed_attempts += 1
                 continue
+
+            if (
+                not result["succeeded"]
+                and is_move_action
+                and before_place is not None
+                and after_place is not None
+                and before_place[0] != after_place[0]
+            ):
+                result["succeeded"] = True
+                result["reason"] = "arrived"
+
+            if is_move_action and before_place is not None and after_place is not None and before_place != after_place:
+                self._leg_departures.append((before_place, request, after_place))
 
             if not result["succeeded"]:
                 if is_move_action and not result["report"].steps and self._calls > 0:

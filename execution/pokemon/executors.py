@@ -1155,7 +1155,11 @@ class GridMoveExecutor(PolicyExecutor):
                     return self._fail(MOVE_INTERRUPTED, "move_interrupted",
                                       f"Left free roam after {taken} steps {direction}: {state.name}")
                 settled_place = self._current_map_place()
-                if before_place is not None and settled_place is not None and settled_place[0] != before_place[0]:
+                if (
+                    (before_place is not None and settled_place is not None and settled_place[0] != before_place[0])
+                    or bool(getattr(getattr(self._env, "_map", None), "faded", False))
+                    or int(getattr(getattr(self._env, "_map", None), "lost", 0) or 0) > 0
+                ):
                     return None
                 if ((step_moved_screen or self._saw_cutscene_activity)
                         and not retried_after_cutscene

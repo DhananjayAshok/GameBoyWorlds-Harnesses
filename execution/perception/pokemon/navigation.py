@@ -1426,8 +1426,32 @@ def run_pocket_bounds(
     gx_min, gx_max = px + min(X_RANGE), px + max(X_RANGE)
     gy_min, gy_max = py + min(Y_RANGE), py + max(Y_RANGE)
 
-    def _is_door_cell(c: Any) -> bool:
-        return bool(set(getattr(c, "tags", ())) & (WARP_TAGS | {"elevator"}))
+    cur_seg = global_map.resolve(global_map.segment, (0, 0))[0]
+    door_leads: Dict[Cell, Optional[int]] = {}
+    if hasattr(global_map, "reachable_door_list"):
+        try:
+            for d in global_map.reachable_door_list(cur_seg):
+                for cell in d.get("cells", ()):
+                    door_leads[cell] = d.get("leads_to")
+        except Exception:  # noqa: BLE001
+            door_leads = {}
+
+    def _is_door_cell(g: Cell, c: Any) -> bool:
+        if c is None or not bool(set(getattr(c, "tags", ())) & (WARP_TAGS | {"elevator"})):
+            return False
+        if g not in door_leads:
+            return True
+        leads = door_leads[g]
+        if leads is None:
+            return True
+        try:
+            if getattr(global_map.info(leads), "explored", None) is not None and not global_map.frontier(leads):
+                return False
+            if hasattr(global_map, "branch_exploration") and global_map.branch_exploration(cur_seg, leads).get("exhausted"):
+                return False
+        except Exception:  # noqa: BLE001
+            return True
+        return True
 
     def in_screen(g: Cell) -> bool:
         return gx_min <= g[0] <= gx_max and gy_min <= g[1] <= gy_max
@@ -1454,7 +1478,7 @@ def run_pocket_bounds(
     for lx, ly in run_cells:
         eg = (px + lx, py + ly)
         c = seg.get(eg)
-        if c is None or getattr(c, "kind", None) == "unknown" or _is_door_cell(c):
+        if c is None or getattr(c, "kind", None) == "unknown" or _is_door_cell(eg, c):
             return None
         if getattr(c, "kind", None) == WALKABLE:
             seeds.append(eg)
@@ -1471,7 +1495,7 @@ def run_pocket_bounds(
         if strictly_beyond(cur):
             beyond_cells.add(cur)
         c = seg.get(cur)
-        if c is not None and _is_door_cell(c):
+        if c is not None and _is_door_cell(cur, c):
             half_plane_open = True
             break
         for _, (nx_d, ny_d) in DIRECTIONS.items():
@@ -1481,18 +1505,18 @@ def run_pocket_bounds(
                     continue
             if not in_half_plane(nxt):
                 nc = seg.get(nxt)
-                if nc is None or getattr(nc, "kind", None) in (WALKABLE, "unknown") or _is_door_cell(nc):
+                if nc is None or getattr(nc, "kind", None) in (WALKABLE, "unknown") or _is_door_cell(nxt, nc):
                     half_plane_open = True
                     break
                 continue
             nc = seg.get(nxt)
-            if nc is None or getattr(nc, "kind", None) == "unknown" or _is_door_cell(nc):
+            if nc is None or getattr(nc, "kind", None) == "unknown" or _is_door_cell(nxt, nc):
                 half_plane_open = True
                 break
             if getattr(nc, "kind", None) == WALKABLE and nxt not in visited:
                 visited.add(nxt)
                 queue.append(nxt)
-                if len(visited) > 60:
+                if len(visited) > 80:
                     half_plane_open = True
                     break
         if half_plane_open:
@@ -1519,7 +1543,7 @@ def run_pocket_bounds(
             if strictly_beyond(cur):
                 beyond2.add(cur)
             c = seg.get(cur)
-            if c is not None and _is_door_cell(c):
+            if c is not None and _is_door_cell(cur, c):
                 open2 = True
                 break
             for _, (nx_d, ny_d) in DIRECTIONS.items():
@@ -1527,7 +1551,7 @@ def run_pocket_bounds(
                 if not in_forward_offset(nxt):
                     continue
                 nc = seg.get(nxt)
-                if nc is None or getattr(nc, "kind", None) == "unknown" or _is_door_cell(nc):
+                if nc is None or getattr(nc, "kind", None) == "unknown" or _is_door_cell(nxt, nc):
                     open2 = True
                     break
                 if getattr(nc, "kind", None) == WALKABLE and nxt not in visited2:
