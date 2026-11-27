@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
-from .routes import plan_route
-from .text import (LEGEND, ascii_window, blocked_moves_lines, door_lines, elsewhere_lines, frontier_targets,
-                   route_lines)
+from .routes import _snap, compress_moves, path_in_segment, plan_route, walked_squares
+from .text import (LEGEND, _mapped_paths_from_start, _obstacle_detour_info, ascii_window, blocked_moves_lines,
+                   door_lines, elsewhere_lines, frontier_targets, project_route_next_leg, route_lines, sector)
 
 if TYPE_CHECKING:
     from .model import Cell, GlobalMap
@@ -160,17 +160,102 @@ def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
     else:
         lines.append("Every reachable edge of this area has been explored; the way on is a door, "
                      "stairs or a path you have not tried.")
+    px, py = gmap.pos
+    walked_here = walked_squares(gmap, gmap.segment)
+    reached_here = _mapped_paths_from_start(gmap, blocked_moves=blocked_moves, local_kinds=local_kinds)
+    unentered_door_routes: List[Dict[str, Any]] = []
+    for door in gmap.reachable_door_list():
+        if door.get("leads_to") is not None:
+            continue
+        goal_cell = min(door["cells"], key=lambda g: abs(g[0] - px) + abs(g[1] - py))
+        dx, dy = goal_cell[0] - px, goal_cell[1] - py
+        snapped = _snap(gmap, gmap.segment, goal_cell, walked_here)
+        found = (
+            path_in_segment(gmap, gmap.segment, (px, py), snapped, walked_here, blocked_moves=blocked_moves)
+            if snapped is not None
+            else None
+        )
+        p_moves = compress_moves(found[1]) if (found is not None and found[1]) else None
+        p_steps = len(found[1]) if found is not None else None
+        detour = (
+            _obstacle_detour_info(gmap, goal_cell, local_kinds, reached=reached_here, blocked_moves=blocked_moves)
+            if p_moves is None
+            else None
+        )
+        unentered_door_routes.append({
+            "dx": dx,
+            "dy": dy,
+            "steps": abs(dx) + abs(dy),
+            "sector": sector(dx, dy) if (dx or dy) else "here",
+            "path_steps": p_steps,
+            "path_moves": p_moves,
+            "next_leg": project_route_next_leg(gmap, found[1], local_kinds=local_kinds, goal_rel=(dx, dy)) if (found is not None and found[1]) else None,
+            "detour": detour,
+        })
+    unentered_door_routes.sort(
+        key=lambda d: (
+            d["path_steps"] is None,
+            d["path_steps"] if d["path_steps"] is not None else (
+                (d["detour"].get("frontier_steps") or d["steps"]) + (d["detour"].get("frontier_door_dist") or 0)
+                if d["detour"] is not None else d["steps"]
+            ),
+            d["steps"],
+        )
+    )
+    last_new_cells = gmap.new_cells_by_episode.get(max(recent), 0) if recent else 0
+    if not explore and exploring(gmap, episode):
+        if last_new_cells > 0 or any(d["path_moves"] is not None for d in unentered_door_routes):
+            gmap.exploring_until = None
     override = None
     triggered = explore and episode is not None
     # Exploration stays in charge for a few episodes: one is not enough to rule a direction out.
     active = exploring(gmap, episode)
-    elsewhere = explore_elsewhere(gmap) if (triggered or active) and not targets else []
-    if (triggered or active) and (targets or elsewhere):
+    elsewhere = explore_elsewhere(gmap) if (triggered or active) and not targets and not unentered_door_routes else []
+    if (triggered or active) and (targets or unentered_door_routes or elsewhere):
         until = gmap.exploring_until if active else episode + EXPLORE_EPISODES - 1
         left = until - episode + 1
         stuck = (f"You judged that you are stuck, so what you have been trying is not working, and you are exploring "
                  f"({left} episode(s) of exploring left).")
-        if targets:
+        direct_door = next((d for d in unentered_door_routes if d["path_moves"] is not None), None)
+        detour_door = next(
+            (d for d in unentered_door_routes if d["detour"] is not None and d["detour"].get("frontier_rel") is not None),
+            None,
+        )
+        if direct_door is not None:
+            override = {
+                "dx": direct_door["dx"],
+                "dy": direct_door["dy"],
+                "steps": direct_door["steps"],
+                "sector": direct_door["sector"],
+                "kind": "edge",
+                "area": gmap.segment,
+                "until": until,
+            }
+            lines.append(
+                f"{stuck} This episode's task MUST be to walk to the unentered door or stairs in "
+                f"{gmap.area_label(gmap.segment)} at ({direct_door['dx']}, {direct_door['dy']}), "
+                f"{direct_door['steps']} steps {direct_door['sector']}, and enter it."
+            )
+        elif detour_door is not None:
+            f_rel = detour_door["detour"]["frontier_rel"]
+            f_steps = abs(f_rel[0]) + abs(f_rel[1])
+            f_sec = sector(f_rel[0], f_rel[1]) if (f_rel[0] or f_rel[1]) else "here"
+            matched = next((t for t in targets if (t["dx"], t["dy"]) == f_rel), None)
+            if matched is None:
+                matched = {
+                    "dx": f_rel[0],
+                    "dy": f_rel[1],
+                    "steps": f_steps,
+                    "sector": f_sec,
+                }
+            override = dict(matched, kind="edge", area=gmap.segment, until=until)
+            lines.append(
+                f"{stuck} This episode's task MUST be to walk to the unexplored edge of {gmap.area_label(gmap.segment)} "
+                f"at ({override['dx']}, {override['dy']}), {override['steps']} steps {override['sector']} "
+                f"(approaching the unentered door/stairs at ({detour_door['dx']}, {detour_door['dy']})), "
+                f"and continue through to enter that door/stairs."
+            )
+        elif targets:
             heading = mass.most_common(1)[0][0]
             override = next(t for t in targets if t["sector"] == heading)   # every direction with mass has one
             override = dict(override, kind="edge", area=gmap.segment, until=until)

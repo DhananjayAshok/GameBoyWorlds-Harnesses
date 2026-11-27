@@ -870,6 +870,8 @@ class PokemonStrategist:
         for e in reversed(self.report.episodes):
             if e.status == "completed":
                 break
+            if e.status == "out_of_calls" and self.global_map.new_cells_by_episode.get(e.n, 0) > 0:
+                break
             streak += 1
             failed.append(e.task)
         return streak, failed

@@ -385,6 +385,7 @@ def _obstacle_detour_info(
                     seen_local.add(nl)
                     queue.append(nl)
     effective_reached = set(reached) | on_screen_reached
+    frontier_set = set(gmap.frontier(gmap.segment)) | on_screen_reached
 
     def kind_at(g: Cell) -> str:
         if g in blocked_targets and g != goal_cell:
@@ -436,19 +437,22 @@ def _obstacle_detour_info(
             frontier_rel: Optional[Cell] = None
             frontier_steps: Optional[int] = None
             frontier_moves: Optional[str] = None
+            frontier_next_leg: Optional[str] = None
             if exit_frontier != start:
                 frontier_rel = (exit_frontier[0] - px, exit_frontier[1] - py)
+                m_list = None
                 if exit_frontier in reached:
                     m_list = _reconstruct_moves(reached, exit_frontier)
-                    if m_list:
-                        frontier_steps = len(m_list)
-                        frontier_moves = compress_moves(m_list)
                 elif local_kinds is not None and in_bounds(frontier_rel):
                     sp = shortest_path(local_kinds, (0, 0), [frontier_rel])
                     if sp:
                         m_list = [(d, m) for d, m, _ in sp]
-                        frontier_steps = len(m_list)
-                        frontier_moves = compress_moves(m_list)
+                if m_list:
+                    frontier_steps = len(m_list)
+                    frontier_moves = compress_moves(m_list)
+                    frontier_next_leg = project_route_next_leg(
+                        gmap, m_list, local_kinds=local_kinds, goal_rel=frontier_rel
+                    )
             frontier_door_dist = abs(exit_frontier[0] - goal_cell[0]) + abs(exit_frontier[1] - goal_cell[1])
             if leave_edge is None and frontier_rel is None:
                 return None
@@ -458,6 +462,7 @@ def _obstacle_detour_info(
                 "frontier_door_dist": frontier_door_dist,
                 "frontier_steps": frontier_steps,
                 "frontier_moves": frontier_moves,
+                "frontier_next_leg": frontier_next_leg,
             }
         if cost > best[cur]:
             continue
@@ -474,6 +479,8 @@ def _obstacle_detour_info(
             if nxt in effective_reached and k == WALKABLE:
                 step_cost = 1
             elif nxt in targets or k in (WALKABLE, "unexplored", UNKNOWN):
+                if cur in effective_reached and k == "unexplored" and cur not in frontier_set:
+                    continue
                 step_cost = 4
             else:
                 continue
@@ -605,10 +612,12 @@ def door_lines(
             f_moves = detour_info.get("frontier_moves")
             f_steps = detour_info.get("frontier_steps")
             f_dist = detour_info.get("frontier_door_dist")
+            f_leg = detour_info.get("frontier_next_leg")
+            f_leg_note = f" [next on-screen leg: {f_leg}]" if f_leg else ""
             if f_rel is not None and f_moves:
                 parts.append(
                     f"nearest reachable unexplored edge toward this door is {f_rel} "
-                    f"({f_dist} step{'s' if f_dist != 1 else ''} from door; mapped route, {f_steps} moves: {f_moves})"
+                    f"({f_dist} step{'s' if f_dist != 1 else ''} from door; mapped route, {f_steps} moves: {f_moves}{f_leg_note})"
                 )
             leave_edge = detour_info.get("leave_edge")
             if leave_edge is not None:

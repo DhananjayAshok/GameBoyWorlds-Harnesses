@@ -3162,12 +3162,17 @@ class GlobalMap(StrategistArtifact):
                         queue.append(nxt)
         return visited
 
+    MAX_DOOR_UNEXPLORED_GAP = 6
+
     def is_door_reachable(
         self,
         segment: int,
         door: Dict[str, Any],
         reachable: Optional[set] = None,
     ) -> bool:
+        from collections import deque
+        from .routes import blocked_target_cells
+
         if door.get("leads_to") is not None:
             return True
         seg = self.segments[segment] if 0 <= segment < len(self.segments) else {}
@@ -3179,6 +3184,44 @@ class GlobalMap(StrategistArtifact):
         for c in door["cells"]:
             if c in reach or any((c[0] + dx, c[1] + dy) in reach for dx, dy in DIRECTIONS.values()):
                 return True
+        frontier_cells = set(self.frontier(segment, reachable=reach))
+        if not frontier_cells:
+            return False
+        seg_moves = self.segment_blocked_moves(segment)
+        blocked_targets = set(self.blocked_cells[segment]) if segment < len(self.blocked_cells) else set()
+        if seg_moves:
+            blocked_targets |= blocked_target_cells(self, segment, seg_moves)
+        door_comp = set(door["cells"])
+        comp_queue = deque(door["cells"])
+        while comp_queue:
+            cur = comp_queue.popleft()
+            for dx, dy in DIRECTIONS.values():
+                nb = (cur[0] + dx, cur[1] + dy)
+                if nb in door_comp or nb in blocked_targets:
+                    continue
+                mc = seg.get(nb)
+                if mc is not None and mc.kind in (WALKABLE, UNKNOWN):
+                    door_comp.add(nb)
+                    comp_queue.append(nb)
+        dist = {f: 0 for f in frontier_cells}
+        queue = deque(frontier_cells)
+        while queue:
+            cur = queue.popleft()
+            d = dist[cur]
+            if cur in door_comp:
+                return True
+            cur_blocked = seg_moves.get(cur, ())
+            for d_name, (dx, dy) in DIRECTIONS.items():
+                if d_name in cur_blocked:
+                    continue
+                nb = (cur[0] + dx, cur[1] + dy)
+                if nb in blocked_targets:
+                    continue
+                if nb in door_comp:
+                    return True
+                if d < self.MAX_DOOR_UNEXPLORED_GAP and seg.get(nb) is None and nb not in dist:
+                    dist[nb] = d + 1
+                    queue.append(nb)
         return False
 
     def reachable_door_list(
