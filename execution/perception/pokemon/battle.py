@@ -691,7 +691,7 @@ def is_party_menu_screen(frame: np.ndarray) -> bool:
         and float(dark[17:23, 152:156].mean()) >= 0.85
         and float(light[16, 88:156].mean()) >= 0.95
         and float(light[23, 88:156].mean()) >= 0.95
-        and int(dark[8:16, 8:80].sum()) >= 40
+        and int(dark[8:16, 8:80].sum()) >= 20
     ):
         return True
     if (
@@ -700,27 +700,22 @@ def is_party_menu_screen(frame: np.ndarray) -> bool:
         and float(light[8:10, 48:96].mean()) >= 0.95
         and float(light[14:16, 48:96].mean()) >= 0.95
         and int(dark[10:14, 32:48].sum()) >= 18
-        and int(dark[0:8, 8:96].sum()) >= 40
+        and (
+            int(dark[0:8, 8:96].sum()) >= 20
+            or _read_tile_hp_fraction(img, ty=1, slash_tx=16) is not None
+            or float(light[0:8, 0:GRID_COLS * TILE_SIZE].mean()) >= 0.95
+        )
     ):
         return True
     if (
         float(light[0:TILE_SIZE, 3 * TILE_SIZE:GRID_COLS * TILE_SIZE].mean()) >= 0.95
         and len(read_tile_text(img, 1, 3, 13)) >= 2
         and any(is_party_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]) for ty in (1, 3, 5, 7, 9, 11))
-        and (
-            _tile_row_signature(img[2 * TILE_SIZE:3 * TILE_SIZE, 8 * TILE_SIZE:9 * TILE_SIZE]) == LEVEL_GLYPH_SIGNATURE
-            or "ABLE" in read_tile_text(img, 2, 11, 20)
-            or any(read_tile_text(img, ty, 1, 8).startswith("CANC") for ty in (3, 5, 7, 9, 11))
-        )
     ):
         return True
     if (
         len(read_tile_text(img, 0, 3, 13)) >= 2
         and any(is_party_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]) for ty in (1, 3, 5, 7, 9, 11))
-        and (
-            _tile_row_signature(img[0:TILE_SIZE, 13 * TILE_SIZE:14 * TILE_SIZE]) == LEVEL_GLYPH_SIGNATURE
-            or "ABLE" in read_tile_text(img, 1, 11, 20)
-        )
     ):
         return True
     return False
@@ -737,7 +732,7 @@ def is_party_menu_selection_screen(frame: np.ndarray) -> bool:
 
 
 def is_pack_screen(frame: np.ndarray) -> bool:
-    """Return True if the screen shows the Generation 2 Pack screen (with or without an open sub-box)."""
+    """Return True if the screen shows the Generation 2 Pack screen (with or without an open sub-box or transition frame)."""
     if frame is None:
         return False
     img = _grey_frame(frame)
@@ -753,7 +748,7 @@ def is_pack_screen(frame: np.ndarray) -> bool:
     if float((sidebar < LIGHT_BACKGROUND).mean()) < 0.65 or float((label_band < DARK_INK).mean()) < 0.60:
         return False
     item_area = img[TILE_SIZE:BATTLE_UPPER_BOTTOM, 5 * TILE_SIZE:GRID_COLS * TILE_SIZE]
-    if float((item_area >= LIGHT_BACKGROUND).mean()) < 0.70 or int((item_area < DARK_INK).sum()) < 25:
+    if float((item_area >= LIGHT_BACKGROUND).mean()) < 0.70:
         return False
     return True
 
@@ -850,18 +845,102 @@ def is_start_menu_screen(frame: np.ndarray) -> bool:
     return False
 
 
-def is_battle_screen(frame: np.ndarray) -> bool:
-    """Return True if the screen shows a battle backdrop above a bottom battle box."""
+def has_right_aligned_ui_box(frame: np.ndarray) -> bool:
+    """Return True if a bordered menu/choice box is anchored along the right edge (col 19) in the upper screen."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < 12 * TILE_SIZE or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    right_v19 = sum(
+        1 for ty in range(1, 12)
+        if is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 19 * TILE_SIZE:20 * TILE_SIZE])
+    )
+    if right_v19 < 3:
+        return False
+    return any(
+        all(
+            is_horizontal_border_tile(img[top_ty * TILE_SIZE:(top_ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+            for tx in range(15, 19)
+        )
+        for top_ty in range(0, 10)
+    )
+
+
+def is_overworld_menu_or_ui_screen(frame: np.ndarray) -> bool:
+    """Return True if the screen displays an overworld or full-screen menu/UI layout (party, Pack, Start menu, top box, or modal preview)."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    return (
+        has_top_dialogue_box(img)
+        or has_modal_preview_box(img)
+        or is_party_menu_screen(img)
+        or is_pack_screen(img)
+        or is_start_menu_screen(img)
+    )
+
+
+def has_positive_battle_layout(frame: np.ndarray) -> bool:
+    """Return True if the upper screen and bottom box exhibit positive visual battle layout features."""
+    if frame is None:
+        return False
     img = _grey_frame(frame)
     if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
         return False
     if not has_bottom_dialogue_box(img):
         return False
-    if (has_top_dialogue_box(img)
-            or has_modal_preview_box(img)
-            or is_party_menu_screen(img)
-            or is_pack_screen(img)
-            or is_start_menu_screen(img)):
+    if is_battle_command_menu(img) or is_move_selection_screen(img) or has_battle_menu_box(img):
+        return True
+    if _read_tile_hp_fraction(img, ty=10, slash_tx=14) is not None:
+        return True
+    dark = img < DARK_INK
+    light = img >= LIGHT_BACKGROUND
+    opp_frame_line = (
+        float(dark[26:32, 16:88].max(axis=0).mean()) >= 0.85
+        and float(light[0:16, 96:160].mean()) >= 0.75
+        and float(light[0:24, 16:88].mean()) >= 0.55
+    )
+    plr_frame_line = (
+        float(dark[90:96, 80:152].max(axis=0).mean()) >= 0.80
+        and float(light[56:88, 80:152].mean()) >= 0.55
+    )
+    opp_hud_header = (
+        len(read_tile_text(img, 0, 1, 11)) >= 2
+        and float(light[0:16, 96:160].mean()) >= 0.80
+        and (
+            any(
+                _tile_row_signature(img[8:16, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]) == LEVEL_GLYPH_SIGNATURE
+                for tx in range(3, 10)
+            )
+            or float(dark[18:23, 24:72].max(axis=0).mean()) >= 0.65
+        )
+    )
+    plr_level = any(
+        _tile_row_signature(img[8 * TILE_SIZE:9 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]) == LEVEL_GLYPH_SIGNATURE
+        for tx in range(12, 18)
+    )
+    if opp_frame_line or plr_frame_line or opp_hud_header or plr_level:
+        return True
+    if any(is_party_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]) for ty in range(12)):
+        return False
+    if any(len(read_tile_text(img, ty, 0, 12)) >= 2 for ty in range(5)):
+        return False
+    if has_right_aligned_ui_box(img):
+        return False
+    return True
+
+
+def is_battle_screen(frame: np.ndarray) -> bool:
+    """Return True if the screen shows a battle backdrop and positive battle layout above a bottom battle box."""
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    if is_overworld_menu_or_ui_screen(img):
         return False
     upper = img[:BATTLE_UPPER_BOTTOM, :]
     if float((upper >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_UPPER_WHITE_FRACTION:
@@ -872,7 +951,7 @@ def is_battle_screen(frame: np.ndarray) -> bool:
         return False
     if float((upper[:, BATTLE_MID_X:] >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_HALF_WHITE_FRACTION:
         return False
-    return True
+    return has_positive_battle_layout(img)
 
 
 def is_evolution_screen(frame: np.ndarray) -> bool:
@@ -1962,6 +2041,80 @@ def read_party_menu_cursor_slot(frame: np.ndarray) -> Optional[int]:
         if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]):
             return idx
     return None
+
+
+def read_party_menu_compatibility(frame: np.ndarray) -> List[Tuple[int, str, Optional[str]]]:
+    """Return [(slot_idx, name, compat_or_None), ...] where compat_or_None is 'ABLE', 'NOT ABLE', or 'LEARNED' when visible on a TM/HM/stone party screen."""
+    if not is_party_menu_screen(frame):
+        return []
+    img = _grey_frame(frame)
+    out: List[Tuple[int, str, Optional[str]]] = []
+    gen1_name0 = read_tile_text(img, 0, 3, 14)
+    if gen1_name0 and gen1_name0 != "CANCEL":
+        for idx, name_ty in enumerate((0, 2, 4, 6, 8, 10)):
+            name = read_tile_text(img, name_ty, 3, 14)
+            if not name or name == "CANCEL" or name.startswith("CANCEL "):
+                break
+            compat_row = read_tile_text(img, name_ty + 1, 10, 20)
+            compat: Optional[str] = None
+            if "NOT ABLE" in compat_row or "UNABLE" in compat_row:
+                compat = "NOT ABLE"
+            elif "ABLE" in compat_row:
+                compat = "ABLE"
+            elif "LEARNED" in compat_row:
+                compat = "LEARNED"
+            out.append((idx, name, compat))
+        return out
+    for idx, row_ty in enumerate((1, 3, 5, 7, 9, 11)):
+        if read_tile_text(img, row_ty, 1, 8).startswith("CANC"):
+            break
+        name = read_tile_text(img, row_ty, 3, 13)
+        if not name or name == "CANCEL" or name.startswith("CANCEL "):
+            break
+        compat_row = read_tile_text(img, row_ty + 1, 10, 20) if row_ty + 1 < 13 else ""
+        compat = None
+        if "NOT ABLE" in compat_row or "UNABLE" in compat_row:
+            compat = "NOT ABLE"
+        elif "ABLE" in compat_row:
+            compat = "ABLE"
+        elif "LEARNED" in compat_row:
+            compat = "LEARNED"
+        out.append((idx, name, compat))
+    return out
+
+
+def is_overworld_confirmation_subbox(frame: np.ndarray) -> bool:
+    """Return True if a 2-option YES/NO or HEAL/CANCEL confirmation sub-box is open over an overworld bottom dialogue box with the cursor on the top affirmative option."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if not has_bottom_dialogue_box(img):
+        return False
+    if (
+        is_party_menu_screen(img)
+        or is_pack_screen(img)
+        or is_start_menu_screen(img)
+        or is_gen1_item_list_screen(img)
+    ):
+        return False
+    for cursor_ty in (7, 8, 9):
+        for cursor_tx in range(11, 17):
+            if not is_cursor_tile(
+                img[cursor_ty * TILE_SIZE:(cursor_ty + 1) * TILE_SIZE,
+                    cursor_tx * TILE_SIZE:(cursor_tx + 1) * TILE_SIZE]
+            ):
+                continue
+            top_opt = read_tile_text(img, cursor_ty, cursor_tx + 1, 20)
+            bot_opt = (
+                read_tile_text(img, cursor_ty + 2, cursor_tx + 1, 20)
+                if cursor_ty + 2 < 12
+                else ""
+            )
+            if (top_opt == "YES" and bot_opt == "NO") or (top_opt == "HEAL" and bot_opt == "CANCEL"):
+                return True
+    return False
 
 
 def read_move_learning_dialogue_status(frame: np.ndarray) -> Optional[Tuple[str, str, str]]:
