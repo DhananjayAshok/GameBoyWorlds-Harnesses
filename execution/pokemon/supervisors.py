@@ -187,6 +187,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                  initial_pokemon_status: Optional[str] = None,
                  initial_status_heal_bag_empty: bool = False,
                  initial_zero_pp_moves: Optional[List[str]] = None,
+                 initial_known_bag_items: Optional[List[str]] = None,
+                 initial_known_bag_complete: bool = False,
                  initial_blocked_moves: Optional[Dict[Tuple[int, Tuple[int, int]], Dict[str, List[str]]]] = None,
                  **kwargs: Any) -> None:
         self._screen_people = screen_people
@@ -198,6 +200,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._active_pokemon_status: Optional[str] = initial_pokemon_status or None
         self._status_heal_bag_empty: bool = bool(initial_status_heal_bag_empty)
         self._zero_pp_moves: List[str] = list(initial_zero_pp_moves or [])
+        self._known_bag_items: List[str] = list(initial_known_bag_items or [])
+        self._known_bag_complete: bool = bool(initial_known_bag_complete)
         self._poison_step_remainder: int = 0
         self._losses_at_start = env.get_info()["pokemon_core"].get("n_battles_lost", 0)
         gmap_init = getattr(env, "_map", None)
@@ -1047,6 +1051,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._active_pokemon_status = None
             self._poison_step_remainder = 0
             self._zero_pp_moves = []
+        for m_found in re.finditer(
+            r"\bYou\s+found\s+([A-Z0-9][A-Z0-9é -]{1,15})!|\bput\s+the\s+([A-Z0-9][A-Z0-9é -]{1,15})\s+in\b",
+            notes,
+        ):
+            raw_found = (m_found.group(1) or m_found.group(2) or "").strip().upper().replace("É", "E")
+            if raw_found and not re.search(r"^\d+\s+EXP\b|^₽|\bAWAY\s+SAFELY\b", raw_found, re.IGNORECASE):
+                if raw_found not in self._known_bag_items:
+                    self._known_bag_items.append(raw_found)
         if re.search(r"\bfound\b.{1,30}!|\bput\s+the\b.{1,30}\bin\b|\bgot\b.{1,25}!", notes, re.IGNORECASE):
             if re.search(r"\b(?:potion|super\s+potion|hyper\s+potion|full\s+restore|fresh\s+water|soda\s+pop|lemonade)\b", notes, re.IGNORECASE):
                 self._healing_bag_empty = False
@@ -1070,16 +1082,56 @@ class PokemonPlayThroughSupervisor(Supervisor):
                             location_failed=report.outcome in LOCATION_FAIL_CODES,
                             ambiguous=report.outcome == MOVE_TARGET_AMBIGUOUS)
 
-    def _update_bag_status_from_notes(self, notes: str) -> bool:
+    def _update_bag_status_from_notes(self, notes: str, task: Optional[str] = None) -> bool:
         bag_info = CombatExecutor.extract_bag_items_from_text(notes)
         if bag_info is None:
             return False
         bag_items, all_checked = bag_info
-        if any(is_healing_item_name(it) for it in bag_items):
+        task_str = task or ""
+        is_buy_only = bool(
+            re.search(r"\b(?:buy|purchase|shop)\b", task_str, re.IGNORECASE)
+            and not re.search(r"\bsell\b", task_str, re.IGNORECASE)
+        ) or bool(
+            re.search(r"\bThat\s+will\s+be\b", notes, re.IGNORECASE)
+            and not re.search(r"\bWhat\s+would\s+you\s+like\s+to\s+sell\b", notes, re.IGNORECASE)
+        )
+        if is_buy_only:
+            return False
+        items = list(bag_items)
+        if re.search(r"\b(?:buy|purchase)\b", task_str, re.IGNORECASE) and re.search(r"\bsell\b", task_str, re.IGNORECASE):
+            for m_s in re.finditer(r"\bsell\s+(?:the\s+|an?\s+)?([A-Z0-9][A-Z0-9 -]{1,15}?)\b", task_str, re.IGNORECASE):
+                s_name = m_s.group(1).strip().upper()
+                if s_name in items:
+                    s_idx = items.index(s_name)
+                    items = [
+                        it for idx_it, it in enumerate(items)
+                        if it.upper() != s_name and (idx_it <= s_idx or it in self._known_bag_items)
+                    ]
+                if s_name in self._known_bag_items:
+                    self._known_bag_items.remove(s_name)
+        if all_checked:
+            missing_non_heal = [
+                old for old in self._known_bag_items
+                if old not in items and not is_healing_item_name(old)
+            ]
+            if len(items) <= 4 and missing_non_heal:
+                self._known_bag_items = CombatExecutor._merge_visible_bag_items(self._known_bag_items, items)
+                if not any(is_healing_item_name(it) for it in items):
+                    self._known_bag_items = [
+                        it for it in self._known_bag_items
+                        if not is_healing_item_name(it) or it in items
+                    ]
+            else:
+                self._known_bag_items = list(items)
+            self._known_bag_complete = True
+        elif items:
+            self._known_bag_items = CombatExecutor._merge_visible_bag_items(self._known_bag_items, items)
+        if any(is_healing_item_name(it) for it in items):
             self._healing_bag_empty = False
         elif all_checked:
             self._healing_bag_empty = True
-        if any(is_status_heal_item_name(it) for it in bag_items):
+            self._known_bag_items = [it for it in self._known_bag_items if not is_healing_item_name(it)]
+        if any(is_status_heal_item_name(it) for it in items):
             self._status_heal_bag_empty = False
         elif all_checked:
             self._status_heal_bag_empty = True
@@ -1087,7 +1139,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _update_party_hp_from_combat(self, report: ExecutorReport) -> None:
         notes = report.notes or ""
-        self._update_bag_status_from_notes(notes)
+        self._update_bag_status_from_notes(notes, getattr(report, "task", None))
         bag_info = CombatExecutor.extract_bag_items_from_text(notes)
         has_remaining_heal = bool(bag_info and any(is_healing_item_name(it) for it in bag_info[0]))
         if (
@@ -1098,6 +1150,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             and not has_remaining_heal
         ):
             self._healing_bag_empty = True
+            self._known_bag_items = [it for it in self._known_bag_items if not is_healing_item_name(it)]
+        if report.termination_reason == "battle_lost":
+            self._last_seen_battle_hp = None
+            self._active_pokemon_status = None
+            self._poison_step_remainder = 0
+            self._zero_pp_moves = []
+            return
         hp = CombatExecutor.extract_player_hp_from_text(notes)
         if hp is not None:
             self._last_seen_battle_hp = hp
@@ -1115,14 +1174,31 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _update_party_hp_from_menu(self, report: ExecutorReport) -> None:
         notes = report.notes or ""
-        self._update_bag_status_from_notes(notes)
+        task_str = getattr(report, "task", None) or ""
+        self._update_bag_status_from_notes(notes, task_str)
         if "No healing item was used in menu" in notes:
             self._healing_bag_empty = True
+            self._known_bag_items = [it for it in self._known_bag_items if not is_healing_item_name(it)]
         if "No status-healing item was used in menu" in notes:
             self._status_heal_bag_empty = True
-        if re.search(r"\b(?:here\s+you\s+go|thank\s+you)\b", notes, re.IGNORECASE):
-            self._healing_bag_empty = False
-            self._status_heal_bag_empty = False
+        if re.search(r"\b(?:here\s+you\s+(?:go|are)|thank\s+you)\b", notes, re.IGNORECASE):
+            if re.search(r"\bpotion\b", notes + " " + task_str, re.IGNORECASE):
+                self._healing_bag_empty = False
+                if "POTION" not in self._known_bag_items:
+                    self._known_bag_items.append("POTION")
+            if re.search(r"\b(?:antidote|full\s+heal|parlyz\s+heal|awakening|burn\s+heal|ice\s+heal)\b", notes + " " + task_str, re.IGNORECASE):
+                self._status_heal_bag_empty = False
+            if re.search(r"\bpok[eé]\s*ball\b", notes + " " + task_str, re.IGNORECASE):
+                if "POKE BALL" not in self._known_bag_items and "POK" not in self._known_bag_items:
+                    self._known_bag_items.append("POKE BALL")
+        if "grew" in notes and "RARE CANDY" in task_str.upper() and "RARE CANDY" in self._known_bag_items:
+            self._known_bag_items.remove("RARE CANDY")
+        if (
+            re.search(r"\b(?:HEALTH|ATTACK|DEFENSE|SPEED|SPECIAL)\s+rose\b", notes, re.IGNORECASE)
+            and "HP UP" in task_str.upper()
+            and "HP UP" in self._known_bag_items
+        ):
+            self._known_bag_items.remove("HP UP")
         status = CombatExecutor.extract_player_status_from_text(notes)
         if status is not None:
             self._active_pokemon_status = status or None
@@ -1162,6 +1238,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             and not self._healing_bag_empty
             and not self._active_pokemon_status
             and not self._zero_pp_moves
+            and not self._known_bag_items
         ):
             return ""
         lines: List[str] = []
@@ -1207,6 +1284,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 f"Active Pokemon moves at 0 PP (cannot be used until healed at a Pokemon Center): "
                 f"{', '.join(self._zero_pp_moves)}."
             )
+        if self._known_bag_items:
+            complete_note = " (all bag slots checked)" if self._known_bag_complete else ""
+            lines.append(f"Bag items currently known: {', '.join(self._known_bag_items)}{complete_note}.")
         return "\n".join(lines)
 
     def _process_combat(self, report: ExecutorReport) -> Dict[str, Any]:

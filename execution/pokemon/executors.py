@@ -3270,14 +3270,14 @@ Press: <one of up, down, left, right, confirm, back>
             zero_pp_items = self._format_zero_pp_list()
             if zero_pp_items:
                 notes_lines.append(f"[Moves at 0 PP: {', '.join(zero_pp_items)}]")
-            if self._seen_bag_items or self._opened_bag_in_battle:
-                all_checked = self._saw_bag_end or (
-                    (self._bag_unavailable or self._healing_items_exhausted)
-                    and not any(is_healing_item_name(it) for it in self._seen_bag_items)
-                )
-                end_note = " (all bag slots checked)" if all_checked else ""
-                items_str = ", ".join(self._seen_bag_items) if self._seen_bag_items else "none"
-                notes_lines.append(f"[Bag items seen: {items_str}{end_note}]")
+        if self._seen_bag_items or self._opened_bag_in_battle:
+            all_checked = self._saw_bag_end or (
+                (self._bag_unavailable or self._healing_items_exhausted)
+                and not any(is_healing_item_name(it) for it in self._seen_bag_items)
+            )
+            end_note = " (all bag slots checked)" if all_checked else ""
+            items_str = ", ".join(self._seen_bag_items) if self._seen_bag_items else "none"
+            notes_lines.append(f"[Bag items seen: {items_str}{end_note}]")
         self.report.notes = "\n".join(notes_lines)
         return code
 
@@ -4438,6 +4438,13 @@ Press: <one of up, down, left, right, confirm, back>
                 )
             ):
                 self._confirmed_bag_items.add(self._pending_bag_item)
+                qty = self._bag_item_quantities.get(self._pending_bag_item)
+                if qty is not None and qty > 1:
+                    self._bag_item_quantities[self._pending_bag_item] = qty - 1
+                elif qty == 1:
+                    self._bag_item_quantities.pop(self._pending_bag_item, None)
+                    if self._pending_bag_item in self._seen_bag_items:
+                        self._seen_bag_items.remove(self._pending_bag_item)
                 self._pending_bag_item = None
             state = effective_agent_state(self._agent_state(), after_frame)
             if state != AgentState.IN_MENU:
