@@ -216,6 +216,13 @@ class PokemonPlayThroughSupervisor(Supervisor):
             for k, by_dir in (initial_blocked_moves or {}).items()
         }
         self._last_settled_step: Optional[int] = None
+        self._dialogue_clear_failed: bool = False
+        self._dialogue_executor_failed: bool = False
+        self._free_in_dialogue_failed: bool = False
+        self._dialogue_fail_count: int = 0
+        self._zero_step_dialogue_failures: int = 0
+        self._dialogue_failed_step: Optional[int] = None
+        self._last_failed_dialogue_text: Optional[str] = None
         self.last_executor = None
         self.plan: List[str] = []
         super().__init__(task=task, executor_class=None, env=env, game=game,
@@ -251,6 +258,121 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _is_in_dialogue(self, frame=None) -> bool:
         return self._effective_state(frame) == AgentState.IN_DIALOGUE
+
+    def _current_step_count(self) -> Optional[int]:
+        return getattr(getattr(self._env, "_emulator", None), "step_count", None)
+
+    def _reset_dialogue_failure_state(self) -> None:
+        self._dialogue_clear_failed = False
+        self._dialogue_executor_failed = False
+        self._free_in_dialogue_failed = False
+        self._dialogue_fail_count = 0
+        self._zero_step_dialogue_failures = 0
+        self._dialogue_failed_step = None
+        self._last_failed_dialogue_text = None
+
+    def _sync_dialogue_failure_state(self) -> None:
+        if not self._is_in_dialogue():
+            self._reset_dialogue_failure_state()
+
+    @staticmethod
+    def _trailing_dialogue_steps_stalled(report: ExecutorReport, min_stalled: int = 3) -> bool:
+        steps = getattr(report, "steps", None) or []
+        if not steps:
+            return True
+        if len(steps) < min_stalled:
+            return not any(getattr(s, "frame_changed", False) for s in steps)
+        tail = steps[-min_stalled:]
+        return all(
+            not getattr(s, "frame_changed", False) or getattr(s, "action_success", 0) == -1
+            for s in tail
+        )
+
+    def _record_dialogue_executor_outcome(
+        self,
+        tag: str,
+        executor: Any,
+        result: Dict[str, Any],
+        was_in_dialogue: bool,
+        step_before: Optional[int],
+        step_after: Optional[int],
+    ) -> None:
+        if not self._is_in_dialogue():
+            self._reset_dialogue_failure_state()
+            return
+        if result.get("succeeded"):
+            return
+        report = result.get("report")
+        dialogue_text = " ".join(str(result.get("dialogue") or getattr(executor, "dialogue_text", "") or "").split())
+        zero_steps = step_before is not None and step_after == step_before
+        tail_stalled = report is not None and self._trailing_dialogue_steps_stalled(report)
+        same_text = bool(
+            dialogue_text
+            and self._last_failed_dialogue_text
+            and dialogue_text == self._last_failed_dialogue_text
+        )
+        if tag == "dialogue":
+            self._dialogue_clear_failed = True
+            self._dialogue_fail_count += 1
+            self._dialogue_failed_step = step_after
+            if (
+                zero_steps
+                or tail_stalled
+                or same_text
+                or result.get("reason") == "dialogue_stuck"
+                or self._dialogue_fail_count >= 2
+            ):
+                self._dialogue_executor_failed = True
+            if zero_steps or tail_stalled:
+                self._zero_step_dialogue_failures += 1
+            else:
+                self._zero_step_dialogue_failures = 0
+            if dialogue_text:
+                self._last_failed_dialogue_text = dialogue_text
+        elif tag == "free" and (was_in_dialogue or zero_steps or tail_stalled):
+            self._dialogue_clear_failed = True
+            self._dialogue_failed_step = step_after
+            presses = [str(p).lower() for p in (getattr(executor, "presses", None) or ())]
+            a_tail = len(presses) >= 3 and all(p == "a" for p in presses[-3:])
+            if (zero_steps or tail_stalled or same_text) and (was_in_dialogue or a_tail):
+                if a_tail and "b" not in presses[-5:]:
+                    self._dialogue_executor_failed = True
+                if was_in_dialogue:
+                    self._free_in_dialogue_failed = True
+            if zero_steps or tail_stalled:
+                self._zero_step_dialogue_failures += 1
+            else:
+                self._zero_step_dialogue_failures = 0
+            if dialogue_text:
+                self._last_failed_dialogue_text = dialogue_text
+
+    def _is_dialogue_unrecoverable(self) -> bool:
+        return (
+            self._is_in_dialogue()
+            and self._dialogue_executor_failed
+            and self._free_in_dialogue_failed
+            and self._zero_step_dialogue_failures >= 2
+        )
+
+    @staticmethod
+    def _is_dialogue_closing_subgoal(text: str) -> bool:
+        if not text:
+            return False
+        has_dialogue_term = bool(
+            re.search(
+                r"\b(?:dialogue|text\s*box|conversation|cutscene|call|message|banner)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+        has_close_term = bool(
+            re.search(
+                r"\b(?:close[ds]?|clear(?:ed)?|dismiss(?:ed)?|finish(?:ed)?|end(?:ed)?|complete[ds]?|back\s+in\s+free\s+roam|return(?:ed)?\s+to\s+free\s+roam)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+        return has_dialogue_term and has_close_term
 
     def _global_map(self):
         return getattr(self._env, "_map", None)
@@ -854,6 +976,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
         run_kwargs.update(executor_kwargs)
         run_kwargs["hint"] = hint
         run_kwargs["allow_self_termination"] = allow_self_termination
+        self._sync_dialogue_failure_state()
+        was_in_dialogue = self._is_in_dialogue()
+        step_before = self._current_step_count()
         self._current_tag = tag
         self._total_calls += 1
         if counted:
@@ -872,7 +997,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
             hook = getattr(self, "_on_event_logged", None)
             if callable(hook):
                 hook()
-            return self.process_executor_return(executor.report)
+            result = self.process_executor_return(executor.report)
+            step_after = self._current_step_count()
+            self._record_dialogue_executor_outcome(
+                tag, executor, result, was_in_dialogue, step_before, step_after
+            )
+            return result
         finally:
             self._current_tag = None
 
@@ -1204,9 +1334,19 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _decide(self, subgoal: str, attempts: List[str], frame) -> Tuple[Optional[Tuple[str, Optional[str]]], str]:
         attempts_block = ""
-        if attempts:
+        effective_attempts = list(attempts)
+        if self._is_in_dialogue(frame) and self._dialogue_executor_failed:
+            snippet = f" (\"{self._last_failed_dialogue_text[:120]}\")" if self._last_failed_dialogue_text else ""
+            warn_note = (
+                f"Dialogue() already ran out of steps without closing the currently open dialogue box{snippet} — "
+                f"do NOT choose Dialogue() again; choose Free(press b and a alternately to close the open dialogue box; "
+                f"stop when: the dialogue box disappears and the player is in free roam)"
+            )
+            if not any("do NOT choose Dialogue() again" in a for a in effective_attempts):
+                effective_attempts.append(warn_note)
+        if effective_attempts:
             attempts_block = PLAYTHROUGH_ATTEMPTS_BLOCK.replace(
-                "[ATTEMPTS]", "\n".join(f"- {attempt}" for attempt in attempts))
+                "[ATTEMPTS]", "\n".join(f"- {attempt}" for attempt in effective_attempts))
         prompt = (self._fill_prompt(PLAYTHROUGH_SUBGOAL_DECISION_PROMPT)
                   .replace("[SUBGOAL]", subgoal)
                   .replace("[ATTEMPTS_BLOCK]", attempts_block))
@@ -1224,6 +1364,19 @@ class PokemonPlayThroughSupervisor(Supervisor):
             decision = parse_decision(output)
         if decision is None:
             log_warn(f"Could not parse a decision from: {output!r}", self._parameters)
+        elif decision[0] == "Dialogue" and self._is_in_dialogue(frame) and self._dialogue_executor_failed:
+            coerced = (
+                "Free",
+                "press b and a alternately to close the open dialogue box; "
+                "stop when: the dialogue box disappears and the player is in free roam",
+            )
+            decision = coerced
+            if records:
+                records[-1].response = re.sub(
+                    r"(?im)^(\s*Action\s*:\s*).*$",
+                    f"\1{coerced[0]}({coerced[1]})",
+                    str(records[-1].response),
+                )
         elif decision[0] == "Free":
             coerced = self._coerce_free_navigation_decision(decision[1], frame)
             if coerced is not None:
@@ -1893,27 +2046,33 @@ class PokemonPlayThroughSupervisor(Supervisor):
         return f": \"{text[:limit]}\"" if text else ""
 
     def _clear_pending_dialogue(self, attempts: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-        if not self._is_in_dialogue() or self._out_of_calls() or self._env_done():
+        self._sync_dialogue_failure_state()
+        if not self._is_in_dialogue() or self._dialogue_clear_failed or self._out_of_calls() or self._env_done():
             return None
         state_chain, handled = self._handle_interruption(dialogue_task="clear the dialogue on screen")
         label = "open dialogue" if state_chain == "in_dialogue" else f"open dialogue ({state_chain})"
-        note = f"Cleared {label} ({handled['reason']}){self._dialogue_snippet(handled)}"
+        prefix = "Cleared" if handled.get("succeeded") else "Could not clear"
+        note = f"{prefix} {label} ({handled['reason']}){self._dialogue_snippet(handled)}"
         self._note(note)
         if attempts is not None:
             attempts.append(note)
         return handled
 
     def _clear_pending_interruption(self, attempts: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        self._sync_dialogue_failure_state()
         if self._out_of_calls() or self._env_done():
             return None
         if not (self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM):
             return None
         frame = self._current_frame()
+        if self._is_in_dialogue(frame) and self._dialogue_clear_failed:
+            return None
         self._perceive(frame)
         if self._is_in_dialogue(frame):
             return self._clear_pending_dialogue(attempts)
         state_chain, handled = self._handle_interruption()
-        note = f"Cleared pending {state_chain} ({handled['reason']}){self._dialogue_snippet(handled)}"
+        prefix = "Cleared" if handled.get("succeeded") else "Could not clear"
+        note = f"{prefix} pending {state_chain} ({handled['reason']}){self._dialogue_snippet(handled)}"
         self._note(note)
         if attempts is not None:
             attempts.append(note)
@@ -1952,15 +2111,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 return "out_of_calls", attempts, subgoal_index
             if self._total_calls > 0:
                 self._settle_free_roam()
-            if self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM:
+            self._sync_dialogue_failure_state()
+            in_dialogue_now = self._is_in_dialogue()
+            if (in_dialogue_now and not self._dialogue_clear_failed) or (
+                not in_dialogue_now and self._agent_state() != AgentState.FREE_ROAM
+            ):
                 before = self._current_frame()
                 self._perceive(before)
-                if self._is_in_dialogue():
+                if self._is_in_dialogue(before):
                     handled = self._clear_pending_dialogue(attempts)
                     request_label = "Dialogue(clear open dialogue)"
                 else:
                     state_chain, handled = self._handle_interruption()
-                    note = f"Cleared pending {state_chain} ({handled['reason']}){self._dialogue_snippet(handled)}"
+                    prefix = "Cleared" if handled.get("succeeded") else "Could not clear"
+                    note = f"{prefix} pending {state_chain} ({handled['reason']}){self._dialogue_snippet(handled)}"
                     self._note(note)
                     attempts.append(note)
                     request_label = f"Interrupt({state_chain})"
@@ -1983,6 +2147,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             iterations += 1
             frame = self._current_frame()
             self._perceive(frame)
+            before_effective_state = self._effective_state(frame)
             before_place = self._current_map_place()
             if before_place is not None and (not subgoal_places or subgoal_places[-1] != before_place):
                 subgoal_places.append(before_place)
@@ -2020,7 +2185,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
             while (
                 is_move_action
                 and not result["succeeded"]
-                and (self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue())
+                and (
+                    (self._is_in_dialogue() and not self._dialogue_clear_failed)
+                    or (not self._is_in_dialogue() and self._agent_state() != AgentState.FREE_ROAM)
+                )
                 and wild_resumes < self.MAX_WILD_MOVE_RESUMES
                 and not self._env_done()
                 and not self._battles_lost()
@@ -2152,7 +2320,21 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 move_tag = self._format_leg_movement(
                     before_place, after_place, prior_stops, is_move_action=is_move_action)
 
-            if not result["succeeded"] and (self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue()):
+            after_in_dialogue = self._is_in_dialogue()
+            should_handle_interruption = (
+                not result["succeeded"]
+                and (self._agent_state() != AgentState.FREE_ROAM or after_in_dialogue)
+                and self._total_calls < self._max_total_calls
+                and not (
+                    after_in_dialogue
+                    and (
+                        action == "Dialogue"
+                        or before_effective_state == AgentState.IN_DIALOGUE
+                        or self._dialogue_clear_failed
+                    )
+                )
+            )
+            if should_handle_interruption:
                 if is_move_action and self._calls > 0:
                     self._calls -= 1
                 seed_crops = getattr(self.last_executor, "dialogue_crops", None) if is_move_action else None
@@ -2193,6 +2375,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     subgoal_places.append(after_place)
                 if not is_move_action or not handled.get("succeeded"):
                     failed_attempts += 1
+                if self._is_dialogue_unrecoverable():
+                    return "stuck", attempts, subgoal_index
                 continue
 
             if (
@@ -2211,7 +2395,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if not result["succeeded"]:
                 if is_move_action and not result["report"].steps and self._calls > 0:
                     self._calls -= 1
-                if result["reason"] in ("move_blocked", "out_of_steps"):
+                if (
+                    result["reason"] in ("move_blocked", "out_of_steps")
+                    and before_effective_state == AgentState.FREE_ROAM
+                    and not after_in_dialogue
+                    and self._agent_state() == AgentState.FREE_ROAM
+                ):
                     if not exec_blocked:
                         move_dir = None
                         if result.get("notes"):
@@ -2242,13 +2431,16 @@ class PokemonPlayThroughSupervisor(Supervisor):
                                 dir_list = self._blocked_moves.setdefault(place_key, {}).setdefault(move_dir, [])
                                 if detail not in dir_list:
                                     dir_list.append(detail)
+                note_detail = " ".join(str(result.get("notes") or "").split())
                 note = f"{request} did not work: {result['reason']}" + (
-                    f" ({result['notes']})" if result.get("notes") else "")
+                    f" ({note_detail[:160]})" if note_detail else "")
                 if move_tag:
                     note = f"{move_tag} {note}"
                 self._note(note)
                 attempts.append(note)
                 failed_attempts += 1
+                if self._is_dialogue_unrecoverable():
+                    return "stuck", attempts, subgoal_index
                 continue
 
             complete, summary, reached, replan_needed = self._judge(
@@ -2412,7 +2604,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if outcome == "lost_battle":
                 return self._finish("lost_battle", "The player lost a battle and blacked out.")
 
-            if replans >= self.MAX_REPLANS:
+            if (
+                replans >= self.MAX_REPLANS
+                or self._is_dialogue_unrecoverable()
+                or (
+                    self._is_in_dialogue()
+                    and self._dialogue_clear_failed
+                    and self._is_dialogue_closing_subgoal(subgoal)
+                )
+            ):
                 return self._finish("stuck", f"Could not achieve: {subgoal}")
             frame = self._current_frame()
             self._perceive(frame)
@@ -2420,6 +2620,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
             replans += 1
             if decision == "quit":
                 return self._finish("quit", reason)
+            if (
+                self._is_in_dialogue()
+                and self._dialogue_clear_failed
+                and self._is_dialogue_closing_subgoal(subgoal)
+                and subgoals
+                and self._is_dialogue_closing_subgoal(subgoals[0])
+            ):
+                return self._finish("stuck", f"Could not achieve: {subgoal}")
             calls_at_plan_start = self._calls
             self.plan = subgoals
             index = 0
