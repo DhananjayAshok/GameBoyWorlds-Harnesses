@@ -958,7 +958,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), people,
                            getattr(self._env, "left_ledge_patterns", None),
-                           self._local_blocked_cells())
+                           self._local_blocked_cells(), global_map=gmap)
         banner_note = (
             "\nNote: The thin 2-tile-tall bordered box at the bottom of the screen is a non-blocking area/location "
             "name popup banner (NOT a dialogue box). The player is already in free roam and can walk normally right "
@@ -997,6 +997,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 self._people_now(),
                 getattr(self._env, "left_ledge_patterns", None),
                 self._local_blocked_cells(),
+                global_map=self._global_map(),
             )
         return None
 
@@ -1457,7 +1458,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None),
                                      getattr(self._env, "walk_patterns", None), after_people,
                                      getattr(self._env, "left_ledge_patterns", None),
-                                     self._local_blocked_cells())
+                                     self._local_blocked_cells(), global_map=gmap)
             after_banner_note = (
                 "\nNote: The thin 2-tile-tall bordered box at the bottom of the screen is a non-blocking area/location "
                 "name popup banner (NOT a dialogue box); the player is in free roam."
@@ -2127,7 +2128,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                                getattr(self._env, "walk_patterns", None), self._people_now(),
                                getattr(self._env, "left_ledge_patterns", None),
-                               self._local_blocked_cells())
+                               self._local_blocked_cells(), global_map=self._global_map())
             result = self.call_executor(tag, task, identified=self._identified,
                                         cell_kinds=kinds, people_fn=self._people_now)
         elif tag == "menu":
@@ -2147,7 +2148,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), self._people_now(),
                            getattr(self._env, "left_ledge_patterns", None),
-                           self._local_blocked_cells())
+                           self._local_blocked_cells(), global_map=self._global_map())
         return self.call_executor(tag, task, counted=counted, screen_tiles=self._screen_tiles,
                                   cell_kinds=kinds,
                                   identified=self._identified,

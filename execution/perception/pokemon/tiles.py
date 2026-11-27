@@ -297,7 +297,11 @@ def verbalize_tiles(
     player_overhang_cells = {
         cell for cell in quarter_tags if is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
     }
-    npc_head_overhang_cells = {cell for cell in quarter_tags if is_npc_head_overhang_floor_cell(cell, quarter_tags)}
+    npc_head_overhang_cells = {
+        cell
+        for cell in quarter_tags
+        if is_npc_head_overhang_floor_cell(cell, quarter_tags, quarter_images=quarter_images)
+    }
     south_ledge_cells = {
         cell for cell in quarter_tags if is_south_ledge_cell(cell, quarter_tags, quarter_descriptions)
     }
@@ -372,6 +376,26 @@ def verbalize_tiles(
         if ((cell[0], cell[1] + 1) not in people and "npc" in above
                 and above["npc"]["quarters"] <= {"bottom_left", "bottom_right"}):
             del above["npc"]  # the top of that person's sprite, drawn above its square
+    for cell in sorted(npc_head_overhang_cells):
+        if cell[1] != min(Y_RANGE):
+            continue
+        off_cell = (cell[0], cell[1] - 1)
+        if off_cell in by_cell:
+            continue
+        if kinds is not None and not approach_cells(kinds, off_cell, identified=identified, people=people):
+            continue
+        overhang_descs: List[str] = []
+        for q in ("bottom_left", "bottom_right"):
+            t = identified.get((cell[0], cell[1], q))
+            if t is not None and getattr(t, "tag", None) == "npc" and t.description:
+                if t.description not in overhang_descs:
+                    overhang_descs.append(t.description)
+        by_cell[off_cell] = {
+            "npc": {
+                "quarters": set(QUARTER_OFFSETS),
+                "descriptions": overhang_descs or ["person just below the bottom edge of the screen"],
+            }
+        }
     top_counter_cell = (0, max(Y_RANGE))
     behind_top_counter_cell = (0, max(Y_RANGE) + 1)
     if (
@@ -471,7 +495,7 @@ def verbalize_cell(identified: Dict[TileKey, Tile], cell: Tuple[int, int]) -> st
         return "obstacle (vertical cliff wall; blocks moving left or right) in the right half"
     is_top_overhang = is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
     is_player_overhang = is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-    is_npc_head_overhang = is_npc_head_overhang_floor_cell(cell, quarter_tags)
+    is_npc_head_overhang = is_npc_head_overhang_floor_cell(cell, quarter_tags, quarter_images=quarter_images)
     patterned_cells = infer_spatial_patterned_floor_cells(
         quarter_tags, quarter_descriptions, quarter_images
     )

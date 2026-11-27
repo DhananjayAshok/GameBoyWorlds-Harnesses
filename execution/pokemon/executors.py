@@ -49,10 +49,11 @@ from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
                                                      filter_forward_edge_cells, filter_open_lane_edge_cells, in_bounds,
-                                                     is_boundary_exit_direction, is_ledge_roofed_edge_cell,
-                                                     is_on_edge, parse_all_cells, parse_avoided_cells,
-                                                     parse_cell, parse_edge_direction, shortest_path, verbalize_edges,
-                                                     warp_cells)
+                                                     is_bottom_edge_overhang_only_cell, is_boundary_exit_direction,
+                                                     is_ledge_roofed_edge_cell, is_on_edge, parse_all_cells,
+                                                     parse_avoided_cells, parse_cell, parse_edge_direction,
+                                                     resolve_interaction_target_and_constraints, shortest_path,
+                                                     verbalize_edges, warp_cells)
 from execution.executor_action import coords_to_string
 from execution.pokemon.executor_actions import CheckInteractionAction
 from execution.report import EnvironmentStepRecord, ExecutorVLMCallRecord
@@ -599,13 +600,21 @@ class InteractionExecutor(PolicyExecutor):
                     taken = 1
         return taken
 
-    def _align_to_target(self, target_cell: Tuple[int, int], records: List[EnvironmentStepRecord]) -> Optional[str]:
+    def _align_to_target(
+        self,
+        target_cell: Tuple[int, int],
+        records: List[EnvironmentStepRecord],
+        *,
+        allowed_facings: Optional[set] = None,
+        preferred_stand_cell: Optional[Tuple[int, int]] = None,
+    ) -> Optional[str]:
         people = None
         if callable(self.people_fn):
             try:
                 people = self.people_fn()
             except Exception:  # noqa: BLE001
                 people = None
+        gmap = getattr(self._env, "_map", None)
         kinds = self.cell_kinds
         if kinds is None and self.identified is not None:
             kinds = cell_kinds(
@@ -615,16 +624,31 @@ class InteractionExecutor(PolicyExecutor):
                 people,
                 getattr(self._env, "left_ledge_patterns", None),
                 getattr(self._env, "blocked_cells", None),
+                global_map=gmap,
             )
         if not kinds:
             return None
-        goals = approach_cells(kinds, target_cell, identified=self.identified, people=people)
+        if is_bottom_edge_overhang_only_cell(target_cell, identified=self.identified, global_map=gmap):
+            target_cell = (target_cell[0], target_cell[1] - 1)
+        all_goals = approach_cells(kinds, target_cell, identified=self.identified, people=people)
+        goals = approach_cells(
+            kinds,
+            target_cell,
+            identified=self.identified,
+            people=people,
+            allowed_facings=allowed_facings,
+            preferred_stand_cell=preferred_stand_cell,
+        )
         if not goals:
             return None
-        avoid = {c for c in parse_avoided_cells(self._task) if in_bounds(c)} | warp_cells(
-            self.identified, getattr(self._env, "_map", None)
+        base_avoid = {c for c in parse_avoided_cells(self._task) if in_bounds(c)} | warp_cells(
+            self.identified, gmap
         )
+        non_goal_adjacent = {c for c in all_goals if c not in goals and c != (0, 0)}
+        avoid = base_avoid | (non_goal_adjacent if (allowed_facings or preferred_stand_cell is not None) else set())
         path = shortest_path(kinds, (0, 0), goals, avoid_cells=avoid)
+        if (path is None or len(path) > self.MAX_ALIGN_STEPS) and non_goal_adjacent:
+            path = shortest_path(kinds, (0, 0), goals, avoid_cells=base_avoid)
         if path is None or len(path) > self.MAX_ALIGN_STEPS:
             return None
         if not path:
@@ -707,6 +731,7 @@ class InteractionExecutor(PolicyExecutor):
                 people,
                 getattr(self._env, "left_ledge_patterns", None),
                 getattr(self._env, "blocked_cells", None),
+                global_map=gmap,
             )
         return info, self.cell_kinds, people
 
@@ -740,6 +765,7 @@ class InteractionExecutor(PolicyExecutor):
                 people = self.people_fn()
             except Exception:  # noqa: BLE001
                 people = None
+        gmap = getattr(self._env, "_map", None)
         kinds = self.cell_kinds
         if kinds is None and self.identified is not None:
             kinds = cell_kinds(
@@ -749,27 +775,32 @@ class InteractionExecutor(PolicyExecutor):
                 people,
                 getattr(self._env, "left_ledge_patterns", None),
                 getattr(self._env, "blocked_cells", None),
+                global_map=gmap,
             )
-        explicit_coords = [
-            c
-            for c in parse_all_cells(self._task)
-            if c != (0, 0)
-            and (
-                in_bounds(c)
-                or (
-                    kinds is not None
-                    and bool(approach_cells(kinds, c, identified=self.identified, people=people))
-                )
-            )
-        ]
-        target_cell: Optional[Tuple[int, int]] = explicit_coords[0] if len(explicit_coords) == 1 else None
+        target_cell, allowed_facings, preferred_stand_cell = resolve_interaction_target_and_constraints(
+            self._task,
+            kinds=kinds,
+            identified=self.identified,
+            people=people,
+            global_map=gmap,
+        )
         direction = None
-        if (
-            target_cell is not None
-            and target_cell not in CheckInteractionAction.cardinals.values()
-        ):
+        need_walk_align = target_cell is not None and (
+            target_cell not in CheckInteractionAction.cardinals.values()
+            or (preferred_stand_cell is not None and preferred_stand_cell != (0, 0))
+            or (
+                bool(allowed_facings)
+                and self.CARDINAL_DIRECTIONS.get(target_cell) not in allowed_facings
+            )
+        )
+        if need_walk_align and target_cell is not None:
             before_place = self._current_map_place()
-            direction = self._align_to_target(target_cell, records)
+            direction = self._align_to_target(
+                target_cell,
+                records,
+                allowed_facings=allowed_facings,
+                preferred_stand_cell=preferred_stand_cell,
+            )
             if self._last_terminated or self._last_truncated:
                 return self._finish(records)
             if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay():
@@ -818,12 +849,22 @@ class InteractionExecutor(PolicyExecutor):
                 return self._fail("target_not_found")
             if result.get("cell") is not None:
                 target_cell = result.get("cell")
-            if code == 1:
+            if code == 1 or (
+                code == 0
+                and result.get("direction") is not None
+                and allowed_facings
+                and result.get("direction") not in allowed_facings
+            ):
                 cell = result.get("cell")
                 if cell is not None:
                     before_place = self._current_map_place()
                     rec_before = len(records)
-                    direction = self._align_to_target(cell, records)
+                    direction = self._align_to_target(
+                        cell,
+                        records,
+                        allowed_facings=allowed_facings,
+                        preferred_stand_cell=preferred_stand_cell,
+                    )
                     if self._last_terminated or self._last_truncated:
                         return self._finish(records)
                     if self._agent_state() != AgentState.FREE_ROAM or self._has_interaction_overlay():
@@ -1104,6 +1145,7 @@ class GridMoveExecutor(PolicyExecutor):
             people,
             getattr(self._env, "left_ledge_patterns", None),
             self._local_blocked_cells_from_history(),
+            global_map=gmap,
         )
         if blocked_neighbor is not None:
             kinds[blocked_neighbor] = BLOCKED
@@ -1632,6 +1674,7 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             people,
             getattr(self._env, "left_ledge_patterns", None),
             getattr(self._env, "blocked_cells", None),
+            global_map=gmap,
         )
         return kinds, identified
 

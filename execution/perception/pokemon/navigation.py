@@ -1,7 +1,7 @@
 import heapq
 import re
 from collections import deque
-from typing import Any, Collection, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -323,7 +323,35 @@ def is_player_overhang_ledge_cell(
     return is_south_ledge_cell(cell, quarter_tags, quarter_descriptions)
 
 
-def is_npc_head_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[str, str]]) -> bool:
+def _is_bottom_quarter_npc_head_overhang_image(
+    img: Optional[Any],
+    walkable_arrays: Sequence[np.ndarray],
+) -> bool:
+    arr = _quarter_array(img)
+    if arr is None:
+        return False
+    top4 = arr[:4, :]
+    bot4 = arr[4:, :]
+    top_black = int((top4 == 0).sum())
+    bot_black = int((bot4 == 0).sum())
+    if bot_black <= 0:
+        return False
+    if top_black == 0:
+        return True
+    for w_arr in walkable_arrays:
+        if w_arr is not None and w_arr.shape == (8, 8):
+            if np.array_equal(top4, w_arr[:4, :]) or np.array_equal(top4, w_arr[4:, :]):
+                if bot_black > top_black or int((bot4 >= 240).sum()) > int((top4 >= 240).sum()):
+                    return True
+    return False
+
+
+def is_npc_head_overhang_floor_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    global_map: Optional[Any] = None,
+) -> bool:
     if cell == (0, 1):
         return False
     cell_q = quarter_tags.get(cell, {})
@@ -337,7 +365,39 @@ def is_npc_head_overhang_floor_cell(cell: Cell, quarter_tags: Dict[Cell, Dict[st
         return False
     below_q = quarter_tags.get((cell[0], cell[1] - 1), {})
     below_top = {below_q[q] for q in ("top_left", "top_right") if q in below_q}
-    return "npc" in below_top
+    if "npc" in below_top:
+        return True
+    if cell[1] != min(Y_RANGE) or below_q:
+        return False
+    if quarter_images is not None:
+        cell_imgs = quarter_images.get(cell, {})
+        walkable_arrays = [
+            arr
+            for q in QUARTERS
+            if cell_q.get(q) in WALKABLE_TAGS
+            and (arr := _quarter_array(cell_imgs.get(q))) is not None
+        ]
+        npc_bottom_qs = [q for q in ("bottom_left", "bottom_right") if cell_q.get(q) == "npc"]
+        if npc_bottom_qs and all(
+            _is_bottom_quarter_npc_head_overhang_image(cell_imgs.get(q), walkable_arrays)
+            for q in npc_bottom_qs
+        ):
+            return True
+    if (
+        global_map is not None
+        and getattr(global_map, "current", None)
+        and getattr(global_map, "pos", None) is not None
+    ):
+        try:
+            si, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+            seg = global_map.segments[si] if 0 <= si < len(global_map.segments) else {}
+            abs_cell = (px + cell[0], py + cell[1])
+            mc = seg.get(abs_cell)
+            if mc is not None and getattr(mc, "kind", None) == WALKABLE:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
 
 
 PATTERNED_FLOOR_OBSTACLE_REJECT_DESC_PATTERN = re.compile(
@@ -563,11 +623,12 @@ def is_overhang_floor_cell(
     quarter_tags: Dict[Cell, Dict[str, str]],
     quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
     quarter_images: Optional[Dict[Cell, Dict[str, Optional[Any]]]] = None,
+    global_map: Optional[Any] = None,
 ) -> bool:
     return (
         is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
         or is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-        or is_npc_head_overhang_floor_cell(cell, quarter_tags)
+        or is_npc_head_overhang_floor_cell(cell, quarter_tags, quarter_images=quarter_images, global_map=global_map)
     )
 
 
@@ -615,6 +676,7 @@ def classify_cell_from_quarters(
     walk_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
     allow_player_overhang: bool = True,
     allow_player_cap: bool = True,
+    global_map: Optional[Any] = None,
 ) -> Tuple[str, Tuple[str, ...]]:
     cell_q = quarter_tags.get(cell, {})
     cell_d = (quarter_descriptions or {}).get(cell, {})
@@ -630,7 +692,7 @@ def classify_cell_from_quarters(
         return WALKABLE, tags
     if (
         allow_player_overhang and is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
-    ) or is_npc_head_overhang_floor_cell(cell, quarter_tags):
+    ) or is_npc_head_overhang_floor_cell(cell, quarter_tags, quarter_images=quarter_images, global_map=global_map):
         tags = tuple(sorted({cell_q[q] for q in ("top_left", "top_right") if q in cell_q})) or ("ground",)
         return WALKABLE, tags
     in_patterned = (
@@ -682,6 +744,7 @@ def cell_kinds(
     people: Optional[Dict[Cell, str]] = None,
     left_ledge_patterns: Optional[Collection[Tuple[Optional[str], ...]]] = None,
     blocked_cells: Optional[Collection[Cell]] = None,
+    global_map: Optional[Any] = None,
 ) -> Dict[Cell, str]:
     from execution.perception.pokemon.tiles import filter_cell_warp_quarter_tags, normalize_tabletop_tag
 
@@ -740,8 +803,43 @@ def cell_kinds(
             walk_patterns=walk_patterns,
             allow_player_overhang=True,
             allow_player_cap=True,
+            global_map=global_map,
         )
         kinds[cell] = BLOCKED if kind in ("occupied", "unknown") else kind
+    if (
+        global_map is not None
+        and getattr(global_map, "current", None)
+        and getattr(global_map, "pos", None) is not None
+    ):
+        try:
+            si, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+            seg = global_map.segments[si] if 0 <= si < len(global_map.segments) else {}
+            visits = global_map.visits[si] if 0 <= si < len(getattr(global_map, "visits", ())) else {}
+            seg_blocked = (
+                set(global_map.blocked_cells[si])
+                if 0 <= si < len(getattr(global_map, "blocked_cells", ()))
+                else set()
+            )
+            gatehouse_road_cells: set = set()
+            if hasattr(global_map, "side_gatehouse_doorways"):
+                for dw in global_map.side_gatehouse_doorways(si):
+                    gatehouse_road_cells.update(dw.get("road_cells", ()))
+            for cell, cell_tags in tags.items():
+                if cell == (0, 0) or kinds.get(cell) != BLOCKED:
+                    continue
+                if cell in confirmed_occupied or cell in empirical_blocked:
+                    continue
+                if cell_tags & {"npc", "water", "sign", "interactable object", "item", "ledge", "right_ledge", "left_ledge"}:
+                    continue
+                abs_cell = (px + cell[0], py + cell[1])
+                if abs_cell in seg_blocked:
+                    continue
+                mc = seg.get(abs_cell)
+                if mc is not None and getattr(mc, "kind", None) == WALKABLE:
+                    if visits.get(abs_cell, 0) > 0 or abs_cell in gatehouse_road_cells:
+                        kinds[cell] = WALKABLE
+        except Exception:  # noqa: BLE001
+            pass
     for cell, cell_q in quarter_tags.items():
         if (
             len(cell_q) == 4
@@ -1029,11 +1127,160 @@ def _is_npc_target_cell(
     return identified is None and people is None
 
 
+APPROACH_SIDE_TO_FACING = {
+    "north": "down",
+    "above": "down",
+    "top": "down",
+    "south": "up",
+    "below": "up",
+    "bottom": "up",
+    "east": "left",
+    "right": "left",
+    "west": "right",
+    "left": "right",
+}
+
+APPROACH_DIRECTION_CLAUSE_PATTERN = re.compile(
+    r"(?:"
+    r"\bfrom\s+(?:the\s+|directly\s+|its\s+)*(?:behind\s*\(\s*)?(north|south|east|west|left|right|above|below|top|bottom)(?:\s+or\s+(north|south|east|west|left|right|above|below|top|bottom))?"
+    r"|\b(?:on|to)\s+(?:the\s+|its\s+)+(north|south|east|west|left|right|top|bottom)\s+side\b"
+    r"|\bstand(?:ing)?\s+(?:directly\s+)?(north|south|east|west|left|right|above|below)\s+of\b"
+    r"|\bfacing\s+(up|down|left|right|north|south|east|west)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+FACING_WORD_TO_DIR = {
+    "up": "up",
+    "north": "up",
+    "down": "down",
+    "south": "down",
+    "left": "left",
+    "west": "left",
+    "right": "right",
+    "east": "right",
+}
+
+STAND_AT_COORD_PREFIX_PATTERN = re.compile(
+    r"\b(?:walk\s+to|move\s+to|step\s+to|stand\s+(?:at|on)|from\s+(?:tile|cell|position)?)\s*$",
+    re.IGNORECASE,
+)
+
+def is_bottom_edge_overhang_only_cell(
+    cell: Cell,
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    global_map: Optional[Any] = None,
+) -> bool:
+    if identified is None or cell[1] != min(Y_RANGE):
+        return False
+    from execution.perception.pokemon.tiles import filter_cell_warp_quarter_tags, normalize_tabletop_tag
+
+    q_tags: Dict[Cell, Dict[str, str]] = {}
+    q_imgs: Dict[Cell, Dict[str, Optional[Any]]] = {}
+    for c in (cell, (cell[0], cell[1] - 1)):
+        for q in QUARTERS:
+            tile = identified.get((c[0], c[1], q))
+            if tile is not None:
+                img = getattr(tile, "image", None)
+                q_tags.setdefault(c, {})[q] = normalize_tabletop_tag(
+                    tile.tag, getattr(tile, "description", None), img
+                )
+                q_imgs.setdefault(c, {})[q] = img
+        if c in q_tags:
+            q_tags[c] = filter_cell_warp_quarter_tags(q_tags[c])
+    return is_npc_head_overhang_floor_cell(cell, q_tags, quarter_images=q_imgs, global_map=global_map)
+
+
+def resolve_interaction_target_and_constraints(
+    task: Optional[str],
+    kinds: Optional[Dict[Cell, str]] = None,
+    identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
+    people: Optional[Dict[Cell, str]] = None,
+    global_map: Optional[Any] = None,
+) -> Tuple[Optional[Cell], set, Optional[Cell]]:
+    positive_cells = [c for c in parse_all_cells(task) if c != (0, 0)]
+    allowed_facings: set = set()
+    if task:
+        for match in APPROACH_DIRECTION_CLAUSE_PATTERN.finditer(task):
+            prefix = task[max(0, match.start() - 40):match.start()]
+            clause = re.split(r"[,;.:()\[\]]", prefix)[-1]
+            if AVOID_MARKER_PATTERN.search(clause):
+                continue
+            side1, side2, side3, side4, face_word = match.groups()
+            for s in (side1, side2, side3, side4):
+                if s:
+                    f_dir = APPROACH_SIDE_TO_FACING.get(s.lower())
+                    if f_dir:
+                        allowed_facings.add(f_dir)
+            if face_word:
+                f_dir = FACING_WORD_TO_DIR.get(face_word.lower())
+                if f_dir:
+                    allowed_facings.add(f_dir)
+
+    valid_cells: List[Cell] = []
+    for c in positive_cells:
+        if is_bottom_edge_overhang_only_cell(c, identified=identified, global_map=global_map):
+            c = (c[0], c[1] - 1)
+        if in_bounds(c) or (
+            kinds is not None and bool(approach_cells(kinds, c, identified=identified, people=people))
+        ):
+            if c not in valid_cells:
+                valid_cells.append(c)
+
+    target_cell: Optional[Cell] = None
+    stand_cell: Optional[Cell] = None
+    if len(valid_cells) == 1:
+        target_cell = valid_cells[0]
+    elif len(valid_cells) >= 2:
+        # Check if one cell is an explicit stand/walk-to cell and another is the target adjacent to it.
+        coord_matches = list(COORDINATE_PATTERN.finditer(task or ""))
+        stand_candidates: List[Cell] = []
+        for m in coord_matches:
+            c = (int(m.group(1)), int(m.group(2)))
+            if is_bottom_edge_overhang_only_cell(c, identified=identified, global_map=global_map):
+                c = (c[0], c[1] - 1)
+            prefix = (task or "")[max(0, m.start() - 32):m.start()]
+            if STAND_AT_COORD_PREFIX_PATTERN.search(prefix) and c in valid_cells:
+                stand_candidates.append(c)
+        non_stand = [c for c in valid_cells if c not in stand_candidates]
+        if stand_candidates and non_stand:
+            stand_cell = stand_candidates[0]
+            target_cell = non_stand[0]
+        else:
+            # Prefer a cell that is an NPC/object target over a walkable approach neighbor
+            npc_or_blocked = [
+                c for c in valid_cells
+                if _is_npc_target_cell(c, identified, people) or (kinds is not None and kinds.get(c) != WALKABLE)
+            ]
+            walkable_cands = [c for c in valid_cells if kinds is not None and kinds.get(c) == WALKABLE]
+            if len(npc_or_blocked) == 1:
+                target_cell = npc_or_blocked[0]
+                for wc in walkable_cands:
+                    if wc != target_cell and abs(wc[0] - target_cell[0]) + abs(wc[1] - target_cell[1]) in (1, 2):
+                        stand_cell = wc
+                        break
+            else:
+                target_cell = valid_cells[-1]
+                if valid_cells[0] != target_cell and abs(valid_cells[0][0] - target_cell[0]) + abs(valid_cells[0][1] - target_cell[1]) in (1, 2):
+                    stand_cell = valid_cells[0]
+
+    if stand_cell is not None and target_cell is not None:
+        dx = target_cell[0] - stand_cell[0]
+        dy = target_cell[1] - stand_cell[1]
+        for d_name, (ox, oy) in DIRECTIONS.items():
+            if (dx, dy) == (ox, oy) or (dx, dy) == (2 * ox, 2 * oy):
+                allowed_facings.add(d_name)
+                break
+    return target_cell, allowed_facings, stand_cell
+
+
 def approach_cells(
     kinds: Dict[Cell, str],
     target: Cell,
     identified: Optional[Dict[Tuple[int, int, str], Any]] = None,
     people: Optional[Dict[Cell, str]] = None,
+    allowed_facings: Optional[Collection[str]] = None,
+    preferred_stand_cell: Optional[Cell] = None,
 ) -> Dict[Cell, str]:
     cells = {}
     for direction, cell in neighbours(target):
@@ -1052,6 +1299,13 @@ def approach_cells(
                 continue
             facing = next(d for d, (ox, oy) in DIRECTIONS.items() if (ox, oy) == (-dx, -dy))
             cells[far] = facing
+    if preferred_stand_cell is not None and preferred_stand_cell in cells:
+        return {preferred_stand_cell: cells[preferred_stand_cell]}
+    if allowed_facings:
+        allowed_set = set(allowed_facings)
+        filtered = {c: f for c, f in cells.items() if f in allowed_set}
+        if filtered:
+            return filtered
     return cells
 
 

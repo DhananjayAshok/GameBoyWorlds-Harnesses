@@ -1185,7 +1185,7 @@ class PokemonStrategist:
             if self._identified:
                 kinds = cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
                                    people, self.global_map.left_ledge_patterns,
-                                   self._local_blocked_cells())
+                                   self._local_blocked_cells(), global_map=self.global_map)
                 self._screen_tiles = (verbalize_tiles(self._identified, people, kinds)
                                       + "\nWalkable cells on each edge of the screen:\n"
                                       + verbalize_edges(kinds, identified=self._identified, people=people, global_map=self.global_map))
@@ -1304,7 +1304,7 @@ class PokemonStrategist:
             return ""
         local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
                             self._screen_people(), self.global_map.left_ledge_patterns,
-                            self._local_blocked_cells())
+                            self._local_blocked_cells(), global_map=self.global_map)
                  if self._identified else None)
         self.global_map.prune_routes()
         _, failed = self._failure_streak()
@@ -1487,7 +1487,7 @@ class PokemonStrategist:
         self.global_map.mark_explored(self.start_episode + self._episodes_run)
         local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
                             self._screen_people(), self.global_map.left_ledge_patterns,
-                            self._local_blocked_cells())
+                            self._local_blocked_cells(), global_map=self.global_map)
                  if self._identified else None)
         seg_blocked_moves = self._current_segment_blocked_moves()
         lines = list(door_lines(self.global_map, local, blocked_moves=seg_blocked_moves))
@@ -1646,7 +1646,7 @@ class PokemonStrategist:
         self.global_map.clear_routes()
         local = (cell_kinds(self._identified, self.global_map.ledge_patterns, self.global_map.walk_patterns,
                             self._screen_people(), self.global_map.left_ledge_patterns,
-                            self._local_blocked_cells())
+                            self._local_blocked_cells(), global_map=self.global_map)
                  if self._identified else None)
         create_subgoals(self.goals, self.knowledge, self._current_place(),
                         explore_text(self.global_map, local, blocked_moves=self._current_segment_blocked_moves()),

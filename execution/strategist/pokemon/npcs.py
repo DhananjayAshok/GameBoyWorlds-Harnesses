@@ -2187,6 +2187,18 @@ class NPCRegistry(StrategistArtifact):
                     people[cell] = mark.npc_id
                     remembered.add(cell)
                 elif not (LEFT_COL <= cell[0] <= LEFT_COL + 9 and TOP_ROW - 8 <= cell[1] <= TOP_ROW):
+                    if (
+                        cell[1] == TOP_ROW - 9
+                        and LEFT_COL <= cell[0] <= LEFT_COL + 9
+                        and self._episode - mark.last_seen[0] <= STALE_MARK_EPISODES
+                        and self._free_identified
+                        and any(
+                            getattr(self._free_identified.get((cell[0], TOP_ROW - 8, q)), "tag", None) == "npc"
+                            for q in ("bottom_left", "bottom_right")
+                        )
+                    ):
+                        people[cell] = mark.npc_id
+                        continue
                     for dx, dy in ((0, 1), (0, -1), (-1, 0), (1, 0)):
                         mid_rel = (cell[0] + dx, cell[1] + dy)
                         far_rel = (cell[0] + 2 * dx, cell[1] + 2 * dy)
