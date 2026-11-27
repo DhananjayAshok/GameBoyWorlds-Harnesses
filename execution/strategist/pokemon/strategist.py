@@ -497,6 +497,13 @@ def sanitize_stale_notepad_bag_status(text: str, healing_bag_empty: bool) -> str
         out,
         flags=re.IGNORECASE,
     )
+    if out != text:
+        out = re.sub(
+            r"\bthen\s+heal\s+at\s+the\s+[^,;.\n]*?Pok[eé]mon\s+Center\s+or\s+",
+            "then ",
+            out,
+            flags=re.IGNORECASE,
+        )
     return out
 
 
