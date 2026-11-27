@@ -21,21 +21,26 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_no_pp_dialogue_frame, is_overworld_pack_menu,
                                                  is_pack_action_subbox_screen, is_pack_item_list_screen,
                                                  is_pack_screen, is_party_menu_screen,
+                                                 has_party_subbox,
                                                  is_party_menu_selection_screen, is_same_battle_frame,
-                                                 is_start_menu_screen, is_tm_hm_pack_pocket,
+                                                 is_start_menu_screen, is_tm_hm_item_name,
+                                                 is_tm_hm_pack_pocket, is_tm_hm_startup_dialogue_frame,
                                                  is_healing_item_name, is_item_use_subbox_screen,
                                                  is_party_boost_item_name, is_party_consumable_item_name,
                                                  is_status_heal_item_for_status,
                                                  is_status_heal_item_name,
+                                                 pack_action_box_height,
                                                  read_bag_cursor_row, read_bag_cursor_row_index,
                                                  read_bag_item_list,
                                                  read_bag_item_quantities, read_battle_hud_hp,
-                                                 read_battle_hud_status, read_menu_cursor_item_name,
+                                                 read_battle_hud_status, read_dialogue_box_lines,
+                                                 read_menu_cursor_item_name,
                                                  read_move_menu_cursor_slot,
                                                  read_move_menu_names, read_move_menu_pp,
                                                  read_party_menu_cursor_slot, read_party_menu_hp,
                                                  read_party_menu_members, read_party_menu_status,
-                                                 read_quantity_selector_value)
+                                                 read_party_move_forget_list, read_quantity_selector_value,
+                                                 read_tm_hm_pocket_rows)
 from execution.perception.pokemon.navigation import (BLOCKED, DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, approach_cells,
                                                      boundary_exit_direction, cell_kinds, compress_path,
                                                      diagonal_barrier_pairs, edge_cells, edge_runs,
@@ -4025,6 +4030,7 @@ Press: <one of up, down, left, right, confirm, back>
         self._confirmed_bag_items: set = set()
         self._last_auto_scrolled_confirmed_count: Optional[int] = None
         self._quantity_adjusted_in_box: bool = False
+        self._completed_tm_hm_party_attempt: bool = False
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
@@ -4321,17 +4327,32 @@ Press: <one of up, down, left, right, confirm, back>
                     auto_steps.append("settled effect dialogue")
         return auto_steps
 
+    def _task_allows_tm_hm_use(self) -> bool:
+        clause = self._task_bag_clause()
+        return not bool(
+            re.search(r"\b(?:toss|discard|drop|give|hold|sell|deposit|store)\b", clause, re.IGNORECASE)
+        )
+
     def _advance_tm_hm_use_to_party_screen(self) -> bool:
         if self._current_call is None:
             self._begin_scripted("advance TM/HM startup prompts to party selection screen")
-        for _ in range(6):
+        for _ in range(12):
             if self._last_terminated or self._last_truncated:
                 return False
             cur_frame = self._get_state()["core"]["current_frame"]
             if is_party_menu_screen(cur_frame):
                 return True
-            if not is_tm_hm_pack_pocket(cur_frame):
+            if effective_agent_state(self._agent_state(), cur_frame) != AgentState.IN_MENU:
                 break
+            if (
+                not is_tm_hm_pack_pocket(cur_frame)
+                and not is_tm_hm_startup_dialogue_frame(cur_frame)
+                and not is_gen1_item_list_screen(cur_frame)
+                and not has_bottom_dialogue_box(cur_frame)
+            ):
+                wait_rec = self._take_action(WaitAction)
+                drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                continue
             rec = self._take_action(MenuAction, menu_action="confirm")
             drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
         return is_party_menu_screen(self._get_state()["core"]["current_frame"])
@@ -4580,6 +4601,34 @@ Press: <one of up, down, left, right, confirm, back>
                 lines.append(
                     "Note: All bag slots were checked and there is NO Antidote or status-healing item in the bag."
                 )
+        tm_hm_rows = read_tm_hm_pocket_rows(cur_frame)
+        if tm_hm_rows:
+            lines.append(f"Visible TM/HM pocket rows in order: {', '.join(tm_hm_rows)}.")
+        if self._completed_tm_hm_party_attempt and (
+            is_tm_hm_pack_pocket(cur_frame)
+            or is_gen1_item_list_screen(cur_frame)
+            or is_start_menu_screen(cur_frame)
+        ):
+            lines.append(
+                "Status: TM/HM move teaching on the party screen is finished and the screen has returned to the menu — do NOT press confirm on the item again; press back to close the Pack/Item and Start menus."
+            )
+        forget_info = read_party_move_forget_list(cur_frame)
+        if forget_info is not None:
+            f_moves, f_cur = forget_info
+            cur_note = f" (currently highlighted: {f_cur})" if f_cur else ""
+            lines.append(
+                f"Move-forget selection box open — moves in order: {', '.join(f_moves)}{cur_note}. Press up/down to select the move to forget and press confirm to forget it (do NOT press back)."
+            )
+        elif is_party_menu_screen(cur_frame) and has_party_subbox(cur_frame):
+            d_l1, _ = read_dialogue_box_lines(cur_frame)
+            if d_l1.lower().startswith("stop ") or d_l1.lower().startswith("abandon "):
+                lines.append(
+                    "Prompt: 'Stop learning move?' YES/NO box is open — press back (or select NO) to continue teaching the move."
+                )
+            else:
+                lines.append(
+                    "Prompt: 'Delete an older move to make room?' YES/NO box is open — press confirm on YES to choose a move to forget."
+                )
         if has_quantity_selector_box(cur_frame) and not has_menu_cursor(cur_frame):
             q_val = read_quantity_selector_value(cur_frame)
             if q_val is not None:
@@ -4640,6 +4689,10 @@ Press: <one of up, down, left, right, confirm, back>
                 return
             if not self._has_menu_bottom_box(frame) or has_menu_cursor(frame):
                 return
+            if has_party_subbox(frame) or pack_action_box_height(frame) >= 4:
+                wait_rec = self._take_action(WaitAction)
+                drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                return
             if is_party_menu_screen(frame) and not has_bottom_dialogue_box(frame):
                 wait_rec = self._take_action(WaitAction)
                 drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
@@ -4659,6 +4712,10 @@ Press: <one of up, down, left, right, confirm, back>
             after_dismiss = self._get_state()["core"]["current_frame"]
             state = effective_agent_state(self._agent_state(), after_dismiss)
             if state != AgentState.IN_MENU or not self._has_menu_bottom_box(after_dismiss) or has_menu_cursor(after_dismiss):
+                return
+            if has_party_subbox(after_dismiss) or pack_action_box_height(after_dismiss) >= 4:
+                wait_rec = self._take_action(WaitAction)
+                drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
                 return
             if is_same_battle_frame(dismiss_rec.frame_before, dismiss_rec.frame_after):
                 wait_rec = self._take_action(WaitAction)
@@ -4795,10 +4852,16 @@ Press: <one of up, down, left, right, confirm, back>
             self.presses.append(press)
             self.press_outcomes.append(press)
             was_party_menu = is_party_menu_screen(frame)
+            was_tm_hm_context = (
+                is_tm_hm_pack_pocket(frame)
+                or is_tm_hm_startup_dialogue_frame(frame)
+                or is_tm_hm_item_name(self._active_menu_item)
+                or is_tm_hm_item_name(self._pending_bag_item)
+            )
             was_tm_hm_use = (
                 press == "confirm"
-                and is_tm_hm_pack_pocket(frame)
-                and is_item_use_subbox_screen(frame)
+                and was_tm_hm_context
+                and (is_item_use_subbox_screen(frame) or is_tm_hm_startup_dialogue_frame(frame))
             )
             record = self._take_action(MenuAction, menu_action=press)
             drop_prefix_crops(captured_dialogue_crops([record]), self.dialogue_crops)
@@ -4806,6 +4869,25 @@ Press: <one of up, down, left, right, confirm, back>
                 return self._finish(MENU_TERMINATED, "terminated")
             if self._last_truncated:
                 return self._finish(MENU_TRUNCATED, "truncated")
+            after_frame = self._get_state()["core"]["current_frame"]
+            if (
+                press == "confirm"
+                and not was_tm_hm_use
+                and self._task_allows_tm_hm_use()
+                and is_item_use_subbox_screen(after_frame)
+                and (
+                    is_tm_hm_pack_pocket(after_frame)
+                    or is_tm_hm_item_name(self._active_menu_item)
+                    or is_tm_hm_item_name(self._pending_bag_item)
+                )
+            ):
+                use_rec = self._take_action(MenuAction, menu_action="confirm")
+                drop_prefix_crops(captured_dialogue_crops([use_rec]), self.dialogue_crops)
+                if self._last_terminated:
+                    return self._finish(MENU_TERMINATED, "terminated")
+                if self._last_truncated:
+                    return self._finish(MENU_TRUNCATED, "truncated")
+                was_tm_hm_use = True
             if was_tm_hm_use:
                 reached_party = self._advance_tm_hm_use_to_party_screen()
                 if self._last_terminated:
@@ -4818,6 +4900,15 @@ Press: <one of up, down, left, right, confirm, back>
                         "select an ABLE party Pokemon with confirm to teach the move)"
                     )
             after_frame = self._get_state()["core"]["current_frame"]
+            if press == "back" and is_start_menu_screen(after_frame) and not has_menu_cursor(after_frame):
+                for _ in range(2):
+                    wait_rec = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                    if self._last_terminated or self._last_truncated:
+                        break
+                    after_frame = self._get_state()["core"]["current_frame"]
+                    if has_menu_cursor(after_frame) or not is_start_menu_screen(after_frame):
+                        break
             bag_after = self._scan_bag_frame(after_frame)
             if bag_before is not None and bag_after is not None:
                 after_bag_cursor = read_bag_cursor_row(after_frame, tracked_index=self._bag_cursor_idx)
@@ -4895,7 +4986,12 @@ Press: <one of up, down, left, right, confirm, back>
                 after_settle = self._get_state()["core"]["current_frame"]
                 self._scan_bag_frame(after_settle)
                 if was_party_menu and not is_party_menu_screen(after_settle):
-                    if any(self._bag_target_matches(it) for it in self._seen_bag_items):
+                    if is_tm_hm_pack_pocket(after_settle) or is_tm_hm_item_name(self._active_menu_item):
+                        self._completed_tm_hm_party_attempt = True
+                        self.press_outcomes[-1] = (
+                            f"{press} (completed TM/HM move teaching on party Pokemon, settled move-learning text, and returned to item menu — do NOT press confirm again; press back to close the Pack/Item and Start menus)"
+                        )
+                    elif any(self._bag_target_matches(it) for it in self._seen_bag_items):
                         self.press_outcomes[-1] = (
                             f"{press} (used on party Pokemon, settled healing/effect text, and returned to item menu)"
                         )

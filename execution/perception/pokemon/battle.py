@@ -697,13 +697,15 @@ def pack_action_box_height(frame: np.ndarray) -> int:
 
 
 def is_pack_item_list_screen(frame: np.ndarray) -> bool:
-    """Return True if the screen shows the Generation 2 Pack item list without an open action/quantity sub-box."""
+    """Return True if the screen shows the Generation 2 Pack item list without an open action/quantity sub-box or TM/HM startup dialogue."""
     if not is_pack_screen(frame):
         return False
     img = _grey_frame(frame)
     if pack_action_box_height(img) >= 4:
         return False
     if has_quantity_selector_box(img):
+        return False
+    if is_tm_hm_startup_dialogue_frame(img):
         return False
     return True
 
@@ -1037,11 +1039,41 @@ HUD_LETTER_TEMPLATES: Dict[Tuple[int, ...], str] = {
     (130, 130, 130, 130, 130, 66, 62, 0): "U",
     (130, 130, 68, 68, 40, 40, 16, 0): "V",
     (130, 146, 170, 170, 198, 198, 130, 0): "W",
+    (130, 130, 146, 170, 198, 198, 130, 0): "W",
     (198, 68, 40, 16, 40, 68, 198, 0): "X",
     (130, 68, 40, 16, 16, 16, 16, 0): "Y",
     (254, 4, 8, 16, 32, 64, 254, 0): "Z",
     (48, 192, 60, 66, 126, 64, 62, 0): "E",
     (0, 0, 0, 126, 0, 0, 0, 0): "-",
+    (0, 0, 0, 0, 126, 0, 0, 0): "-",
+}
+
+DIALOGUE_LOWER_TEMPLATES: Dict[Tuple[int, ...], str] = {
+    (0, 0, 56, 4, 60, 68, 62, 0): "a",
+    (64, 64, 64, 124, 66, 66, 124, 0): "b",
+    (0, 0, 62, 64, 64, 64, 62, 0): "c",
+    (2, 2, 2, 62, 66, 66, 62, 0): "d",
+    (0, 0, 60, 66, 126, 64, 62, 0): "e",
+    (12, 18, 16, 126, 16, 16, 16, 0): "f",
+    (0, 0, 62, 66, 66, 62, 2, 124): "g",
+    (64, 64, 64, 120, 68, 68, 68, 0): "h",
+    (0, 16, 0, 16, 16, 16, 16, 0): "i",
+    (64, 64, 70, 88, 96, 88, 70, 0): "k",
+    (16, 16, 16, 16, 16, 16, 16, 0): "l",
+    (0, 0, 236, 146, 146, 146, 146, 0): "m",
+    (0, 0, 60, 34, 34, 34, 34, 0): "n",
+    (0, 0, 60, 66, 66, 66, 60, 0): "o",
+    (0, 0, 124, 66, 66, 124, 64, 64): "p",
+    (0, 0, 78, 80, 96, 64, 64, 0): "r",
+    (0, 0, 60, 64, 60, 2, 124, 0): "s",
+    (0, 16, 124, 16, 16, 16, 12, 0): "t",
+    (0, 0, 68, 68, 68, 68, 60, 0): "u",
+    (0, 0, 68, 68, 68, 40, 16, 0): "v",
+    (0, 0, 130, 146, 146, 170, 68, 0): "w",
+    (0, 0, 68, 68, 68, 60, 4, 120): "y",
+    (126, 231, 206, 24, 0, 24, 24, 0): "?",
+    (24, 60, 60, 60, 24, 0, 24, 24): "!",
+    (0, 0, 0, 0, 0, 24, 24, 0): ".",
 }
 
 GEN1_POKEDOLLAR_SIGNATURE = (60, 36, 60, 32, 112, 32, 112, 32)
@@ -1255,6 +1287,62 @@ def is_gen1_item_list_screen(frame: np.ndarray) -> bool:
     return True
 
 
+def read_dialogue_box_lines(frame: np.ndarray, tx_start: int = 1, tx_end: int = 18) -> Tuple[str, str]:
+    """Read the two mixed-case text lines (tile rows 14 and 16) inside the bottom dialogue box."""
+    if frame is None or not has_bottom_dialogue_box(frame):
+        return ("", "")
+    img = _grey_frame(frame)
+    lines: List[str] = []
+    max_tx = min(tx_end, img.shape[1] // TILE_SIZE)
+    for ty in (14, 16):
+        y0 = ty * TILE_SIZE
+        if img.shape[0] < y0 + TILE_SIZE:
+            lines.append("")
+            continue
+        chars: List[str] = []
+        for tx in range(tx_start, max_tx):
+            tile = img[y0:y0 + TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+            if float((tile >= LIGHT_BACKGROUND).mean()) < 0.45:
+                break
+            sig = _tile_row_signature(tile)
+            if not any(sig):
+                chars.append(" ")
+            elif sig in HUD_LETTER_TEMPLATES:
+                chars.append(HUD_LETTER_TEMPLATES[sig])
+            elif sig in DIALOGUE_LOWER_TEMPLATES:
+                chars.append(DIALOGUE_LOWER_TEMPLATES[sig])
+            elif sig in HUD_DIGIT_TEMPLATES:
+                chars.append(str(HUD_DIGIT_TEMPLATES[sig]))
+            else:
+                chars.append(" ")
+        lines.append(" ".join("".join(chars).split()))
+    return (lines[0], lines[1])
+
+
+def is_tm_hm_startup_dialogue_frame(frame: np.ndarray) -> bool:
+    """Return True when the bottom dialogue box shows a TM/HM boot or teaching confirmation prompt ('Booted up...', 'It contained...', 'Teach ... to a POKeMON?')."""
+    if frame is None or not has_bottom_dialogue_box(frame) or is_party_menu_screen(frame):
+        return False
+    line1, line2 = read_dialogue_box_lines(frame, tx_start=1, tx_end=15)
+    l1_low = line1.lower()
+    l2_low = line2.lower()
+    if "booted up" in l1_low or l1_low.startswith("booted ") or "booted a" in l1_low:
+        return True
+    if l1_low.startswith("it contain") or "contained" in l1_low:
+        return True
+    if l1_low.startswith("teach ") or l2_low.startswith("to a p"):
+        return True
+    return False
+
+
+def is_tm_hm_item_name(name: Optional[str]) -> bool:
+    """Return True if a bag or Pack item name is a TM or HM (e.g. 'TM34', 'HM01', '31 MUD-SLAP', 'H1 CUT')."""
+    up = re.sub(r"\s*\(X\d+\)\s*$", "", (name or "").strip().upper())
+    if not up or up == "CANCEL":
+        return False
+    return bool(re.match(r"^(?:(?:TM|HM)\s*\d|\d{2}\s+[A-Z]|H\d\s+[A-Z])", up))
+
+
 def is_tm_hm_pack_pocket(frame: np.ndarray) -> bool:
     """Return True if the Generation 2 Pack screen is displaying the TM/HM pocket (with 2-character TM/HM codes at columns 5..6)."""
     if not is_pack_screen(frame):
@@ -1265,6 +1353,28 @@ def is_tm_hm_pack_pocket(frame: np.ndarray) -> bool:
         if code and re.match(r"^(?:\d{2}|H\d)$", code):
             return True
     return False
+
+
+def read_tm_hm_pocket_rows(frame: np.ndarray) -> Optional[List[str]]:
+    """Return formatted visible rows (e.g. ['31 MUD-SLAP (x1)', 'H1 CUT', 'CANCEL']) when the Gen 2 TM/HM pocket list is open, or None."""
+    if not is_tm_hm_pack_pocket(frame) or not is_pack_item_list_screen(frame):
+        return None
+    img = _grey_frame(frame)
+    rows: List[str] = []
+    for ty in (2, 4, 6, 8, 10):
+        code = read_tile_text(img, ty, 5, 7)
+        name = read_tile_text(img, ty, 8, 20)
+        if not name:
+            continue
+        if name == "CANCEL" or name.startswith("CANCEL "):
+            rows.append("CANCEL")
+            break
+        qty = read_tile_quantity(img, ty + 1, 17, 20)
+        label = f"{code} {name}".strip() if code else name
+        if qty is not None:
+            label = f"{label} (x{qty})"
+        rows.append(label)
+    return rows if rows else None
 
 
 def read_bag_item_list(frame: np.ndarray) -> Optional[Tuple[List[str], bool]]:
@@ -1649,20 +1759,78 @@ def is_overworld_pack_use_subbox_screen(frame: np.ndarray) -> bool:
                 for tx in range(left_tx + 1, span_end)
             ):
                 continue
-            if is_cursor_tile(
-                img[(top_ty + 1) * TILE_SIZE:(top_ty + 2) * TILE_SIZE, (left_tx + 1) * TILE_SIZE:(left_tx + 2) * TILE_SIZE]
+            if (
+                is_cursor_tile(
+                    img[(top_ty + 1) * TILE_SIZE:(top_ty + 2) * TILE_SIZE, (left_tx + 1) * TILE_SIZE:(left_tx + 2) * TILE_SIZE]
+                )
+                and read_tile_text(img, top_ty + 1, left_tx + 2, 19) == "USE"
             ):
                 return True
     return False
 
 
 def is_item_use_subbox_screen(frame: np.ndarray) -> bool:
-    """Return True if a Gen 1 or Gen 2 item action sub-box (USE/TOSS or USE/GIVE/TOSS/QUIT) is open with cursor on USE."""
+    """Return True if a Gen 1 or Gen 2 item action sub-box (USE/TOSS, USE/QUIT, or USE/GIVE/TOSS/QUIT) is open with cursor on USE."""
     return (
-        is_pack_action_subbox_screen(frame)
-        or is_overworld_pack_use_subbox_screen(frame)
+        is_overworld_pack_use_subbox_screen(frame)
         or is_gen1_item_action_subbox_screen(frame)
     )
+
+
+def has_party_subbox(frame: np.ndarray) -> bool:
+    """Return True if an interactive sub-box (YES/NO, 4-move deletion box, or party action menu) is drawn on the party screen."""
+    if not is_party_menu_screen(frame):
+        return False
+    img = _grey_frame(frame)
+    right_v = sum(
+        1 for ty in range(3, 12)
+        if is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 19 * TILE_SIZE:20 * TILE_SIZE])
+    )
+    if right_v < 3:
+        return False
+    return any(
+        all(
+            is_horizontal_border_tile(img[top_ty * TILE_SIZE:(top_ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+            for tx in range(15, 19)
+        )
+        for top_ty in range(2, 9)
+    )
+
+
+def read_party_move_forget_list(frame: np.ndarray) -> Optional[Tuple[List[str], Optional[str]]]:
+    """Return (move_names, highlighted_move) when the 4-move forget box ('Which move should be forgotten?') is open on a party screen, or None."""
+    if not is_party_menu_screen(frame):
+        return None
+    img = _grey_frame(frame)
+    if (
+        all(is_horizontal_border_tile(img[2 * TILE_SIZE:3 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]) for tx in range(5, 19))
+        and sum(1 for ty in range(3, 11) if is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 19 * TILE_SIZE:20 * TILE_SIZE])) >= 6
+    ):
+        moves: List[str] = []
+        cur_move: Optional[str] = None
+        for ty in (4, 6, 8, 10):
+            name = read_tile_text(img, ty, 7, 19)
+            if name and name != "-":
+                moves.append(name)
+                if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 6 * TILE_SIZE:7 * TILE_SIZE]):
+                    cur_move = name
+        if len(moves) >= 2:
+            return (moves, cur_move)
+    if (
+        all(is_horizontal_border_tile(img[7 * TILE_SIZE:8 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]) for tx in range(5, 19))
+        and all(is_horizontal_border_tile(img[12 * TILE_SIZE:13 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]) for tx in range(5, 19))
+    ):
+        moves = []
+        cur_move = None
+        for ty in (8, 9, 10, 11):
+            name = read_tile_text(img, ty, 6, 19)
+            if name and name != "-":
+                moves.append(name)
+                if is_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 5 * TILE_SIZE:6 * TILE_SIZE]):
+                    cur_move = name
+        if len(moves) >= 2:
+            return (moves, cur_move)
+    return None
 
 
 def read_party_menu_members(frame: np.ndarray) -> List[Tuple[int, str, Optional[Tuple[int, int]]]]:
