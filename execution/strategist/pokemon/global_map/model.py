@@ -1965,8 +1965,179 @@ class GlobalMap(StrategistArtifact):
                             healed += 1
         return healed
 
+    def _heal_unwarped_segment_splits(self) -> int:
+        healed = 0
+        if len(self.trail) < 2:
+            return 0
+        while True:
+            split_idx = None
+            for idx in range(len(self.trail) - 1, 0, -1):
+                t_prev, s_prev, p_prev = self.trail[idx - 1]
+                t_cur, s_cur, p_cur = self.trail[idx]
+                if s_prev == s_cur:
+                    continue
+                rs_prev, rp_prev = self.resolve(s_prev, p_prev)
+                rs_cur, rp_cur = self.resolve(s_cur, p_cur)
+                if rs_prev == rs_cur:
+                    continue
+                has_warp = any(
+                    t_prev <= wt <= t_cur
+                    and (
+                        self.resolve(wa, (0, 0))[0] in (rs_prev, rs_cur)
+                        or self.resolve(wb, (0, 0))[0] in (rs_prev, rs_cur)
+                    )
+                    for wt, wa, _, wb, _ in self.warps
+                )
+                if has_warp:
+                    continue
+                if any(self.resolve(s, (0, 0))[0] != rs_cur for _, s, _ in self.trail[idx:]):
+                    continue
+                earlier_in_cur = [t for t, s, _ in self.trail[:idx] if self.resolve(s, (0, 0))[0] == rs_cur]
+                if not earlier_in_cur:
+                    continue
+                base_ox = rp_prev[0] - rp_cur[0]
+                base_oy = rp_prev[1] - rp_cur[1]
+                seg_cur = self.segments[rs_cur]
+                seg_prev = self.segments[rs_prev]
+                if not seg_cur or not seg_prev:
+                    continue
+                new_cells = {g: c for g, c in seg_cur.items() if c.last_seen >= t_cur}
+                best_off = None
+                best_score = (-1, -1)
+                for dx in range(-2, 3):
+                    for dy in range(-2, 3):
+                        if abs(dx) + abs(dy) > 2:
+                            continue
+                        ox, oy = base_ox + dx, base_oy + dy
+                        m = tot = 0
+                        for g, c in new_cells.items():
+                            c2 = seg_prev.get((g[0] + ox, g[1] + oy))
+                            if c2 is None or c.kind == OCCUPIED or c2.kind == OCCUPIED:
+                                continue
+                            u1 = len(set(c.hashes)) == 1
+                            u2 = len(set(c2.hashes)) == 1
+                            if u1 and u2:
+                                continue
+                            tot += 1
+                            if not u1 and not u2 and _cells_match(c.hashes, c.pixels, c2):
+                                m += 1
+                        score = (m, -abs(dx) - abs(dy))
+                        if tot >= 5 and m / tot >= 0.5 and score > best_score:
+                            best_score = score
+                            best_off = (ox, oy)
+                if best_off is None:
+                    continue
+                split_idx = (idx, t_cur, rs_cur, rs_prev, best_off)
+                break
+            if split_idx is None:
+                break
+            idx, t_cur, rs_cur, rs_prev, (ox, oy) = split_idx
+            seg_cur = self.segments[rs_cur]
+            seg_prev = self.segments[rs_prev]
+            for g, c in list(seg_cur.items()):
+                if c.last_seen >= t_cur:
+                    g_dst = (g[0] + ox, g[1] + oy)
+                    if g_dst not in seg_prev:
+                        seg_prev[g_dst] = c
+                    if c.first_seen >= t_cur:
+                        seg_cur.pop(g, None)
+            post_pts = [self.resolve(s, p)[1] for _, s, p in self.trail[idx:] if self.resolve(s, (0, 0))[0] == rs_cur]
+            post_filled = set()
+            for i, p1 in enumerate(post_pts):
+                post_filled.add(p1)
+                if i + 1 < len(post_pts):
+                    p2 = post_pts[i + 1]
+                    if (p1[0] == p2[0]) != (p1[1] == p2[1]) and 1 < abs(p2[0] - p1[0]) + abs(p2[1] - p1[1]) <= MAX_STEP_FILL:
+                        sx = (p2[0] > p1[0]) - (p2[0] < p1[0])
+                        sy = (p2[1] > p1[1]) - (p2[1] < p1[1])
+                        for k in range(1, abs(p2[0] - p1[0]) + abs(p2[1] - p1[1])):
+                            post_filled.add((p1[0] + sx * k, p1[1] + sy * k))
+            pre_pts = [self.resolve(s, p)[1] for _, s, p in self.trail[:idx] if self.resolve(s, (0, 0))[0] == rs_cur]
+            pre_visits: Counter = Counter()
+            for i, p1 in enumerate(pre_pts):
+                pre_visits[p1] += 1
+                if i + 1 < len(pre_pts):
+                    p2 = pre_pts[i + 1]
+                    if (p1[0] == p2[0]) != (p1[1] == p2[1]) and 1 < abs(p2[0] - p1[0]) + abs(p2[1] - p1[1]) <= MAX_STEP_FILL:
+                        sx = (p2[0] > p1[0]) - (p2[0] < p1[0])
+                        sy = (p2[1] > p1[1]) - (p2[1] < p1[1])
+                        for k in range(1, abs(p2[0] - p1[0]) + abs(p2[1] - p1[1])):
+                            mid = (p1[0] + sx * k, p1[1] + sy * k)
+                            c_mid = seg_cur.get(mid)
+                            if c_mid is None or c_mid.kind not in (BLOCKED, LEDGE, LEDGE_LEFT):
+                                pre_visits[mid] += 1
+            for g in post_filled:
+                old_v = self.visits[rs_cur].get(g, 0)
+                keep_v = pre_visits.get(g, 0)
+                moved_v = max(0, old_v - keep_v)
+                if keep_v > 0:
+                    self.visits[rs_cur][g] = keep_v
+                else:
+                    self.visits[rs_cur].pop(g, None)
+                if moved_v > 0:
+                    self.visits[rs_prev][(g[0] + ox, g[1] + oy)] += moved_v
+            warp_doors_cur = [
+                self._door_at(rs_cur, self.resolve(s, p)[1])
+                for _, wa, pa, wb, pb in self.warps
+                for s, p in ((wa, pa), (wb, pb))
+                if self.resolve(s, (0, 0))[0] == rs_cur
+            ]
+            ref_ground = next(
+                (
+                    mc for gp, mc in seg_cur.items()
+                    if mc.first_seen < t_cur and mc.kind == WALKABLE and not is_door(mc) and pre_visits.get(gp, 0) > 0
+                ),
+                None,
+            )
+            for g, c in list(seg_cur.items()):
+                if (
+                    c.first_seen < t_cur <= c.last_seen
+                    and is_door(c)
+                    and pre_visits.get(g, 0) > 0
+                    and not any(max(abs(g[0] - wd[0]), abs(g[1] - wd[1])) <= 2 for wd in warp_doors_cur)
+                ):
+                    seg_cur[g] = MapCell(
+                        WALKABLE,
+                        ("ground",),
+                        ref_ground.hashes if ref_ground is not None else c.hashes,
+                        c.first_seen,
+                        c.last_seen,
+                        ref_ground.pixels if ref_ground is not None else c.pixels,
+                    )
+            if rs_cur < len(self.blocked_moves) and self.blocked_moves[rs_cur]:
+                while len(self.blocked_moves) <= rs_prev:
+                    self.blocked_moves.append({})
+                for b_pos, dirs in list(self.blocked_moves[rs_cur].items()):
+                    if b_pos in post_filled and b_pos not in pre_visits:
+                        self.blocked_moves[rs_prev].setdefault((b_pos[0] + ox, b_pos[1] + oy), set()).update(dirs)
+                        self.blocked_moves[rs_cur].pop(b_pos, None)
+            self.trail = [
+                (t, rs_prev, (self.resolve(s, p)[1][0] + ox, self.resolve(s, p)[1][1] + oy))
+                if (i >= idx and self.resolve(s, (0, 0))[0] == rs_cur)
+                else (t, s, p)
+                for i, (t, s, p) in enumerate(self.trail)
+            ]
+            if self.segment == rs_cur and self.pos is not None:
+                self.segment = rs_prev
+                self.pos = (self.pos[0] + ox, self.pos[1] + oy)
+                if getattr(self, "_anchor_place", None) is not None and self._anchor_place[0] == rs_cur:
+                    ap = self._anchor_place[1]
+                    self._anchor_place = (rs_prev, (ap[0] + ox, ap[1] + oy))
+            self.naming_queue = [e for e in self.naming_queue if e.get("segment") != rs_cur]
+            info_cur = self.info(rs_cur)
+            if info_cur.aliases:
+                old_name, old_desc = info_cur.aliases.pop(0)
+                info_cur.name, info_cur.description = old_name, old_desc
+            if not self.frontier(rs_cur) and info_cur.explored is None:
+                info_cur.explored = info_cur.episode
+            self._seg_index_cache = {}
+            self._overlap_cache = {}
+            healed += 1
+        return healed
+
     def consolidate(self, judge: Optional[Callable[[int, int, Dict[str, Any]], Optional[bool]]] = None
                     ) -> List[Dict[str, Any]]:
+        self._heal_unwarped_segment_splits()
         self.prune_transient_segments()
         self._heal_aliased_merged_doors()
         merged = []
