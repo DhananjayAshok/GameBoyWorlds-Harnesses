@@ -1692,6 +1692,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
         ):
             complete = True
             replan_needed = False
+        elif (
+            not complete
+            and after_state == AgentState.FREE_ROAM
+            and self._is_satisfied_across_water_trainer_subgoal(
+                subgoal, request, after_kinds, after_identified if after_state == AgentState.FREE_ROAM else None,
+                after_people if after_state == AgentState.FREE_ROAM else None,
+            )
+        ):
+            complete = True
+            replan_needed = False
+            summary = (
+                f"{summary} [Note: the across-water trainer has no adjacent walkable approach tile and did not trigger "
+                f"from the aligned walkway tile (already defeated) — advancing to the next subgoal.]"
+            )
         if complete and reached_index >= len(self.plan) - 1:
             unfinished_note = self._unfinished_room_exploration_note(subgoal, after_kinds)
             if unfinished_note is None:
@@ -1789,6 +1803,42 @@ class PokemonPlayThroughSupervisor(Supervisor):
         ):
             return True
         return False
+
+    @staticmethod
+    def _is_satisfied_across_water_trainer_subgoal(
+        subgoal: str,
+        request: str,
+        after_kinds: Optional[Dict[Tuple[int, int], str]],
+        after_identified: Optional[Dict[Any, Any]],
+        after_people: Optional[Dict[Tuple[int, int], str]],
+    ) -> bool:
+        if not subgoal or not after_kinds or not after_people:
+            return False
+        if re.search(r"\b(?:gym\s+leader|leader)\b", subgoal, re.IGNORECASE):
+            return False
+        if not re.search(
+            r"\b(?:swimmer|subordinate\s+(?:gym\s+)?trainers?|trainer\s+in\s+the\s+(?:eastern\s+|western\s+|gym\s+)?(?:water|pool))\b",
+            subgoal,
+            re.IGNORECASE,
+        ):
+            return False
+        found_unreachable_water_npc = False
+        for cell, label in after_people.items():
+            if cell == (0, 0) or not in_bounds(cell) or str(label or "").startswith("sign:"):
+                continue
+            goals = approach_cells(after_kinds, cell, identified=after_identified, people=after_people)
+            if goals:
+                continue
+            lower_lbl = str(label or "").lower()
+            if (
+                "talked to here" in lower_lbl
+                or "aligned walkway tile already walked" in lower_lbl
+                or cell[0] == 0
+                or cell[1] == 0
+                or request.startswith("Free(")
+            ):
+                found_unreachable_water_npc = True
+        return found_unreachable_water_npc
 
     def _reconsider(self, subgoal: str, attempts: List[str], frame) -> Tuple[str, Optional[str], List[str]]:
         prompt = (self._fill_prompt(PLAYTHROUGH_ACHIEVABLE_PROMPT)
@@ -2989,6 +3039,28 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     rel = (gx - a_pos[0], gy - a_pos[1])
                     if in_bounds(rel) and rel != (0, 0):
                         return None
+        targets_specific_person = bool(
+            re.search(
+                r"\b(?:gym\s+leader|leader|nurse|clerk|receptionist|captain|professor|elder|guide)\b",
+                subgoal or "",
+                re.IGNORECASE,
+            )
+            or (
+                re.search(
+                    r"\b(?:reach|talk(?:ed)?\s+to|speak\s+(?:to|with)|interact(?:ed)?\s+with|challenge[ds]?)\b",
+                    subgoal or "",
+                    re.IGNORECASE,
+                )
+                and not re.search(r"\b(?:any\s+(?:undefeated\s+)?(?:subordinate\s+)?(?:gym\s+)?trainers?|along\s+the\s+way)\b", subgoal or "", re.IGNORECASE)
+            )
+        )
+        if targets_specific_person and after_people:
+            for p_cell, p_label in after_people.items():
+                if p_cell == (0, 0) or not in_bounds(p_cell) or str(p_label or "").startswith("sign:"):
+                    continue
+                p_goals = approach_cells(after_kinds, p_cell, identified=after_identified, people=after_people)
+                if p_goals and shortest_path(after_kinds, (0, 0), p_goals, people=after_people) is not None:
+                    return None
 
         dir_aliases = {
             "north": "up", "up": "up", "top": "up",

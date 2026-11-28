@@ -6827,8 +6827,10 @@ Press: <one of a, b, start, up, down, left, right>
         self.dialogue_text: str = ""
         self._blocked_at_place: Dict[Any, List[str]] = {}
         self._zero_disp_at_place: Dict[Any, List[str]] = {}
+        self._no_effect_ab_at_place: Dict[Any, List[str]] = {}
         self._repeated_blocked_presses: int = 0
         self._no_displacement_directional_presses: int = 0
+        self._no_effect_ab_presses: int = 0
         self._last_was_turn_at_place: bool = False
         self.termination = (termination or "").strip() or self.DEFAULT_TERMINATION
         super().__init__(env, task, max_steps, termination=self.termination, **kwargs)
@@ -6854,6 +6856,13 @@ Press: <one of a, b, start, up, down, left, right>
                 f"Blocked directions at current position {cur_place[1]} (pressing these did NOT move the player — "
                 f"do NOT press them again from here): {', '.join(blocked_here)}."
             )
+        no_effect_ab_here = self._no_effect_ab_at_place.get(cur_place, []) if cur_place is not None else []
+        if no_effect_ab_here:
+            lines.append(
+                f"No-effect A/B interaction directions already tried at current position {cur_place[1]} "
+                f"(pressing A/B facing these directions triggered no dialogue or event — do NOT press A/B again from here): "
+                f"{', '.join(no_effect_ab_here)}."
+            )
         return "\n" + "\n".join(lines) + "\n"
 
     def _finish(self, code: int, reason: str) -> int:
@@ -6872,8 +6881,18 @@ Press: <one of a, b, start, up, down, left, right>
             parts = [f"{', '.join(dirs)} at {place[1]}" for place, dirs in self._blocked_at_place.items() if dirs]
             if parts:
                 blocked_note = f"Blocked moving {'; '.join(parts)}"
+        no_effect_note = ""
+        if self._no_effect_ab_at_place:
+            ab_parts = [
+                f"facing {', '.join(dirs)} at {place[1] if isinstance(place, tuple) and len(place) == 2 else 'current tile'}"
+                for place, dirs in self._no_effect_ab_at_place.items()
+                if dirs
+            ]
+            if ab_parts:
+                no_effect_note = f"No interaction triggered pressing A/B {'; '.join(ab_parts)}"
         self.report.notes = "\n".join(filter(None, [f"Presses: {', '.join(self.presses) or 'none'}",
                                                     blocked_note,
+                                                    no_effect_note,
                                                     self.dialogue_text]))
         return code
 
@@ -7075,11 +7094,7 @@ Press: <one of a, b, start, up, down, left, right>
                     )
                     or is_cutscene_frame_changing(record.frame_before, record.frame_after)
                 )
-                if (
-                    box_or_emote
-                    or cutscene_changed
-                    or not has_bottom_location_banner(record.frame_before)
-                ):
+                if box_or_emote or cutscene_changed:
                     self._settle_after_step(settle_wait=FREE_SETTLE_WAIT)
             elif press in DIRECTIONS:
                 box_or_emote = (
@@ -7160,10 +7175,19 @@ Press: <one of a, b, start, up, down, left, right>
                 outcome_label = f"{press} (turned to face {press} at {before_place[1]} — press {press} again to step {press})"
         elif was_free and still_free and press in ("a", "b"):
             cur_p = self._current_map_place()
-            facing_now = getattr(self._env, "facing", None)
-            outcome_label = f"{press} (no dialogue or interaction triggered at {cur_p[1] if cur_p else 'current tile'})"
-            if cur_p is not None and facing_now in DIRECTIONS and facing_now in self._blocked_at_place.get(cur_p, ()):
-                self._no_displacement_directional_presses += 1
+            facing_now = getattr(self._env, "facing", None) or "here"
+            tried_ab = self._no_effect_ab_at_place.setdefault(cur_p, [])
+            already_tried_ab = facing_now in tried_ab
+            if not already_tried_ab:
+                tried_ab.append(facing_now)
+            self._no_effect_ab_presses += 1
+            self._no_displacement_directional_presses += 1
+            if already_tried_ab or self._no_effect_ab_presses >= 2:
+                self._repeated_blocked_presses += 1
+            outcome_label = (
+                f"{press} (no dialogue or interaction triggered at {cur_p[1] if cur_p else 'current tile'} "
+                f"facing {facing_now} — do NOT press {press} here again)"
+            )
         self.press_outcomes.append(outcome_label)
         return True
 
@@ -7273,6 +7297,7 @@ Press: <one of a, b, start, up, down, left, right>
             if (
                 self._repeated_blocked_presses >= self.MAX_REPEATED_BLOCKED_PRESSES
                 or self._no_displacement_directional_presses >= self.MAX_NO_DISPLACEMENT_DIRECTIONAL_PRESSES
+                or self._no_effect_ab_presses >= 2
             ):
                 return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")
         return self._finish(FREE_OUT_OF_STEPS, "out_of_steps")
