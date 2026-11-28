@@ -943,6 +943,37 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 )
         return f"[Area coordinate: {b_pos} -> {a_pos} (step delta ({dx:+d}, {dy:+d}){revisit})]"
 
+    def _sync_screen_to_global_map(self, frame, identified, gmap) -> None:
+        if (
+            gmap is None
+            or not getattr(gmap, "current", None)
+            or getattr(gmap, "pos", None) is None
+            or getattr(gmap, "residual", None) != (0, 0)
+            or getattr(gmap, "faded", False)
+        ):
+            return
+        try:
+            gmap.observe(frame, identified, record_visit=False)
+            cur_seg, (px, py) = gmap.resolve(gmap.segment, gmap.pos)
+            seg = gmap.segments[cur_seg]
+            seg_blocked = gmap.blocked_cells[cur_seg] if cur_seg < len(getattr(gmap, "blocked_cells", ())) else set()
+            for (b_seg, b_pos), by_dir in list(self._blocked_moves.items()):
+                r_seg, r_pos = gmap.resolve(b_seg, b_pos)
+                if r_seg != cur_seg or r_pos != (px, py):
+                    continue
+                for d_name in list(by_dir):
+                    if d_name not in DIRECTIONS:
+                        continue
+                    dx, dy = DIRECTIONS[d_name]
+                    target = (px + dx, py + dy)
+                    c = seg.get(target)
+                    if c is not None and c.kind == WALKABLE and target not in seg_blocked:
+                        by_dir.pop(d_name, None)
+                if not by_dir:
+                    self._blocked_moves.pop((b_seg, b_pos), None)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _perceive(self, frame) -> str:
         self._record_map_stop()
         state = self._effective_state(frame)
@@ -955,6 +986,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if gmap is not None:
             gmap.refresh(self._tile_recognizer._by_hash)
         self._identified = self._tile_recognizer.identify_tiles(frame, global_map=gmap)
+        self._sync_screen_to_global_map(frame, self._identified, gmap)
         people = self._people_now()
         kinds = cell_kinds(self._identified, getattr(self._env, "ledge_patterns", None),
                            getattr(self._env, "walk_patterns", None), people,
@@ -1455,6 +1487,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if gmap is not None:
                 gmap.refresh(self._tile_recognizer._by_hash)
             after_identified = self._tile_recognizer.identify_tiles(after, global_map=gmap)
+            self._sync_screen_to_global_map(after, after_identified, gmap)
             after_people = self._people_now()
             after_kinds = cell_kinds(after_identified, getattr(self._env, "ledge_patterns", None),
                                      getattr(self._env, "walk_patterns", None), after_people,
@@ -2583,6 +2616,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._tile_recognizer.record_tiles(after_frame, self._episode_number)
         gmap.refresh(self._tile_recognizer._by_hash)
         after_identified = self._tile_recognizer.identify_tiles(after_frame, global_map=gmap)
+        self._sync_screen_to_global_map(after_frame, after_identified, gmap)
         self._identified = after_identified
         after_people = self._people_now()
         after_kinds = cell_kinds(

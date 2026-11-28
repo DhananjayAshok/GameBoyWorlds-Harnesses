@@ -308,7 +308,7 @@ def is_player_overhang_floor_cell(
     for q in ("bottom_left", "bottom_right"):
         if is_ridge_quarter(cell_q.get(q), cell_d.get(q)):
             return False
-    if cell_q["bottom_left"] == "obstacle" and cell_q["bottom_right"] == "obstacle":
+    if cell_q["bottom_left"] in ("obstacle", "interactable object") and cell_q["bottom_right"] in ("obstacle", "interactable object"):
         return False
     return True
 
@@ -651,15 +651,21 @@ def is_walkable_pattern_learnable(
             return True
         if is_patterned_floor_cell((0, 0), q_map, d_map, i_map, min_ground_quarters=1):
             return True
+    if hashes is not None and len(hashes) == 4 and len(set(hashes)) == 1 and hashes[0] is not None:
+        sample = pixels
+        if (sample is None or getattr(sample, "size", 0) == 0) and quarter_images:
+            sample = next((img for img in quarter_images.values() if img is not None), None)
+        if sample is not None and getattr(sample, "size", 0) > 0:
+            arr = np.asarray(sample)
+            min_s, max_s = int(arr.min()), int(arr.max())
+            if min_s == max_s:
+                return False
+            if "obstacle" in tag_set and (min_s < 56 or (max_s - min_s) > 72):
+                return False
+        return True
     if "obstacle" in tag_set:
         return False
     if bool(tag_set & WALKABLE_TAGS):
-        return True
-    if hashes is not None and len(hashes) == 4 and len(set(hashes)) == 1 and hashes[0] is not None:
-        if pixels is not None and getattr(pixels, "size", 0) > 0:
-            arr = np.asarray(pixels)
-            if int(arr.min()) == int(arr.max()):
-                return False
         return True
     return False
 

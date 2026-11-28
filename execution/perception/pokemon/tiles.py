@@ -85,6 +85,10 @@ TABLETOP_OBJECT_PATTERN = re.compile(
     r"(?!.*\b(?:potted\s+plant|plant|flower\s*pot|flowerpot)\b)",
     re.IGNORECASE,
 )
+CUTTABLE_OBJECT_PATTERN = re.compile(
+    r"\bcuttable\b",
+    re.IGNORECASE,
+)
 WALKABLE_GROUND_OVERRIDE_PATTERN = re.compile(
     r"^(?:boundary\s+hedge|hedge\s+border|roadside\s+sign)$",
     re.IGNORECASE,
@@ -133,7 +137,7 @@ def is_speckled_ground_quarter(
     min_s, max_s = int(arr.min()), int(arr.max())
     dom = float(counts.max()) / arr.size
     row_means = [float(arr[r, :].mean()) for r in range(8)]
-    col_means = [float(arr[:, c].mean()) for r in range(8)]
+    col_means = [float(arr[:, c].mean()) for c in range(8)]
     row_span = max(row_means) - min(row_means)
     col_span = max(col_means) - min(col_means)
     if (
@@ -250,7 +254,9 @@ def normalize_tabletop_tag(tag: str, description: Optional[str], image: Optional
         return "obstacle"
     if description:
         stripped = description.strip()
-        if tag == "obstacle" and TABLETOP_OBJECT_PATTERN.search(stripped):
+        if tag == "obstacle" and (
+            TABLETOP_OBJECT_PATTERN.search(stripped) or CUTTABLE_OBJECT_PATTERN.search(stripped)
+        ):
             return "interactable object"
         if tag in ("obstacle", "sign") and WALKABLE_GROUND_OVERRIDE_PATTERN.search(stripped):
             return "ground"

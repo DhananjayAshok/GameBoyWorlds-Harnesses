@@ -369,9 +369,22 @@ class GlobalMap(StrategistArtifact):
 
     def _heal_visited_ground(self, si: int) -> int:
         seg = self.segments[si] if 0 <= si < len(self.segments) else None
-        if not seg or si >= len(self.visits) or not self.visits[si]:
+        if not seg or si >= len(self.visits):
             return 0
         seg_blocked = self.blocked_cells[si] if si < len(self.blocked_cells) else set()
+        for _, t_si, t_pos in getattr(self, "trail", ()):
+            rs, rp = self.resolve(t_si, t_pos)
+            if rs != si or rp in seg_blocked or self.visits[si].get(rp, 0) > 0:
+                continue
+            mc = seg.get(rp)
+            if mc is not None and not is_door(mc) and (
+                mc.kind in (WALKABLE, UNKNOWN)
+                or "ground" in mc.tags
+                or self._can_learn_walkable(mc.tags, mc.hashes, mc.pixels)
+            ):
+                self.visits[si][rp] = 1
+        if not self.visits[si]:
+            return 0
         restored = 0
         for g, cnt in self.visits[si].items():
             if cnt <= 0 or g in seg_blocked:
@@ -594,6 +607,17 @@ class GlobalMap(StrategistArtifact):
             if seg_blocked is not None:
                 seg_blocked.discard(cur)
 
+    def _clear_blocked_moves_to(self, segment: int, target: Cell) -> None:
+        if not (0 <= segment < len(getattr(self, "blocked_moves", ()))):
+            return
+        seg_moves = self.blocked_moves[segment]
+        for d_name, (dx, dy) in DIRECTIONS.items():
+            src = (target[0] - dx, target[1] - dy)
+            if src in seg_moves and d_name in seg_moves[src]:
+                seg_moves[src].discard(d_name)
+                if not seg_moves[src]:
+                    seg_moves.pop(src, None)
+
     def _is_uniform_walk_pattern_cell(self, c: Optional["MapCell"]) -> bool:
         return bool(
             c is not None
@@ -767,14 +791,16 @@ class GlobalMap(StrategistArtifact):
                 info.explored = None
 
     def observe(self, frame: np.ndarray, identified: Dict[Tuple[int, int, str], Any],
-                shift: Cell = (0, 0), can_learn_walkable: bool = False) -> int:
+                shift: Cell = (0, 0), can_learn_walkable: bool = False,
+                record_visit: bool = True) -> int:
         seg = self.segments[self.segment]
         a = _screen(frame)
         px, py = self.pos
         added = 0
         if shift != (0, 0) or has_bottom_dialogue_box(frame) or has_modal_preview_box(frame):
-            self.visits[self.segment][self.pos] += 1
-            self.trail.append((self.step, self.segment, self.pos))
+            if record_visit:
+                self.visits[self.segment][self.pos] += 1
+                self.trail.append((self.step, self.segment, self.pos))
             return 0
         masked_cells = {key[:2] for key in TileRecognizer.overlay_tile_keys(frame)} if shift == (0, 0) else set()
         quarter_tags: Dict[Cell, Dict[str, str]] = {}
@@ -847,14 +873,21 @@ class GlobalMap(StrategistArtifact):
                 quarter_descriptions=cell_d,
                 quarter_images=cell_imgs,
             )
+            old = seg.get(g)
             if (x, y) == (0, 0):
                 seg_blocked.discard(g)
+                self._clear_blocked_moves_to(self.segment, g)
             elif g in seg_blocked and kind == WALKABLE and not bool(set(tags) & DOOR_TAGS):
-                if len(set(hashes)) == 1 and None not in hashes and hashes in self.walk_patterns and cell_learnable:
+                if (
+                    (len(set(hashes)) == 1 and None not in hashes and hashes in self.walk_patterns and cell_learnable)
+                    or (old is not None and old.hashes != hashes and ("obstacle" in old.tags or "interactable object" in old.tags))
+                ):
                     seg_blocked.discard(g)
+                    self._clear_blocked_moves_to(self.segment, g)
                 else:
                     kind = BLOCKED
-            old = seg.get(g)
+            elif old is not None and old.kind == BLOCKED and kind == WALKABLE and old.hashes != hashes:
+                self._clear_blocked_moves_to(self.segment, g)
             if old is None:
                 if (
                     is_uniform_piece
@@ -934,8 +967,9 @@ class GlobalMap(StrategistArtifact):
             ):
                 self.visits[self.segment].pop(g, None)
             old.kind, old.tags, old.hashes, old.pixels = kind, tags, hashes, pixels
-        self.visits[self.segment][self.pos] += 1
-        self.trail.append((self.step, self.segment, self.pos))
+        if record_visit:
+            self.visits[self.segment][self.pos] += 1
+            self.trail.append((self.step, self.segment, self.pos))
         self._new_this_episode += added
         self.stats["cells_added"] += added
         return added
@@ -3298,16 +3332,16 @@ class GlobalMap(StrategistArtifact):
                     si < len(self.visits)
                     and self.visits[si].get(g, 0) > 0
                     and g not in seg_blocked
-                    and new_kind == BLOCKED
+                    and new_kind in (BLOCKED, UNKNOWN)
                     and not is_door(c)
                     and not bool(set(new_tags) & DOOR_TAGS)
-                    and learnable
+                    and (learnable or (new_kind == UNKNOWN and "ground" in new_tags))
                     and (c.kind == WALKABLE or "ground" in c.tags or "ground" in new_tags)
                     and not (set(new_tags) & {"sign", "interactable object", "pc", "water", "ledge", "right_ledge", "left_ledge"})
                 ):
                     new_kind = WALKABLE
-                    if "obstacle" in new_tags:
-                        new_tags = tuple(t for t in new_tags if t != "obstacle") or ("ground",)
+                    if "obstacle" in new_tags or "unknown" in new_tags:
+                        new_tags = tuple(t for t in new_tags if t not in ("obstacle", "unknown")) or ("ground",)
                 elif (
                     si < len(self.visits)
                     and self.visits[si].get(g, 0) > 0
@@ -3319,6 +3353,8 @@ class GlobalMap(StrategistArtifact):
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1
+            if self.info(si).kind == OUTDOORS:
+                changed += self._heal_visited_ground(si)
         if self.seen_entrances is not None:
             valid = {(si, g) for si, seg in enumerate(self.segments)
                      if si not in self.merged_into and self.info(si).kind in (OUTDOORS, None)
