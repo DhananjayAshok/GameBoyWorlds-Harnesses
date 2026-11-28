@@ -54,8 +54,9 @@ def explore_text(
             lines.append(
                 f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''} "
                 f"(no unentered doors/stairs in this room — finish revealing these remaining {edge} edge "
-                f"square{'s' if edge != 1 else ''} before leaving through the exit door/stairs so this branch "
-                f"is marked as a fully explored dead-end branch with 0 unexplored edges)."
+                f"square{'s' if edge != 1 else ''} and talk to any untalked-to people/clerks inside before "
+                f"leaving through the exit door/stairs so this branch is marked as a fully explored dead-end "
+                f"branch with 0 unexplored edges)."
             )
         else:
             lines.append(f"- {here}, where you are: {edge} unexplored edge square{'s' if edge != 1 else ''}.")
@@ -154,8 +155,9 @@ def prompt_block(gmap: GlobalMap, recent_episodes: Iterable[int],
                 f"Important: Only {edge_here} reachable unexplored edge square{'s' if edge_here != 1 else ''} remain in this room "
                 f"(nearest at ({targets[0]['dx']}, {targets[0]['dy']}), {targets[0]['steps']} steps {targets[0]['sector']}) "
                 f"and there are no other unentered doors or stairs here. Before leaving this room through the exit door/stairs, "
-                f"finish revealing those remaining unexplored edge squares (or reveal them first and then take the exit door/stairs) "
-                f"so this room reaches 0 unexplored edge squares and is permanently marked as a fully explored dead-end branch."
+                f"finish revealing those remaining unexplored edge squares and talk to any untalked-to people or counter clerks "
+                f"in this room; do not combine revealing the room or talking to people inside with exiting through the exit door "
+                f"in the same episode when untalked-to people remain here."
             )
     else:
         lines.append("Every reachable edge of this area has been explored; the way on is a door, "

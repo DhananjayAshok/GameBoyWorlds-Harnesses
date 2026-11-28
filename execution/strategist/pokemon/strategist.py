@@ -461,8 +461,25 @@ def sanitize_stale_notepad_routes(
             return new_seq
         return "route blocked by wall — use live mapped routes below"
 
-    return pattern.sub(repl, text)
-
+    text = pattern.sub(repl, text)
+    frontiers_here = gmap.frontier(gmap.segment)
+    cur_label = gmap.area_label(gmap.segment)
+    m_num = re.match(r"^area\s+#(\d+)\b", cur_label, re.IGNORECASE)
+    cur_num = int(m_num.group(1)) if m_num else gmap.segment
+    cleaned: List[str] = []
+    for line in text.splitlines():
+        if re.match(r"^\s*-\s*Inside\s+area\s+#(\d+)\b", line, re.IGNORECASE):
+            m_in = re.match(r"^\s*-\s*Inside\s+area\s+#(\d+)\b", line, re.IGNORECASE)
+            if m_in and int(m_in.group(1)) != cur_num:
+                continue
+        if frontiers_here:
+            if re.search(r"\b0\s+unexplored\s+edges?(?:\s+squares?)?\b", line, re.IGNORECASE):
+                continue
+            if re.match(r"^\s*1\.\s+Step\b.*\bexit\s+(?:door|mat)\b", line, re.IGNORECASE):
+                continue
+        cleaned.append(line)
+    text = "\n".join(cleaned)
+    return text
 
 def sanitize_false_loss_notepad(text: str) -> str:
     if not text:
@@ -2772,6 +2789,7 @@ class PokemonStrategist:
             and not extracted
             and not named_new_segment
             and not new_blocked_moves
+            and not new_warps
             and not closed
             and self.notepad.text.strip()
         ):

@@ -773,8 +773,19 @@ class GlobalMap(StrategistArtifact):
         return self.area_label(segment) + (f" (inside {self.area_label(parent)})" if parent is not None else "")
 
     def prune_routes(self) -> None:
-        self.routes = [r for r in self.routes
-                       if self.segment not in {self.resolve(t, (0, 0))[0] for t in r["targets"]}]
+        kept: List[Dict[str, Any]] = []
+        for r in self.routes:
+            targets = {self.resolve(t, (0, 0))[0] for t in r["targets"]}
+            if self.segment in targets:
+                continue
+            from_step = int(r.get("step", 0) or 0)
+            if from_step > 0 and any(
+                t >= from_step and self.resolve(s, (0, 0))[0] in targets
+                for t, s, _ in self.trail
+            ):
+                continue
+            kept.append(r)
+        self.routes = kept
 
     def filled_pixels(self, segment: int) -> int:
         return sum(c.pixels.size for c in self.segments[segment].values() if c.pixels is not None)
@@ -804,6 +815,26 @@ class GlobalMap(StrategistArtifact):
             sum(self.visits[segment].values()) >= MIN_NAME_OBSERVATIONS
             and self._visited_cells_count(segment) >= MIN_NAME_OBSERVATIONS
         )
+
+    def _has_door_warp(self, segment: int) -> bool:
+        si = self.resolve(segment, (0, 0))[0]
+        for idx, (_, a, pa, b, pb) in enumerate(self.warps):
+            m = self.warp_moves[idx] if idx < len(self.warp_moves) else None
+            if self._is_scripted_cutscene_warp(a, pa, b, pb, m):
+                continue
+            ra, rpa = self.resolve(a, pa)
+            rb, rpb = self.resolve(b, pb)
+            if ra == rb or (ra != si and rb != si):
+                continue
+            da = self._door_at(ra, rpa)
+            db = self._door_at(rb, rpb)
+            seg_a = self.segments[ra] if 0 <= ra < len(self.segments) else {}
+            seg_b = self.segments[rb] if 0 <= rb < len(self.segments) else {}
+            ca = seg_a.get(da)
+            cb = seg_b.get(db)
+            if (ca is not None and is_door(ca)) or (cb is not None and is_door(cb)):
+                return True
+        return False
 
     def queue_grown(self) -> None:
         queued = {entry["segment"] for entry in self.naming_queue}
@@ -1399,7 +1430,7 @@ class GlobalMap(StrategistArtifact):
         if c is not None and is_door(c):
             return pos
         d = self._door_at(segment, pos)
-        if d != pos and d in seg and is_door(seg[d]) and max(abs(d[0] - pos[0]), abs(d[1] - pos[1])) <= DOOR_REACH:
+        if d != pos and d in seg and is_door(seg[d]) and max(abs(d[0] - pos[0]), abs(d[1] - pos[1])) <= DOOR_SNAP_REACH:
             return d
         return pos
 
@@ -1432,7 +1463,8 @@ class GlobalMap(StrategistArtifact):
         self.warps.append((self.step, self.segment, dep, segment, pos))
         self.warp_moves.append(move)
         left = self.segment
-        if (self.info(left).name is None and self._has_min_observations(left)
+        if (self.info(left).name is None
+                and (self._has_min_observations(left) or self._has_door_warp(left))
                 and all(entry["segment"] != left for entry in self.naming_queue)):
             self.naming_queue.append({"segment": left, "exit": dep, "step": self.step, "marker": None,
                                       "reason": "door"})
@@ -2007,7 +2039,7 @@ class GlobalMap(StrategistArtifact):
         for si in range(len(self.segments)):
             if si == self.segment or si in self.merged_into or not self.segments[si]:
                 continue
-            if self._has_min_observations(si):
+            if self._has_min_observations(si) or self._has_door_warp(si):
                 continue
             if self.info(si).name is not None and len(self.visits[si]) > 1:
                 continue
@@ -3676,27 +3708,29 @@ class GlobalMap(StrategistArtifact):
                 for g in [(pos[0] + ox, pos[1] + oy)] if g in seg and is_door(seg[g])]
         if near:
             return min(near)[2]
-        cand = [
-            (max(abs(ox), abs(oy)), abs(ox) + abs(oy), (pos[0] + ox, pos[1] + oy))
-            for ox in range(-DOOR_SNAP_REACH, DOOR_SNAP_REACH + 1)
-            for oy in range(-DOOR_SNAP_REACH, DOOR_SNAP_REACH + 1)
-            if (pos[0] + ox, pos[1] + oy) in seg and is_door(seg[(pos[0] + ox, pos[1] + oy)])
-        ]
-        if not cand:
-            return pos
-        doors_in_range = {g for _, _, g in cand}
-        seed = min(cand)[2]
-        comp, stack = set(), [seed]
-        while stack:
-            h = stack.pop()
-            if h in comp:
+        for radius in range(2, DOOR_SNAP_REACH + 1):
+            cand = [
+                (max(abs(ox), abs(oy)), abs(ox) + abs(oy), (pos[0] + ox, pos[1] + oy))
+                for ox in range(-radius, radius + 1)
+                for oy in range(-radius, radius + 1)
+                if (pos[0] + ox, pos[1] + oy) in seg and is_door(seg[(pos[0] + ox, pos[1] + oy)])
+            ]
+            if not cand:
                 continue
-            comp.add(h)
-            for ox, oy in NEIGHBOURS_8:
-                nb = (h[0] + ox, h[1] + oy)
-                if nb in seg and is_door(seg[nb]) and nb not in comp:
-                    stack.append(nb)
-        return seed if doors_in_range <= comp else pos
+            doors_in_range = {g for _, _, g in cand}
+            seed = min(cand)[2]
+            comp, stack = set(), [seed]
+            while stack:
+                h = stack.pop()
+                if h in comp:
+                    continue
+                comp.add(h)
+                for ox, oy in NEIGHBOURS_8:
+                    nb = (h[0] + ox, h[1] + oy)
+                    if nb in seg and is_door(seg[nb]) and nb not in comp:
+                        stack.append(nb)
+            return seed if doors_in_range <= comp else pos
+        return pos
 
     def door_labels(self) -> Dict[Tuple[int, Cell], int]:
         labels: Dict[Tuple[int, Cell], int] = {}
@@ -4200,7 +4234,8 @@ class GlobalMap(StrategistArtifact):
             return []
         reach = self.reachable_cells(si) if reachable is None else reachable
         info = self.info(si)
-        check_void = info.kind not in (OUTDOORS, CAVE)
+        visits = self.visits[si] if si < len(self.visits) else Counter()
+        check_void = info.kind not in (OUTDOORS, CAVE) and len(visits) > 1
         void_cols = (
             {
                 g[0]
@@ -4224,7 +4259,6 @@ class GlobalMap(StrategistArtifact):
             else set()
         )
         has_void = bool(void_cols)
-        visits = self.visits[si] if si < len(self.visits) else Counter()
         cave_void_cells = (
             [
                 g

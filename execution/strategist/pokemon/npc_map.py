@@ -234,8 +234,20 @@ def people_lines(gmap: GlobalMap, ordered: List[Any], where: str = "here", maybe
     if len(ordered) > MAX_PEOPLE_LINES:
         lines.append(f"...and {len(ordered) - MAX_PEOPLE_LINES} more.")
     lines += maybe_lines(gmap, maybe)
-    lines.append(f"Not yet talked to here: {sum(m.talked == 'no' for m in ordered) + len(maybe)} of "
-                 f"{len(ordered) + len(maybe)}.")
+    untalked_n = sum(m.talked == "no" for m in ordered) + len(maybe)
+    total_n = len(ordered) + len(maybe)
+    lines.append(f"Not yet talked to here: {untalked_n} of {total_n}.")
+    if where == "here" and untalked_n > 0 and gmap.info(gmap.segment).kind not in ("outdoors", "cave"):
+        doors_here = gmap.reachable_door_list()
+        unentered_here = sum(d.get("leads_to") is None for d in doors_here)
+        talked_n = sum(m.talked != "no" for m in ordered)
+        if unentered_here == 0 and len(doors_here) <= 1 and talked_n == 0:
+            lines.append(
+                f"Important: You have not spoken to anyone in this room yet ({untalked_n} untalked-to "
+                f"{'person' if untalked_n == 1 else 'people'} here). Before exiting through the doorway/stairs, "
+                f"talk to the untalked-to {'person' if untalked_n == 1 else 'people'} or counter clerk inside first "
+                f"(and do not combine talking to people inside with exiting the building in the same task)."
+            )
     return lines
 
 
