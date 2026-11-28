@@ -599,6 +599,43 @@ class PokemonPlayThroughSupervisor(Supervisor):
             except Exception:  # noqa: BLE001
                 door_leads = {}
 
+        episode_visited_here: set = set()
+        for s_seg, s_pos in getattr(self, "_leg_stops", ()):
+            try:
+                r_seg, r_pos = gmap.resolve(s_seg, s_pos)
+                if r_seg == cur_seg:
+                    episode_visited_here.add(r_pos)
+            except Exception:  # noqa: BLE001
+                pass
+
+        offscreen_entity_cells: set = set()
+        if re.search(
+            r"\b(?:leader|trainer|gym|person|people|npc|nurse|clerk|talk|speak|challenge|battle|defeat|interact|item|ball)\b",
+            self._task or "",
+            re.IGNORECASE,
+        ):
+            if self._npcs is not None and hasattr(self._npcs, "people_here"):
+                try:
+                    for _, sq in self._npcs.people_here(gmap):
+                        if strictly_beyond(sq):
+                            offscreen_entity_cells.add(sq)
+                except Exception:  # noqa: BLE001
+                    pass
+            for g_cell, mc in seg.items():
+                if strictly_beyond(g_cell) and (
+                    getattr(mc, "kind", None) in ("occupied", "item")
+                    or bool(set(getattr(mc, "tags", ())) & {"npc", "item", "interactable object"})
+                ):
+                    offscreen_entity_cells.add(g_cell)
+
+        def _has_unvisited_offscreen_entity(g: Tuple[int, int]) -> bool:
+            if not offscreen_entity_cells or g not in offscreen_entity_cells:
+                return False
+            return not any(
+                (g[0] + dx, g[1] + dy) in episode_visited_here
+                for dx, dy in DIRECTIONS.values()
+            )
+
         def _is_open_door_cell(g: Tuple[int, int], c: Any) -> bool:
             if c is None or not is_door(c):
                 return False
@@ -659,7 +696,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         break
                     continue
                 nc = seg.get(nxt)
-                if nc is None or nc.kind == UNKNOWN or _is_open_door_cell(nxt, nc):
+                if nc is None or nc.kind == UNKNOWN or _is_open_door_cell(nxt, nc) or _has_unvisited_offscreen_entity(nxt):
                     half_plane_open = True
                     break
                 if nc.kind == WALKABLE and nxt not in visited:
@@ -703,7 +740,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     if nxt in blocked_targets or not in_forward_offset(nxt):
                         continue
                     nc = seg.get(nxt)
-                    if nc is None or nc.kind == UNKNOWN or _is_open_door_cell(nxt, nc):
+                    if nc is None or nc.kind == UNKNOWN or _is_open_door_cell(nxt, nc) or _has_unvisited_offscreen_entity(nxt):
                         open2 = True
                         break
                     if nc.kind == WALKABLE and nxt not in visited2:
@@ -1339,11 +1376,20 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return None
         instruction, termination = split_free_argument(argument)
         if re.search(
-            r"\b(?:a|b|start|menu|talk|speak|interact|dialogue|text|cutscene|wait|evolve|evolution)\b",
+            r"\b(?:start|menu|dialogue|text|cutscene|wait|evolve|evolution)\b"
+            r"|(?:\b(?:press|pressing|hit|push|tap|hold)\s+(?:the\s+)?b\b|\bb\s+button\b)",
             instruction,
             re.IGNORECASE,
         ):
             return None
+        wants_interact = bool(
+            re.search(
+                r"\b(?:talk|speak|interact)\b"
+                r"|(?:\b(?:press|pressing|hit|push|tap|hold|then|and)\s+(?:the\s+)?a\b|\ba\s+button\b)",
+                instruction,
+                re.IGNORECASE,
+            )
+        )
         if re.search(
             r"\b(?:up\s+and\s+down|down\s+and\s+up|left\s+and\s+right|right\s+and\s+left|back\s+and\s+forth|tall\s+grass|grind|level\s+up)\b",
             instruction,
@@ -1371,7 +1417,32 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if len(legs) < 2 and legs[0][1] < 4:
             return None
         gmap = self._global_map()
+        people = self._people_now()
         warps = warp_cells(identified=self._identified, global_map=gmap)
+        if wants_interact:
+            explicit_coords = [c for c in parse_all_cells(instruction) if in_bounds(c) and c != (0, 0)]
+            if len(explicit_coords) == 1:
+                tc = explicit_coords[0]
+                goals = approach_cells(local_kinds, tc, identified=self._identified, people=people)
+                if goals and shortest_path(local_kinds, (0, 0), goals, avoid_cells=warps) is not None:
+                    return "Interact", f"person at {tc}"
+            cur_i = (0, 0)
+            for d_leg, n_leg in legs:
+                dx_l, dy_l = DIRECTIONS[d_leg]
+                for _ in range(n_leg):
+                    nxt = (cur_i[0] + dx_l, cur_i[1] + dy_l)
+                    if in_bounds(nxt) and local_kinds.get(nxt) == WALKABLE and nxt not in warps:
+                        cur_i = nxt
+                    else:
+                        break
+            if cur_i != (0, 0) and legs:
+                last_dx, last_dy = DIRECTIONS[legs[-1][0]]
+                cand_target = (cur_i[0] + last_dx, cur_i[1] + last_dy)
+                if in_bounds(cand_target) and cand_target != (0, 0) and local_kinds.get(cand_target) == BLOCKED:
+                    goals = approach_cells(local_kinds, cand_target, identified=self._identified, people=people)
+                    if goals and shortest_path(local_kinds, (0, 0), goals, avoid_cells=warps) is not None:
+                        return "Interact", f"person at {cand_target}"
+            return None
         if len(legs) >= 2:
             cur = (0, 0)
             prefix_ok = True
@@ -1388,6 +1459,14 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if prefix_ok:
                 dir_last, n_last = legs[-1]
                 dx_last, dy_last = DIRECTIONS[dir_last]
+                exact_end = cur
+                exact_ok = True
+                for _ in range(n_last):
+                    nxt = (exact_end[0] + dx_last, exact_end[1] + dy_last)
+                    if not in_bounds(nxt) or local_kinds.get(nxt) != WALKABLE or nxt in warps:
+                        exact_ok = False
+                        break
+                    exact_end = nxt
                 probe = cur
                 reached_edge_cell = None
                 for _ in range(max(n_last, 10)):
@@ -1403,6 +1482,9 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         break
                 if reached_edge_cell is not None and reached_edge_cell in edge_cells(local_kinds, dir_last):
                     return "MoveOff", f"{dir_last} via {reached_edge_cell}"
+                if exact_ok and exact_end != (0, 0):
+                    if shortest_path(local_kinds, (0, 0), [exact_end], avoid_cells=warps, people=people) is not None:
+                        return "MoveTo", f"{exact_end}"
             for d_leg, _ in legs:
                 target = self._best_open_edge_target(d_leg, local_kinds)
                 if target is not None:
@@ -2931,7 +3013,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if (
                 cand_dir in open_runs_by_dir
                 and cand_dir != opposite_dir
-                and (not subgoal_dirs or cand_dir in subgoal_dirs or move_dir not in open_runs_by_dir)
+                and (not subgoal_dirs or cand_dir in subgoal_dirs)
             ):
                 next_dir = cand_dir
                 mapped_next_arg = cand_arg
@@ -2944,7 +3026,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 if (
                     cand_dir in open_runs_by_dir
                     and cand_dir != opposite_dir
-                    and (not subgoal_dirs or cand_dir in subgoal_dirs or move_dir not in open_runs_by_dir)
+                    and (not subgoal_dirs or cand_dir in subgoal_dirs)
                 ):
                     next_dir = cand_dir
                     mapped_next_arg = door_arg

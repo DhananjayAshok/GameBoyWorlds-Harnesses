@@ -643,15 +643,36 @@ class GlobalMap(StrategistArtifact):
                     seg_moves.pop(src, None)
 
     def _is_uniform_walk_pattern_cell(self, c: Optional["MapCell"]) -> bool:
-        return bool(
-            c is not None
-            and c.hashes
-            and len(c.hashes) == 4
-            and len(set(c.hashes)) == 1
-            and c.hashes[0] is not None
-            and c.hashes in self.walk_patterns
-            and self._can_learn_walkable(c.tags, c.hashes, c.pixels)
-        )
+        if (
+            c is None
+            or not c.hashes
+            or len(c.hashes) != 4
+            or None in c.hashes
+            or c.hashes not in self.walk_patterns
+        ):
+            return False
+        if self._can_learn_walkable(c.tags, c.hashes, c.pixels):
+            return True
+        tile_lookup = getattr(self, "_tile_lookup", None)
+        if isinstance(tile_lookup, dict):
+            tiles = [tile_lookup.get(h) for h in c.hashes]
+            if all(t is not None for t in tiles):
+                raw_qtags = {
+                    q: normalize_tabletop_tag(t.tag, t.description, getattr(t, "image", None))
+                    for q, t in zip(QUARTERS, tiles)
+                }
+                qtags = filter_cell_warp_quarter_tags(raw_qtags)
+                qdescs = {q: t.description for q, t in zip(QUARTERS, tiles)}
+                qimgs = {q: getattr(t, "image", None) for q, t in zip(QUARTERS, tiles)}
+                return self._can_learn_walkable(
+                    set(qtags.values()),
+                    hashes=c.hashes,
+                    pixels=c.pixels,
+                    quarter_tags=qtags,
+                    quarter_descriptions=qdescs,
+                    quarter_images=qimgs,
+                )
+        return False
 
     def segment_blocked_moves(
         self,
@@ -903,7 +924,7 @@ class GlobalMap(StrategistArtifact):
                 self._clear_blocked_moves_to(self.segment, g)
             elif g in seg_blocked and kind == WALKABLE and not bool(set(tags) & DOOR_TAGS):
                 if (
-                    (len(set(hashes)) == 1 and None not in hashes and hashes in self.walk_patterns and cell_learnable)
+                    (None not in hashes and hashes in self.walk_patterns and cell_learnable)
                     or (old is not None and old.hashes != hashes and ("obstacle" in old.tags or "interactable object" in old.tags))
                 ):
                     seg_blocked.discard(g)
@@ -3479,12 +3500,12 @@ class GlobalMap(StrategistArtifact):
                     if (
                         c.hashes
                         and len(c.hashes) == 4
-                        and len(set(c.hashes)) == 1
-                        and c.hashes[0] is not None
+                        and None not in c.hashes
                         and c.hashes in self.walk_patterns
                         and learnable
                     ):
                         seg_blocked.discard(g)
+                        self._clear_blocked_moves_to(si, g)
                     elif new_kind == WALKABLE and not bool(set(new_tags) & DOOR_TAGS):
                         new_kind = BLOCKED
                 if (
@@ -3512,8 +3533,7 @@ class GlobalMap(StrategistArtifact):
                 if (c.kind, c.tags) != (new_kind, new_tags):
                     c.kind, c.tags = new_kind, new_tags
                     changed += 1
-            if self.info(si).kind == OUTDOORS:
-                changed += self._heal_visited_ground(si)
+            changed += self._heal_visited_ground(si)
         merged = self.consolidate(judge=None)
         if merged:
             changed += len(merged)

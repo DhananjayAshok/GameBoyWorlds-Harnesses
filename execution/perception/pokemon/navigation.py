@@ -83,7 +83,7 @@ def _is_top_cliff_border_overhang_floor_cell(
         return False
     bl_sample = bl
     br_sample = br
-    if cell == (0, 1) and not np.array_equal(bl, br):
+    if not np.array_equal(bl, br) or (0 in np.unique(bl[4:, :]) and 0 not in np.unique(bl[:4, :])):
         bl_sample = bl[:4, :]
         br_sample = br[:4, :]
     if not (np.array_equal(tl, tr) and np.array_equal(bl_sample, br_sample)):
