@@ -14,7 +14,8 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_overworld_menu_or_ui_screen,
                                                  is_overworld_pack_menu, is_pack_screen,
                                                  is_party_menu_screen, is_status_heal_item_name,
-                                                 read_battle_hud_hp, read_move_learning_dialogue_status)
+                                                 read_battle_hud_hp, read_move_learning_dialogue_status,
+                                                 read_tile_text)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
                                                      boundary_exit_direction, cell_kinds, compress_path, edge_cells,
                                                      edge_runs, filter_open_lane_edge_cells, format_path_runs,
@@ -1933,6 +1934,39 @@ class PokemonPlayThroughSupervisor(Supervisor):
             return False
         return bool(re.search(r"\bwild\b.{1,30}\bappeared\b", text, re.IGNORECASE))
 
+    @classmethod
+    def _is_wild_encounter_crops(cls, crops: Optional[List[Any]], current_frame=None) -> bool:
+        from utils.vlm import cache_lookup_ocr
+
+        if crops:
+            cached = [cache_lookup_ocr(c) for c in crops]
+            joined = "\n".join(t for t in cached if t)
+            if joined and cls._is_wild_encounter_dialogue(joined):
+                return True
+        for candidate in list(crops or ()) + ([current_frame] if current_frame is not None else []):
+            if candidate is None or not hasattr(candidate, "shape"):
+                continue
+            h = candidate.shape[0]
+            if h >= 144:
+                row_text = read_tile_text(candidate, 14, 1, 19)
+                full_str = "".join(
+                    read_tile_text(candidate, 14, tx, tx + 1) or " "
+                    for tx in range(1, 19)
+                )
+            elif h >= 32:
+                row_text = read_tile_text(candidate, 1, 0, 18)
+                full_str = "".join(
+                    read_tile_text(candidate, 1, tx, tx + 1) or " "
+                    for tx in range(0, min(18, candidate.shape[1] // 8))
+                )
+            else:
+                continue
+            if row_text.startswith("WILD") or (
+                row_text == "W" and len(full_str) >= 6 and full_str[0] == "W" and full_str[4] == " " and full_str[5].isalpha()
+            ):
+                return True
+        return False
+
     def _task_wants_wild_battles(self) -> bool:
         combined = f"{self._task or ''} {self._guidance or ''}"
         if re.search(
@@ -2168,7 +2202,6 @@ class PokemonPlayThroughSupervisor(Supervisor):
         earlier["reason"] = later.get("reason")
         if later.get("notes"):
             earlier["notes"] = "\n".join(filter(None, [earlier.get("notes"), later.get("notes")]))
-            earlier["report"].notes = earlier["notes"]
         return earlier
 
     def _handle_interruption(self, *, dialogue_task: str = "clear the dialogue that interrupted what the player was doing",
@@ -2203,7 +2236,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if state == AgentState.IN_DIALOGUE:
                 task = dialogue_task if step_idx == 0 else "clear the dialogue that followed"
                 handled = self.call_executor("dialogue", task, counted=False,
-                                             initial_dialogue_crops=pending_crops)
+                                             initial_dialogue_crops=pending_crops,
+                                             defer_ocr_on_battle=True)
                 diag_crops = getattr(self.last_executor, "dialogue_crops", None)
                 pending_crops = list(diag_crops) if diag_crops else None
                 if handled.get("dialogue"):
@@ -2214,7 +2248,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     )
             elif state == AgentState.IN_BATTLE:
                 is_wild_flee = (
-                    self._is_wild_encounter_dialogue(pre_battle_dialogue)
+                    (
+                        self._is_wild_encounter_dialogue(pre_battle_dialogue)
+                        or self._is_wild_encounter_crops(pending_crops, frame)
+                    )
                     and not self._task_wants_wild_battles()
                     and self._active_pokemon_hp_healthy(frame)
                 )
@@ -2416,6 +2453,157 @@ class PokemonPlayThroughSupervisor(Supervisor):
         visited = {gmap.resolve(seg, pos) for seg, pos in subgoal_places}
         return (a_seg, a_pos) not in visited
 
+    def _try_deterministic_corridor_continuation(
+        self,
+        *,
+        subgoal: str,
+        subgoal_index: int,
+        action: str,
+        task: str,
+        request: str,
+        result: Dict[str, Any],
+        before_place: Optional[Tuple[int, Tuple[int, int]]],
+        after_place: Optional[Tuple[int, Tuple[int, int]]],
+        move_tag: str,
+        made_progress: bool,
+    ) -> Optional[Tuple[str, Optional[Tuple[str, str]], str]]:
+        if (
+            action != "MoveOff"
+            or not result.get("succeeded")
+            or result.get("reason") != "left_screen"
+            or not made_progress
+            or self._out_of_calls()
+            or max(0, self._max_steps - self._calls) < 1
+        ):
+            return None
+        if self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue():
+            return None
+        if self._last_seen_battle_hp is not None:
+            cur_hp, max_hp = self._last_seen_battle_hp
+            if max_hp > 0 and cur_hp * 2 <= max_hp and not self._healing_bag_empty:
+                return None
+        gmap = self._global_map()
+        if gmap is None or before_place is None or after_place is None:
+            return None
+        b_seg, b_pos = gmap.resolve(before_place[0], before_place[1])
+        a_seg, a_pos = gmap.resolve(after_place[0], after_place[1])
+        if b_seg != a_seg:
+            return None
+        notes_str = str(result.get("notes") or "")
+        if "further movement" in notes_str.lower() and "blocked" in notes_str.lower():
+            return None
+        move_dir = parse_edge_direction(task)
+        if move_dir not in DIRECTIONS:
+            return None
+
+        after_frame = self._current_frame()
+        if self._effective_state(after_frame) != AgentState.FREE_ROAM or self._is_in_dialogue(after_frame):
+            return None
+        self._tile_recognizer.record_tiles(after_frame, self._episode_number)
+        gmap.refresh(self._tile_recognizer._by_hash)
+        after_identified = self._tile_recognizer.identify_tiles(after_frame, global_map=gmap)
+        self._identified = after_identified
+        after_people = self._people_now()
+        after_kinds = cell_kinds(
+            after_identified,
+            getattr(self._env, "ledge_patterns", None),
+            getattr(self._env, "walk_patterns", None),
+            after_people,
+            getattr(self._env, "left_ledge_patterns", None),
+            self._local_blocked_cells(),
+            global_map=gmap,
+        )
+        for (lx, ly), kind in (after_kinds or {}).items():
+            if abs(lx) + abs(ly) <= 6 and kind == "item":
+                return None
+        for key, info in (after_identified or {}).items():
+            if not isinstance(key, tuple) or len(key) < 2:
+                continue
+            lx, ly = key[0], key[1]
+            tag = getattr(info, "tag", None)
+            tags = (tag,) if tag else (info if isinstance(info, (set, list, tuple)) else getattr(info, "tags", ()))
+            if any(t in ("door", "staircase", "entrance", "exit") for t in (tags or ())):
+                if (lx, ly) != (0, 0) and shortest_path(after_kinds, (0, 0), [(lx, ly)], people=after_people) is not None:
+                    return None
+        for door in gmap.reachable_door_list(a_seg):
+            if door.get("leads_to") is None:
+                for gx, gy in door.get("cells", ()):
+                    rel = (gx - a_pos[0], gy - a_pos[1])
+                    if in_bounds(rel) and rel != (0, 0):
+                        return None
+
+        dir_aliases = {
+            "north": "up", "up": "up", "top": "up",
+            "south": "down", "down": "down", "bottom": "down",
+            "west": "left", "left": "left",
+            "east": "right", "right": "right",
+        }
+        subgoal_dirs: List[str] = []
+        for m in re.finditer(r"\b(north|south|east|west|up|down|left|right|top|bottom)\b", subgoal or "", re.IGNORECASE):
+            d = dir_aliases[m.group(1).lower()]
+            if d not in subgoal_dirs:
+                subgoal_dirs.append(d)
+        if not subgoal_dirs:
+            return None
+
+        single_step_only = bool(
+            re.search(
+                r"\b(?:walked|stepped)\s+(?:north|south|east|west|up|down|left|right)\s+off\s+the\s+"
+                r"(?:top|bottom|left|right|up|down)\s+edge\b",
+                subgoal or "",
+                re.IGNORECASE,
+            )
+            and not re.search(
+                r"\b(?:continue[ds]?|all\s+the\s+way|along|middle|end|toward|until|past|through|corridor|bridge|route)\b",
+                subgoal or "",
+                re.IGNORECASE,
+            )
+        )
+        if single_step_only:
+            return None
+
+        cells = edge_cells(after_kinds, move_dir)
+        if not cells:
+            return None
+        runs = edge_runs(cells, move_dir)
+        open_runs = [r for r in runs if self._run_pocket_bounds(move_dir, r) is None]
+        if not open_runs:
+            return None
+
+        targets, _ = frontier_targets(gmap, after_kinds, blocked_moves=self._current_segment_blocked_moves())
+        mapped_next_arg: Optional[str] = None
+        if len(subgoal_dirs) == 1 and subgoal_dirs[0] == move_dir:
+            for t in targets:
+                n_leg = t.get("next_leg") or ""
+                if n_leg.startswith(f"MoveOff({move_dir} via "):
+                    dist = t.get("path_steps") or t.get("steps") or 0
+                    if dist > 6 and not t.get("on_screen"):
+                        mapped_next_arg = n_leg[len("MoveOff("):-1]
+                        break
+            if mapped_next_arg is None:
+                best_target = self._best_open_edge_target(move_dir, after_kinds)
+                if best_target is not None:
+                    mapped_next_arg = f"{move_dir} via {best_target}"
+
+        if mapped_next_arg is None:
+            return None
+
+        if len(open_runs) > 1 and not targets:
+            return None
+
+        dx, dy = a_pos[0] - b_pos[0], a_pos[1] - b_pos[1]
+        steps_taken = abs(dx) + abs(dy)
+        cardinal_name = {"up": "north", "down": "south", "left": "west", "right": "east"}[move_dir]
+        summary = (
+            f"The player walked {steps_taken} step{'s' if steps_taken != 1 else ''} {cardinal_name} "
+            f"from {b_pos} to {a_pos} ({task}); the {move_dir} corridor continues open via {mapped_next_arg}."
+        )
+        next_reasoning = (
+            f"The player advanced to {a_pos} in free roam and the {move_dir} corridor continues open "
+            f"toward the subgoal destination via {mapped_next_arg}."
+        )
+        return summary, ("MoveOff", mapped_next_arg), next_reasoning
+
     def _pursue(self, subgoal: str, subgoal_index: int = 0) -> Tuple[str, List[str], int]:
         attempts: List[str] = []
         subgoal_places: List[Tuple[int, Tuple[int, int]]] = []
@@ -2424,6 +2612,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             subgoal_places.append(start_subgoal_place)
         failed_attempts = 0
         iterations = 0
+        queued_decision: Optional[Tuple[Tuple[str, Optional[str]], str]] = None
         while failed_attempts < self.MAX_SUBGOAL_ATTEMPTS and iterations < self.MAX_SUBGOAL_ITERATIONS:
             if self._env_done():
                 return "env_done", attempts, subgoal_index
@@ -2436,6 +2625,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if (in_dialogue_now and not self._dialogue_clear_failed) or (
                 not in_dialogue_now and self._agent_state() != AgentState.FREE_ROAM
             ):
+                queued_decision = None
                 before = self._current_frame()
                 self._perceive(before)
                 if self._is_in_dialogue(before):
@@ -2472,7 +2662,11 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if before_place is not None and (not subgoal_places or subgoal_places[-1] != before_place):
                 subgoal_places.append(before_place)
             prior_stops = list(self._leg_stops)
-            decision, decision_reasoning = self._decide(subgoal, attempts, frame)
+            if queued_decision is not None:
+                decision, decision_reasoning = queued_decision
+                queued_decision = None
+            else:
+                decision, decision_reasoning = self._decide(subgoal, attempts, frame)
             if decision is None:
                 attempts.append("the reply could not be read, so nothing was done")
                 failed_attempts += 1
@@ -2790,6 +2984,35 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     return "stuck", attempts, subgoal_index
                 continue
 
+            made_progress = is_move_action and self._made_new_subgoal_progress(before_place, after_place, subgoal_places)
+            det_cont = (
+                self._try_deterministic_corridor_continuation(
+                    subgoal=subgoal,
+                    subgoal_index=subgoal_index,
+                    action=action,
+                    task=task,
+                    request=request,
+                    result=result,
+                    before_place=before_place,
+                    after_place=after_place,
+                    move_tag=move_tag,
+                    made_progress=made_progress,
+                )
+                if is_move_action
+                else None
+            )
+            if det_cont is not None:
+                summary, next_decision, next_reasoning = det_cont
+                if move_tag and move_tag not in summary:
+                    summary = f"{move_tag} {summary}"
+                self._note(summary)
+                attempts.append(f"{request}: {summary}")
+                if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
+                    subgoal_places.append(after_place)
+                if next_decision is not None:
+                    queued_decision = (next_decision, next_reasoning)
+                continue
+
             complete, summary, reached, replan_needed = self._judge(
                 subgoal, request, result, subgoal_index, move_tag=move_tag,
                 decision_reasoning=decision_reasoning)
@@ -2801,7 +3024,6 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 return "complete", attempts, reached
             if replan_needed:
                 return "stuck", attempts, subgoal_index
-            made_progress = is_move_action and self._made_new_subgoal_progress(before_place, after_place, subgoal_places)
             if after_place is not None and (not subgoal_places or subgoal_places[-1] != after_place):
                 subgoal_places.append(after_place)
             if not made_progress:

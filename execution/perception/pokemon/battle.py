@@ -1349,6 +1349,31 @@ def read_move_menu_names(frame: np.ndarray) -> Dict[int, str]:
     return names
 
 
+def read_move_menu_type(frame: np.ndarray) -> Optional[str]:
+    """Return the selected move's type string (e.g. 'NORMAL', 'FIRE') from the TYPE/ overlay box at tile row 10, or None."""
+    if frame is None or not is_move_selection_screen(frame):
+        return None
+    img = _grey_frame(frame)
+    if read_move_menu_pp(img) is None:
+        return None
+    t_str = read_tile_text(img, 10, 1, 10)
+    if t_str and len(t_str) >= 2 and t_str != "TYPE":
+        return t_str
+    return None
+
+
+def read_battle_opponent_hud_name(frame: np.ndarray) -> Optional[str]:
+    """Return the enemy Pokemon's name from the top-left battle HUD (tile row 0), or None."""
+    if frame is None or not is_battle_screen(frame):
+        return None
+    img = _grey_frame(frame)
+    for tx in (0, 1, 2, 3):
+        name = read_tile_text(img, 0, tx, 12)
+        if len(name) >= 2 and name not in ("LEVEL", "HP"):
+            return name
+    return None
+
+
 def is_no_pp_dialogue_frame(frame: np.ndarray) -> bool:
     """Return True when the 'No PP left for this move!' dialogue box is displayed below a 0/max PP overlay box."""
     if frame is None:

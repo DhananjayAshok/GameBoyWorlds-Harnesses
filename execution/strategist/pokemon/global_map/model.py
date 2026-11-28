@@ -999,6 +999,21 @@ class GlobalMap(StrategistArtifact):
             if (anchor_place is not None and anchor_place[0] == self.segment and anchor_pending is not None)
             else self.pos
         )
+        if (
+            not self.faded
+            and direction not in DIRECTIONS
+            and self.pos is not None
+            and 0 <= self.segment < len(self.segments)
+            and self.segments[self.segment]
+            and self._blacks_out(
+                frame,
+                self.segment,
+                self.pos,
+                tuple((-r) % GRID_SKIP for r in self.residual),
+            )
+        ):
+            self.stats["blackout_frames"] += 1
+            return "blank"
         placed = None if self.faded else register(
             self.anchor,
             frame,

@@ -37,8 +37,10 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  read_bag_item_quantities, read_battle_hud_hp,
                                                  read_battle_hud_status, read_dialogue_box_lines,
                                                  read_menu_cursor_item_name,
+                                                 read_battle_opponent_hud_name,
                                                  read_move_menu_cursor_slot,
                                                  read_move_menu_names, read_move_menu_pp,
+                                                 read_move_menu_type,
                                                  read_party_menu_compatibility,
                                                  read_party_menu_cursor_slot, read_party_menu_hp,
                                                  read_party_menu_members, read_party_menu_status,
@@ -2313,7 +2315,7 @@ class CombatExecutor(PolicyExecutor):
 The image is the current battle screen.
 [HISTORY]
 Choose what to do next:
-- fight: attack, and say which of the four moves to use (1 is the top one)
+- fight: attack, and say which of the four moves to use (1 is the top one; if a move was already shown to be "not very effective" or had no effect against the current opponent and another damaging move with PP left is available that is not resisted, switch to that non-resisted damaging move rather than repeating the resisted move, even if a general battle tip prefers the resisted move)
 - progress: press through battle text, or continue when there is no choice to make
 - run: try to escape. This never works against another trainer
 - bag: open the bag to use an item; choose this in a trainer battle whenever your active Pokemon's HP is at or below 50% of max HP (do not gamble on knocking out the opponent first when your HP is at or below 50%), unless a note below says the bag has no usable item
@@ -2390,6 +2392,7 @@ Press: <one of up, down, left, right, confirm, back>
             if initial_dialogue_crops
             else []
         )
+        self._pending_initial_ocr: bool = bool(self.dialogue_crops)
         self.dialogue_text: List[str] = []
         self._skip_intro_ocr: bool = bool(skip_intro_ocr)
         self._exited_to_free_roam: bool = False
@@ -2421,9 +2424,13 @@ Press: <one of up, down, left, right, confirm, back>
         self._battle_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self.battle_lost: bool = False
         self._move_names: Dict[int, str] = {}
+        self._move_types: Dict[int, str] = {}
         self._move_pp: Dict[int, Tuple[int, int]] = {}
         self._zero_pp_slots: Dict[int, str] = {}
         self._known_zero_pp_names: set = set()
+        self._current_opponent_name: Optional[str] = None
+        self._resisted_moves_for_opponent: Dict[int, str] = {}
+        self._immune_moves_for_opponent: Dict[int, str] = {}
         self._seen_bag_items: List[str] = list(party_state.items) if party_state is not None else []
         self._bag_item_quantities: Dict[str, Optional[int]] = (
             dict(party_state.quantities) if party_state is not None else {}
@@ -2549,9 +2556,14 @@ Press: <one of up, down, left, right, confirm, back>
         if isinstance(records, EnvironmentStepRecord):
             records = [records]
         crops = [crop for crop in captured_dialogue_crops(records) if not is_battle_menu_crop(crop)]
-        if not crops:
+        if self._pending_initial_ocr:
+            self._pending_initial_ocr = False
+            if crops:
+                drop_prefix_crops(crops, self.dialogue_crops)
+            fresh = list(self.dialogue_crops)
+        elif not crops:
             return []
-        if new_turn:
+        elif new_turn:
             fresh = drop_prefix_crops(crops)
             self.dialogue_crops.extend(fresh)
         else:
@@ -2707,9 +2719,40 @@ Press: <one of up, down, left, right, confirm, back>
             parts.append(f"dismissed {stat_dismisses} stat box{'es' if stat_dismisses > 1 else ''}")
         return (", then " + " and ".join(parts)) if parts else ""
 
+    def _update_opponent_tracking(self, frame: Optional[np.ndarray] = None, texts: Optional[List[str]] = None) -> None:
+        if texts:
+            joined = "\n".join(texts)
+            if re.search(r"\b(?:sent\s+out|fainted!|about\s+to\s+use)\b", joined, re.IGNORECASE):
+                self._resisted_moves_for_opponent.clear()
+                self._immune_moves_for_opponent.clear()
+        if frame is not None:
+            opp = read_battle_opponent_hud_name(frame)
+            if opp:
+                if self._current_opponent_name and opp != self._current_opponent_name:
+                    self._resisted_moves_for_opponent.clear()
+                    self._immune_moves_for_opponent.clear()
+                self._current_opponent_name = opp
+
+    def _record_move_effectiveness(self, move_slot: Optional[int], texts: List[str]) -> str:
+        if move_slot is None or not texts:
+            return ""
+        joined = "\n".join(texts)
+        move_name = self._move_names.get(move_slot, f"Move {move_slot}")
+        if re.search(r"\b(?:doesn['’]t\s+affect|it\s+had\s+no\s+effect)\b", joined, re.IGNORECASE):
+            self._immune_moves_for_opponent[move_slot] = move_name
+            return " (had NO EFFECT on the current opponent — switch to a different move)"
+        if re.search(r"\bnot\s+very\s+effective\b", joined, re.IGNORECASE):
+            self._resisted_moves_for_opponent[move_slot] = move_name
+            return " (was NOT VERY EFFECTIVE against the current opponent — prefer another damaging move if available)"
+        if re.search(r"\bsuper\s+effective\b", joined, re.IGNORECASE):
+            self._resisted_moves_for_opponent.pop(move_slot, None)
+            self._immune_moves_for_opponent.pop(move_slot, None)
+        return ""
+
     def _scan_move_menu_frame(self, frame: Optional[np.ndarray]) -> None:
         if frame is None:
             return
+        self._update_opponent_tracking(frame=frame)
         names = read_move_menu_names(frame)
         if names:
             for slot, name in names.items():
@@ -2721,6 +2764,9 @@ Press: <one of up, down, left, right, confirm, back>
                         self._zero_pp_slots[slot] = name
         slot = read_move_menu_cursor_slot(frame)
         pp = read_move_menu_pp(frame)
+        mtype = read_move_menu_type(frame)
+        if slot is not None and mtype:
+            self._move_types[slot] = mtype
         if slot is not None and pp is not None:
             self._move_pp[slot] = pp
             if pp[0] == 0:
@@ -3193,6 +3239,46 @@ Press: <one of up, down, left, right, confirm, back>
                 )
             elif cursor_row:
                 lines.append(f"Current bag cursor row: {cursor_row}.")
+        if self._move_names:
+            move_Descs: List[str] = []
+            for s in sorted(self._move_names):
+                m_name = self._move_names[s]
+                details: List[str] = []
+                if s in self._move_types:
+                    details.append(f"type: {self._move_types[s]}")
+                if s in self._move_pp:
+                    details.append(f"PP: {self._move_pp[s][0]}/{self._move_pp[s][1]}")
+                elif s in self._zero_pp_slots:
+                    details.append("PP: 0")
+                if s in self._immune_moves_for_opponent:
+                    details.append("NO EFFECT against current opponent")
+                elif s in self._resisted_moves_for_opponent:
+                    details.append("NOT VERY EFFECTIVE against current opponent")
+                detail_str = f" [{', '.join(details)}]" if details else ""
+                move_Descs.append(f"Move {s}: {m_name}{detail_str}")
+            lines.append(f"Known active Pokemon moves: {'; '.join(move_Descs)}.")
+        if self._immune_moves_for_opponent or self._resisted_moves_for_opponent:
+            bad_parts: List[str] = []
+            for s in sorted(set(self._immune_moves_for_opponent) | set(self._resisted_moves_for_opponent)):
+                m_name = self._move_names.get(s) or self._immune_moves_for_opponent.get(s) or self._resisted_moves_for_opponent.get(s) or f"Move {s}"
+                t_str = f", type: {self._move_types[s]}" if s in self._move_types else ""
+                eff_label = "had NO EFFECT" if s in self._immune_moves_for_opponent else "was NOT VERY EFFECTIVE"
+                bad_parts.append(f"Move {s} ({m_name}{t_str}) {eff_label}")
+            alt_moves = [
+                f"Move {s} ({self._move_names[s]}" + (f", type: {self._move_types[s]}" if s in self._move_types else "") + ")"
+                for s in sorted(self._move_names)
+                if s not in self._zero_pp_slots
+                and s not in self._immune_moves_for_opponent
+                and s not in self._resisted_moves_for_opponent
+                and self._move_names[s] not in ("GROWL", "LEER", "TAIL WHIP", "STRING SHOT", "SAND-ATTACK", "SAND ATTACK", "SMOKESCREEN", "SMOKESCR", "KINESIS", "FLASH", "DEFENSE CURL", "HARDEN", "WITHDRAW")
+            ]
+            alt_note = (
+                f" Switch to a non-resisted damaging move with PP left ({', '.join(alt_moves)}) instead of repeating the resisted move."
+                if alt_moves
+                else ""
+            )
+            opp_label = f" against {self._current_opponent_name}" if self._current_opponent_name else " against the current opponent"
+            lines.append(f"Note: {'; '.join(bad_parts)}{opp_label}.{alt_note}")
         zero_pp_items = self._format_zero_pp_list()
         if zero_pp_items:
             avail = [
@@ -3423,6 +3509,12 @@ Press: <one of up, down, left, right, confirm, back>
             if callable(recorder):
                 recorder(place=self._battle_place)
             reason = "battle_lost"
+        if self._pending_initial_ocr and not self._skip_intro_ocr and self.dialogue_crops:
+            self._pending_initial_ocr = False
+            init_texts = ocr(self.dialogue_crops, self._vlm, do_merge=True, parameters=self._parameters)
+            self.dialogue_text = init_texts + list(self.dialogue_text)
+            if is_battle_defeat_text(init_texts):
+                self.battle_lost = True
         self.report.termination_reason = reason
         notes_lines = list(self.dialogue_text)
         if reason == "battle_lost":
@@ -3540,6 +3632,7 @@ Press: <one of up, down, left, right, confirm, back>
             if self._last_truncated:
                 return self._fail(BATTLE_TRUNCATED, "truncated")
             if self._skip_intro_ocr and not self._exited_to_free_roam:
+                self._pending_initial_ocr = False
                 intro_crops = [c for c in captured_dialogue_crops(intro_records) if not is_battle_menu_crop(c)]
                 drop_prefix_crops(intro_crops, self.dialogue_crops)
                 texts = []
@@ -3862,6 +3955,7 @@ Press: <one of up, down, left, right, confirm, back>
 
             turn_records = []
             presses, dismisses = 0, 0
+            used_move_slot: Optional[int] = None
             if move_menu_open and option == "fight":
                 entry = f"- step {step + 1}: chose fight"
                 move = self._choose_move(output)
@@ -3899,6 +3993,7 @@ Press: <one of up, down, left, right, confirm, back>
                             self._mark_zero_pp_slot(move)
                         elif move in self._move_pp and self._move_pp[move][0] > 1:
                             self._move_pp[move] = (self._move_pp[move][0] - 1, self._move_pp[move][1])
+                        used_move_slot = move
                         consecutive_failures = 0
                         presses, dismisses = self._advance_until_decision(turn_records)
                         if self._last_terminated:
@@ -4029,6 +4124,7 @@ Press: <one of up, down, left, right, confirm, back>
                                 self._mark_zero_pp_slot(move)
                             elif move in self._move_pp and self._move_pp[move][0] > 1:
                                 self._move_pp[move] = (self._move_pp[move][0] - 1, self._move_pp[move][1])
+                            used_move_slot = move
                             presses, dismisses = self._advance_until_decision(turn_records)
                             if self._last_terminated:
                                 return self._fail(BATTLE_TERMINATED, "terminated")
@@ -4055,7 +4151,13 @@ Press: <one of up, down, left, right, confirm, back>
             else:
                 texts = self._read_new_text(turn_records, new_turn=(option != "progress"))
             if texts:
+                eff_note = self._record_move_effectiveness(used_move_slot, texts)
+                if eff_note:
+                    entry += eff_note
+                self._update_opponent_tracking(frame=self._current_frame(), texts=texts)
                 entry += "\n  text on screen: " + " / ".join(texts)
+            else:
+                self._update_opponent_tracking(frame=self._current_frame())
             self.history.append(entry)
             if self._exited_to_free_roam:
                 return self._record_outcome(AgentState.FREE_ROAM)
@@ -5797,9 +5899,18 @@ class _DialogueSettlingExecutor(PolicyExecutor):
 
 
 class DialogueExecutor(_DialogueSettlingExecutor):
-    def __init__(self, env, task, max_steps: int = 10, initial_dialogue_crops: Optional[List[Any]] = None, **kwargs):
+    def __init__(
+        self,
+        env,
+        task,
+        max_steps: int = 10,
+        initial_dialogue_crops: Optional[List[Any]] = None,
+        defer_ocr_on_battle: bool = False,
+        **kwargs,
+    ):
         self.dialogue_crops: List[Any] = list(initial_dialogue_crops) if initial_dialogue_crops else []
         self.dialogue_text: str = ""
+        self._defer_ocr_on_battle: bool = bool(defer_ocr_on_battle)
         super().__init__(env, task, max_steps, **kwargs)
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
@@ -5808,7 +5919,7 @@ class DialogueExecutor(_DialogueSettlingExecutor):
         return code
 
     def _finish(self, code: int, reason: str) -> int:
-        if self.dialogue_crops:
+        if self.dialogue_crops and not (self._defer_ocr_on_battle and reason == "left_dialogue_to_battle"):
             self.dialogue_text = "\n".join(ocr(self.dialogue_crops, self._vlm, do_merge=True,
                                                parameters=self._parameters))
             if is_battle_defeat_text([self.dialogue_text]):
@@ -5816,7 +5927,7 @@ class DialogueExecutor(_DialogueSettlingExecutor):
                 if callable(recorder):
                     recorder()
         self.report.termination_reason = reason
-        self.report.notes = self.dialogue_text
+        self.report.notes = self.dialogue_text or None
         return code
 
     def _in_dialogue_loop_state(self, state: AgentState) -> bool:

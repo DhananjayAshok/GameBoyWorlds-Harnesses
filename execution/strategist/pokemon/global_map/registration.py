@@ -112,15 +112,17 @@ def pixel_diff(before: np.ndarray, after: np.ndarray, sx: int, sy: int) -> Optio
             ob = old[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).swapaxes(1, 2)
             kb = keep[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).swapaxes(1, 2)
             db = diff_mask[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).swapaxes(1, 2)
-            for r in range(bh):
-                for c in range(bw):
-                    if db[r, c].any() and kb[r, c].all():
-                        blk_n = nb[r, c]
-                        blk_o = ob[r, c]
-                        for shift_x in range(1, 8):
-                            if np.array_equal(np.roll(blk_o, shift_x, axis=1), blk_n):
-                                db[r, c] = False
-                                break
+            active = db.any(axis=(2, 3)) & kb.all(axis=(2, 3))
+            if active.any():
+                act_nb = nb[active]
+                act_ob = ob[active]
+                matched = np.zeros(act_nb.shape[0], dtype=bool)
+                for shift_x in range(1, 8):
+                    shifted = np.concatenate((act_ob[:, :, -shift_x:], act_ob[:, :, :-shift_x]), axis=2)
+                    matched |= (shifted == act_nb).all(axis=(1, 2))
+                if matched.any():
+                    rs, cs = np.nonzero(active)
+                    db[rs[matched], cs[matched]] = False
     return float(diff_mask[keep].mean())
 
 
@@ -227,12 +229,26 @@ def register(before: np.ndarray, after: np.ndarray, direction: Optional[str], ma
 
 def _register_scripted(before: np.ndarray, after: np.ndarray, residual: Cell) -> Optional[Tuple[Cell, Cell]]:
     far, near = SCRIPTED_MAX_STEPS * GRID_SKIP + PX_SLACK, GRID_SKIP + PX_SLACK
+    coarse_best: Dict[Cell, float] = {}
+    for kx in range(-SCRIPTED_MAX_STEPS, SCRIPTED_MAX_STEPS + 1):
+        for ky in range(-SCRIPTED_MAX_STEPS, SCRIPTED_MAX_STEPS + 1):
+            if (kx, ky) == (0, 0) or min(abs(kx), abs(ky)) > 1:
+                continue
+            sx = GRID_SKIP * kx - residual[0]
+            sy = GRID_SKIP * ky - residual[1]
+            diff = pixel_diff(before, after, sx, sy)
+            if diff is not None:
+                coarse_best[(kx, ky)] = diff
+    if not coarse_best or min(coarse_best.values()) > 0.35:
+        return None
     best: Dict[Cell, Tuple[float, Cell]] = {}
     for sx in range(-far, far + 1):
         for sy in range(-far, far + 1):
             if (sx, sy) == (0, 0) or min(abs(sx), abs(sy)) > near:
                 continue
             kx, ky = int(round((sx + residual[0]) / GRID_SKIP)), int(round((sy + residual[1]) / GRID_SKIP))
+            if coarse_best.get((kx, ky), 1.0) > 0.35:
+                continue
             rx, ry = sx + residual[0] - GRID_SKIP * kx, sy + residual[1] - GRID_SKIP * ky
             if abs(rx) > PX_SLACK or abs(ry) > PX_SLACK:
                 continue
