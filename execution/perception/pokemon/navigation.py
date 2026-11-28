@@ -27,8 +27,11 @@ OVERHANG_TOP_TAGS = {"interactable object", "obstacle", "npc", "item", "sign"}
 QUARTERS = ("top_left", "top_right", "bottom_left", "bottom_right")
 FURNITURE_OVERHANG_DESC_PATTERN = re.compile(r"\b(?:table|desk|counter|shelf|bookshelf|machine|computer|pc|tv|television|sink|stove|bed)\b", re.IGNORECASE)
 SEATING_QUARTER_DESC_PATTERN = re.compile(
-    r"\b(?:stool|stools|chair|chairs|cushion|cushions|seat|seats)\b"
-    r"(?!.*\b(?:table\s+with|desk\s+with|counter\s+with)\b)",
+    r"\b(?:stool|stools|chair|chairs|cushion|cushions|seat|seats)\b",
+    re.IGNORECASE,
+)
+SEATING_TABLETOP_REJECT_DESC_PATTERN = re.compile(
+    r"\b(?:flask|flasks|plate|plates|cup|cups|book|books|map|trophy|statue|pot|plant|tv|television|sink|stove|bed)\b",
     re.IGNORECASE,
 )
 RIDGE_DESCRIPTION_PATTERN = re.compile(
@@ -639,7 +642,9 @@ def is_walkable_seating_cell(
     if len(cell_q) < 4:
         return False
     tag_set = set(cell_q.values())
-    if "obstacle" not in tag_set or not (tag_set <= {"ground", "ground decoration", "obstacle"}):
+    if not (tag_set & {"obstacle", "interactable object"}) or not (
+        tag_set <= {"ground", "ground decoration", "obstacle", "interactable object"}
+    ):
         return False
     cell_d = quarter_descriptions.get(cell, {})
     has_seating = False
@@ -649,6 +654,8 @@ def is_walkable_seating_cell(
         if t in ("ground", "ground decoration"):
             continue
         if not desc or not SEATING_QUARTER_DESC_PATTERN.search(desc):
+            return False
+        if SEATING_TABLETOP_REJECT_DESC_PATTERN.search(desc):
             return False
         has_seating = True
     return has_seating

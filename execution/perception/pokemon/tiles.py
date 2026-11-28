@@ -20,6 +20,7 @@ from execution.perception.pokemon.navigation import (FURNITURE_OVERHANG_TOP_TAGS
                                                      is_overhang_floor_cell, is_patterned_floor_cell,
                                                      is_player_overhang_floor_cell,
                                                      is_south_ledge_cell, is_top_overhang_floor_cell,
+                                                     is_walkable_seating_cell,
                                                      is_west_ledge_cell, trainer_los_ray)
 from execution.perception.pokemon.prompts import PLAYER_SIDES, TILE_IN_CELL_PROMPT, TILE_TAGS, fill_player_note
 from utils import log_error, parse_key_value
@@ -82,7 +83,7 @@ REACHABILITY_OBJECT_TAGS = ("entrance", "staircase", "elevator", "interactable o
 MIN_WARP_QUARTERS = 2
 TABLETOP_OBJECT_PATTERN = re.compile(
     r"\b(?:table|desk|counter)\b.*\b(?:with|holding|containing)\b"
-    r"(?!.*\b(?:potted\s+plant|plant|flower\s*pot|flowerpot)\b)",
+    r"(?!.*\b(?:potted\s+plant|plant|flower\s*pot|flowerpot|stool|stools|chair|chairs|cushion|cushions|seat|seats)\b)",
     re.IGNORECASE,
 )
 CUTTABLE_OBJECT_PATTERN = re.compile(
@@ -317,6 +318,11 @@ def verbalize_tiles(
         for cell in quarter_tags
         if is_npc_head_overhang_floor_cell(cell, quarter_tags, quarter_images=quarter_images)
     }
+    seating_floor_cells = {
+        cell
+        for cell in quarter_tags
+        if is_walkable_seating_cell(cell, quarter_tags, quarter_descriptions)
+    }
     south_ledge_cells = {
         cell for cell in quarter_tags if is_south_ledge_cell(cell, quarter_tags, quarter_descriptions)
     }
@@ -357,6 +363,8 @@ def verbalize_tiles(
         if (x, y) in player_overhang_cells and quarter in ("bottom_left", "bottom_right") and tag in OVERHANG_TOP_TAGS:
             continue
         if (x, y) in npc_head_overhang_cells and quarter in ("bottom_left", "bottom_right") and tag == "npc":
+            continue
+        if (x, y) in seating_floor_cells:
             continue
         if tag in NON_OBJECT_TAGS:
             continue
