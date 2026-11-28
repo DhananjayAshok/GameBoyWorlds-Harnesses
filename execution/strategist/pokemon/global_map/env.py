@@ -81,10 +81,13 @@ class MappingEnvironment:
 
     def step_high_level_action(self, action, **kwargs):
         from execution.game_api import AgentState, MenuAction, OpenMenuAction
-        from execution.perception.pokemon.battle import is_battle_screen
+        from execution.perception.pokemon.battle import is_battle_screen, is_false_overworld_menu_state
 
         before = self._env.get_info()
+        before_frame = before.get("core", {}).get("current_frame")
         before_state = before.get("pokemon_core", {}).get("agent_state")
+        if before_state == AgentState.IN_MENU and before_frame is not None and is_false_overworld_menu_state(before_frame):
+            before_state = AgentState.FREE_ROAM
         was_free = before_state == AgentState.FREE_ROAM
         result = self._env.step_high_level_action(action, **kwargs)
         try:
@@ -96,6 +99,8 @@ class MappingEnvironment:
             if not info.get("invalid_action") and core.get("current_frame") is not None:
                 frame = core["current_frame"]
                 after_state = info.get("pokemon_core", {}).get("agent_state")
+                if after_state == AgentState.IN_MENU and is_false_overworld_menu_state(frame):
+                    after_state = AgentState.FREE_ROAM
                 free = after_state == AgentState.FREE_ROAM
                 in_battle = (
                     before_state == AgentState.IN_BATTLE

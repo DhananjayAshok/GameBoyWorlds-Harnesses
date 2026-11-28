@@ -534,14 +534,14 @@ def find_modal_preview_boxes(frame: np.ndarray):
                     y0, y1 = (top_ty + 1) * TILE_SIZE, bot_ty * TILE_SIZE
                     x0, x1 = (left_tx + 1) * TILE_SIZE, right_tx * TILE_SIZE
                     inner = img[y0:y1, x0:x1]
-                    if float((inner >= LIGHT_BACKGROUND).mean()) < MODAL_MIN_LIGHT_FRACTION:
+                    if float((inner >= DIALOGUE_BOX_WHITE).mean()) < MODAL_MIN_LIGHT_FRACTION:
                         continue
                     margin_mask = np.zeros(inner.shape, dtype=bool)
                     margin_mask[:TILE_SIZE, :] = True
                     margin_mask[-TILE_SIZE:, :] = True
                     margin_mask[:, :TILE_SIZE] = True
                     margin_mask[:, -TILE_SIZE:] = True
-                    if float((inner[margin_mask] >= LIGHT_BACKGROUND).mean()) < MODAL_MIN_MARGIN_LIGHT_FRACTION:
+                    if float((inner[margin_mask] >= DIALOGUE_BOX_WHITE).mean()) < MODAL_MIN_MARGIN_LIGHT_FRACTION:
                         continue
                     boxes.append((top_ty, bot_ty, left_tx, right_tx))
     return boxes
@@ -560,6 +560,8 @@ def has_quantity_selector_box(frame: np.ndarray) -> bool:
     max_ty = min(GRID_ROWS, img.shape[0] // TILE_SIZE)
     max_tx = min(GRID_COLS, img.shape[1] // TILE_SIZE)
     if max_ty < GRID_ROWS or max_tx < GRID_COLS:
+        return False
+    if not has_bottom_dialogue_box(img):
         return False
     tiles = [[img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
               for tx in range(max_tx)] for ty in range(max_ty)]
@@ -580,7 +582,7 @@ def has_quantity_selector_box(frame: np.ndarray) -> bool:
                     y0, y1 = (top_ty + 1) * TILE_SIZE, bot_ty * TILE_SIZE
                     x0, x1 = (left_tx + 1) * TILE_SIZE, check_end * TILE_SIZE
                     inner = img[y0:y1, x0:x1]
-                    if inner.size == 0 or float((inner >= LIGHT_BACKGROUND).mean()) < 0.50:
+                    if inner.size == 0 or float((inner >= DIALOGUE_BOX_WHITE).mean()) < 0.50:
                         continue
                     if int((inner < DARK_INK).sum()) < 15:
                         continue
@@ -880,6 +882,24 @@ def is_overworld_menu_or_ui_screen(frame: np.ndarray) -> bool:
         or is_party_menu_screen(img)
         or is_pack_screen(img)
         or is_start_menu_screen(img)
+    )
+
+
+def is_false_overworld_menu_state(frame: np.ndarray) -> bool:
+    """Return True when a screen reported as IN_MENU has no menu cursor, UI/menu layout, dialogue box, battle screen, or fade."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < DIALOGUE_BOX_BOTTOM or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    return not (
+        has_menu_cursor(img)
+        or is_overworld_menu_or_ui_screen(img)
+        or has_bottom_dialogue_box(img)
+        or is_gen1_item_list_screen(img)
+        or has_quantity_selector_box(img)
+        or is_battle_screen(img)
+        or is_blank_or_fade_frame(img)
     )
 
 

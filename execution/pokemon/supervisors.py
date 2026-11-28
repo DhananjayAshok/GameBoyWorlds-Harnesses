@@ -2500,7 +2500,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         self._sync_dialogue_failure_state()
         if self._out_of_calls() or self._env_done():
             return None
-        if not (self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM):
+        if not (self._is_in_dialogue() or self._effective_state() != AgentState.FREE_ROAM):
             return None
         frame = self._current_frame()
         if self._is_in_dialogue(frame) and self._dialogue_clear_failed:
@@ -2704,7 +2704,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._sync_dialogue_failure_state()
             in_dialogue_now = self._is_in_dialogue()
             if (in_dialogue_now and not self._dialogue_clear_failed) or (
-                not in_dialogue_now and self._agent_state() != AgentState.FREE_ROAM
+                not in_dialogue_now and self._effective_state() != AgentState.FREE_ROAM
             ):
                 queued_decision = None
                 before = self._current_frame()
@@ -2785,7 +2785,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 and not result["succeeded"]
                 and (
                     (self._is_in_dialogue() and not self._dialogue_clear_failed)
-                    or (not self._is_in_dialogue() and self._agent_state() != AgentState.FREE_ROAM)
+                    or (not self._is_in_dialogue() and self._effective_state() != AgentState.FREE_ROAM)
                 )
                 and wild_resumes < self.MAX_WILD_MOVE_RESUMES
                 and not self._env_done()
@@ -2903,7 +2903,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     return "env_done", attempts, subgoal_index
 
             if (result["succeeded"]
-                    and (self._is_in_dialogue() or self._agent_state() != AgentState.FREE_ROAM)
+                    and (self._is_in_dialogue() or self._effective_state() != AgentState.FREE_ROAM)
                     and not self._env_done()
                     and self._total_calls < self._max_total_calls):
                 _, follow_up = self._handle_interruption(
@@ -2938,7 +2938,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
             after_in_dialogue = self._is_in_dialogue()
             should_handle_interruption = (
                 not result["succeeded"]
-                and (self._agent_state() != AgentState.FREE_ROAM or after_in_dialogue)
+                and (self._effective_state() != AgentState.FREE_ROAM or after_in_dialogue)
                 and self._total_calls < self._max_total_calls
                 and not (
                     after_in_dialogue

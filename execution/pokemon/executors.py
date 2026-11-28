@@ -18,6 +18,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_cutscene_frame_changing,
                                                  is_screen_wide_cutscene_change,
                                                  is_empty_battle_bag_menu, is_evolution_screen,
+                                                 is_false_overworld_menu_state,
                                                  is_gen1_item_list_screen, is_move_selection_screen,
                                                  is_no_pp_dialogue_frame, is_overworld_confirmation_subbox,
                                                  is_overworld_menu_or_ui_screen, is_overworld_pack_menu,
@@ -223,6 +224,7 @@ def settle_overworld_menu_state(
             or is_battle_screen(frame)
             or (has_top_dialogue_box(frame) and not has_menu_cursor(frame))
             or has_top_dialogue_box(frame)
+            or is_false_overworld_menu_state(frame)
         )
         if (not require_waited_for_ready_check or waited > 0) and ready:
             break
@@ -234,7 +236,12 @@ def settle_overworld_menu_state(
         state = get_state_fn()
         if state != AgentState.IN_MENU or is_done_fn():
             break
-        if has_menu_cursor(after_frame) or is_battle_screen(after_frame) or has_top_dialogue_box(after_frame):
+        if (
+            has_menu_cursor(after_frame)
+            or is_battle_screen(after_frame)
+            or has_top_dialogue_box(after_frame)
+            or is_false_overworld_menu_state(after_frame)
+        ):
             break
         if is_cutscene_frame_changing(before_frame, after_frame):
             post_motion_remaining = post_motion_wait
@@ -2296,6 +2303,8 @@ def effective_agent_state(raw_state: AgentState, frame: np.ndarray) -> AgentStat
                 return AgentState.IN_BATTLE
             if has_top_dialogue_box(frame):
                 return AgentState.IN_DIALOGUE
+            if is_false_overworld_menu_state(frame):
+                return AgentState.FREE_ROAM
     elif raw_state == AgentState.FREE_ROAM:
         if (has_bottom_dialogue_box(frame)
                 or has_modal_preview_box(frame)

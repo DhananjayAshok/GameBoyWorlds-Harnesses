@@ -126,24 +126,33 @@ def is_speckled_ground_quarter(
         return False
     if TABLETOP_SURFACE_DESC_PATTERN.search(description):
         return False
-    if not SPECKLED_GROUND_OBSTACLE_DESC_PATTERN.search(description):
-        return False
     arr = np.squeeze(np.asarray(image))
     if arr.shape != (8, 8):
         return False
     vals, counts = np.unique(arr, return_counts=True)
-    if len(vals) < 3:
-        return False
     min_s, max_s = int(arr.min()), int(arr.max())
-    if min_s < 60 or (max_s - min_s) > 72:
-        return False
     dom = float(counts.max()) / arr.size
-    if not (0.50 <= dom <= 0.85):
-        return False
     row_means = [float(arr[r, :].mean()) for r in range(8)]
-    col_means = [float(arr[:, c].mean()) for c in range(8)]
+    col_means = [float(arr[:, c].mean()) for r in range(8)]
     row_span = max(row_means) - min(row_means)
     col_span = max(col_means) - min(col_means)
+    if (
+        len(vals) == 2
+        and min_s >= 200
+        and max_s >= 240
+        and 0.45 <= dom <= 0.85
+        and row_span <= 30.0
+        and col_span <= 24.0
+    ):
+        return True
+    if not SPECKLED_GROUND_OBSTACLE_DESC_PATTERN.search(description):
+        return False
+    if len(vals) < 3:
+        return False
+    if min_s < 60 or (max_s - min_s) > 72:
+        return False
+    if not (0.50 <= dom <= 0.85):
+        return False
     if row_span <= 24.0 and col_span <= 24.0:
         return True
     if len(vals) == 3 and int(counts[0]) <= 10 and (int(counts[1]) + int(counts[2])) >= 54:
