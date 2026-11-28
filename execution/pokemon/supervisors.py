@@ -18,7 +18,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  read_battle_hud_hp, read_move_learning_dialogue_status,
                                                  read_tile_text)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
-                                                     boundary_exit_direction, cell_kinds, compress_path, edge_cells,
+                                                     approach_cells, boundary_exit_direction, cell_kinds, compress_path, edge_cells,
                                                      edge_runs, filter_open_lane_edge_cells, format_path_runs,
                                                      in_bounds, is_boundary_exit_direction, is_on_edge,
                                                      parse_all_cells, parse_edge_direction, shortest_path,
