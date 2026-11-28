@@ -1390,6 +1390,24 @@ class GlobalMap(StrategistArtifact):
         if not self._is_scripted_cutscene_warp(self.segment, dep, segment, pos, move):
             dep = self._snap_warp_door_endpoint(self.segment, dep)
             pos = self._snap_warp_door_endpoint(segment, pos)
+        if move is None:
+            seg_a = self.segments[self.segment] if 0 <= self.segment < len(self.segments) else {}
+            seg_b = self.segments[segment] if 0 <= segment < len(self.segments) else {}
+            da = self._door_at(self.segment, dep)
+            db = self._door_at(segment, pos)
+            ca = seg_a.get(da)
+            cb = seg_b.get(db)
+            has_door_a = ca is not None and is_door(ca) and max(abs(da[0] - dep[0]), abs(da[1] - dep[1])) <= DOOR_REACH
+            has_door_b = cb is not None and is_door(cb) and max(abs(db[0] - pos[0]), abs(db[1] - pos[1])) <= DOOR_REACH
+            if (
+                not has_door_a
+                and not has_door_b
+                and ca is not None
+                and ca.kind not in (OCCUPIED, UNKNOWN)
+                and "unknown" not in ca.tags
+                and (cb is None or (cb.kind not in (OCCUPIED, UNKNOWN) and "unknown" not in cb.tags))
+            ):
+                return
         self.warps.append((self.step, self.segment, dep, segment, pos))
         self.warp_moves.append(move)
         left = self.segment
@@ -2080,10 +2098,11 @@ class GlobalMap(StrategistArtifact):
             return True
         if (
             overlap.get("trail_anchored")
-            and overlap.get("matches", 0) >= 24
+            and overlap.get("matches", 0) >= 18
             and overlap.get("agreement", 0.0) >= 0.9
-            and self.info(source).kind == OUTDOORS
-            and self.info(target).kind == OUTDOORS
+            and (self.info(source).kind in (OUTDOORS, None) or self.info(target).kind in (OUTDOORS, None))
+            and self.info(source).kind != BUILDING
+            and self.info(target).kind != BUILDING
         ):
             return True
         if judge is None:
@@ -2156,9 +2175,10 @@ class GlobalMap(StrategistArtifact):
                     needed_shared = min(CONSOLIDATE_MIN_CELLS, max(15, int(0.4 * len(src_uniform))))
                     high_precision_collar = (
                         abs(dx) + abs(dy) <= 10
-                        and total >= 20
-                        and matches >= 20
-                        and matches >= 0.85 * total
+                        and (
+                            (total >= 20 and matches >= 20 and matches >= 0.85 * total)
+                            or (total >= 15 and matches >= 15 and matches >= 0.90 * total)
+                        )
                     )
                     if (
                         abs(dx) + abs(dy) <= 5
@@ -3039,7 +3059,7 @@ class GlobalMap(StrategistArtifact):
         if "unknown" in c_src.tags or "unknown" in c_dst.tags:
             return False
         trans_src_p = (src_p[0] + dx, src_p[1] + dy)
-        return max(abs(trans_src_p[0] - dst_p[0]), abs(trans_src_p[1] - dst_p[1])) <= DOOR_REACH
+        return max(abs(trans_src_p[0] - dst_p[0]), abs(trans_src_p[1] - dst_p[1])) <= MAX_STEP_FILL
 
     def _is_scripted_cutscene_warp(
         self,
@@ -3399,6 +3419,9 @@ class GlobalMap(StrategistArtifact):
                     changed += 1
             if self.info(si).kind == OUTDOORS:
                 changed += self._heal_visited_ground(si)
+        merged = self.consolidate(judge=None)
+        if merged:
+            changed += len(merged)
         if self.seen_entrances is not None:
             valid = {(si, g) for si, seg in enumerate(self.segments)
                      if si not in self.merged_into and self.info(si).kind in (OUTDOORS, None)
@@ -3549,17 +3572,47 @@ class GlobalMap(StrategistArtifact):
                     continue
                 if all(step_dir in seg_moves.get(rc, ()) for rc in road_cells):
                     continue
+                used_h0_door = False
                 if side == "right_wall":
-                    if not (h0[0] == h1[0] and h0[1] == h1[1] == h1[3] and h0[0] != h0[1] and h1[2] != h1[0]):
+                    if h0[0] == h1[0] and h0[1] == h1[1] == h1[3] and h0[0] != h0[1] and h1[2] != h1[0]:
+                        pass
+                    elif (
+                        h0[0] == h1[0] == h1[2]
+                        and h0[1] == h1[1] == h1[3]
+                        and h0[0] != h0[1]
+                        and h0[2] != h0[0]
+                        and h0[3] != h0[1]
+                    ):
+                        used_h0_door = True
+                    else:
                         continue
                 else:
-                    if not (h0[1] == h1[1] and h0[0] == h1[0] == h1[2] and h0[0] != h0[1] and h1[3] != h1[1]):
+                    if h0[1] == h1[1] and h0[0] == h1[0] == h1[2] and h0[0] != h0[1] and h1[3] != h1[1]:
+                        pass
+                    elif (
+                        h0[0] == h1[0] == h1[2]
+                        and h0[1] == h1[1] == h1[3]
+                        and h0[0] != h0[1]
+                        and h0[2] != h0[0]
+                        and h0[3] != h0[1]
+                    ):
+                        used_h0_door = True
+                    else:
                         continue
                 inner_block = [(wx + inner_step * k, y0 + dy) for k in range(1, 4) for dy in range(4)]
-                if all(b in seg for b in inner_block):
+                if not any(b in seg for b in inner_block):
+                    continue
+                if not used_h0_door and all(b in seg for b in inner_block):
                     continue
                 if any(
-                    b in seg and (is_door(seg[b]) or (seg[b].kind != BLOCKED or seg[b].tags != ("obstacle",)))
+                    b in seg
+                    and (
+                        (not used_h0_door and is_door(seg[b]))
+                        or (
+                            not (seg[b].kind == BLOCKED and seg[b].tags == ("obstacle",))
+                            and not (used_h0_door and b[1] == y0 and is_door(seg[b]))
+                        )
+                    )
                     for b in inner_block
                 ):
                     continue

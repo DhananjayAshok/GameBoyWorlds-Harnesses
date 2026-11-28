@@ -11,7 +11,7 @@ import numpy as np
 from execution.artifact import StrategistArtifact, update
 from execution.perception.pokemon import sprites as S
 from execution.perception.pokemon.grid import LEFT_COL, TOP_ROW, cell_box
-from execution.strategist.pokemon.global_map import (DIRECTIONS, OCCUPIED, PX_SLACK, GlobalMap, StepEvent,
+from execution.strategist.pokemon.global_map import (DIRECTIONS, OCCUPIED, PX_SLACK, WALKABLE, GlobalMap, StepEvent,
                                                      grid_offset, grid_residual)
 from execution.strategist.pokemon import npc_model
 from execution.strategist.pokemon.npc_map import LABEL_NOTE, WHERE_NOTES, maybe_lines

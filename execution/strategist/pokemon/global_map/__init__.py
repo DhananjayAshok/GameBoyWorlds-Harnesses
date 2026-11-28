@@ -12,7 +12,7 @@ a new map segment is started, so a door warp or cut-scene never corrupts an exis
 from __future__ import annotations
 
 from .registration import PX_SLACK, SCREEN_UNIT, grid_offset, grid_residual
-from .model import BUILDING, DIRECTIONS, OCCUPIED, OUTDOORS, GlobalMap, MapCell, SegmentInfo
+from .model import BUILDING, DIRECTIONS, OCCUPIED, OUTDOORS, WALKABLE, GlobalMap, MapCell, SegmentInfo
 from .env import MappingEnvironment, StepEvent
 from .render import render_segment, segment_bounds
 from .text import LEGEND, ascii_window, door_lines, glyph, sector
