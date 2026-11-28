@@ -345,6 +345,8 @@ class NPCRegistry(StrategistArtifact):
         self._gmap, self._episode = gmap, episode
         if hasattr(gmap, "attach_npcs"):
             gmap.attach_npcs(self)
+        self._normalize_coordinates(gmap)
+        self._split_distant_same_segment_sightings(gmap)
         self._tracks = {}
         self._forget_screen()
         self._facing, self._open, self._last_closed = self.last_facing, None, None
@@ -1001,9 +1003,43 @@ class NPCRegistry(StrategistArtifact):
         square = (rpos[0] + target[0], rpos[1] + target[1])
         return square if (self._cell_tags(target, ev) & SIGN_TAGS) else None
 
-    def _merge_look_and_npc(self, keep: NPC, drop: NPC) -> NPC:
+    def can_merge_npcs(self, keep: NPC, drop: NPC, gmap: Optional[GlobalMap] = None,
+                       max_same_segment_dist: int = NEAR) -> bool:
         keep, drop = self.get(keep.id), self.get(drop.id)
         if keep.id == drop.id or frozenset((keep.id, drop.id)) in self.covisible:
+            return False
+        if (
+            keep.real_name
+            and drop.real_name
+            and keep.name_type == "personal"
+            and drop.name_type == "personal"
+        ):
+            return keep.real_name.casefold() == drop.real_name.casefold()
+        g = gmap if gmap is not None else self._gmap
+        if g is None:
+            return True
+        keep_by_seg: Dict[int, List[Cell]] = {}
+        for s in keep.sightings:
+            seg, sq = self.place(g, s)
+            keep_by_seg.setdefault(seg, []).append(sq)
+        drop_by_seg: Dict[int, List[Cell]] = {}
+        for s in drop.sightings:
+            seg, sq = self.place(g, s)
+            drop_by_seg.setdefault(seg, []).append(sq)
+        shared_segs = set(keep_by_seg) & set(drop_by_seg)
+        for seg in shared_segs:
+            min_dist = min(
+                _manhattan(a, b)
+                for a in keep_by_seg[seg]
+                for b in drop_by_seg[seg]
+            )
+            if min_dist > max_same_segment_dist:
+                return False
+        return True
+
+    def _merge_look_and_npc(self, keep: NPC, drop: NPC, max_same_segment_dist: int = NEAR) -> NPC:
+        keep, drop = self.get(keep.id), self.get(drop.id)
+        if not self.can_merge_npcs(keep, drop, max_same_segment_dist=max_same_segment_dist):
             return keep
         if drop.created < keep.created:
             keep, drop = drop, keep
@@ -1077,19 +1113,26 @@ class NPCRegistry(StrategistArtifact):
         if not empty_ray_squares:
             return npc
         allowed_places = empty_ray_squares | {rtarget}
+        step_cap = g.step if max_step is None else max_step
         for other in list(self.live_npcs()):
             if other.id == npc.id or self.look_of(other).kind_hint == "object":
                 continue
             if frozenset((npc.id, other.id)) in self.covisible:
                 continue
-            other_places = {self.place(g, s)[1] for s in other.sightings if self.place(g, s)[0] == rseg}
+            other_sights_in_seg = [s for s in other.sightings if self.place(g, s)[0] == rseg]
+            other_places = {self.place(g, s)[1] for s in other_sights_in_seg}
             if other_places and other_places <= allowed_places:
-                if not other.conversations or not npc.conversations:
-                    npc = self._merge_look_and_npc(npc, other)
+                recent_in_ray = any(0 <= step_cap - s.map_step <= 32 for s in other_sights_in_seg)
+                if recent_in_ray and (not other.conversations or not npc.conversations):
+                    npc = self._merge_look_and_npc(npc, other, max_same_segment_dist=4)
         for s in npc.sightings:
             s_seg, s_sq = self.place(g, s)
-            if s_seg == rseg and s_sq in empty_ray_squares and (max_step is None or s.map_step <= max_step):
-                s.segment, s.square = segment, target_raw
+            if (
+                s_seg == rseg
+                and s_sq in empty_ray_squares
+                and (max_step is None or 0 <= max_step - s.map_step <= 32)
+            ):
+                s.segment, s.square = rseg, rtarget
         return npc
 
     def _link_or_track_cell(self, cell: Cell, window: np.ndarray, mask: np.ndarray,
@@ -1931,6 +1974,28 @@ class NPCRegistry(StrategistArtifact):
                     and self._same_or_step_square(gmap, other.segment, other.square, rseg, rsq)
                     for other in convs
                 )
+                if not followed_by_battle and conv.led_to == "free_roam" and conv.text.strip():
+                    trail = getattr(gmap, "trail", ())
+                    if trail and not npc_model.is_routine_service_text(conv.text):
+                        window = [(t, gmap.resolve(s, p)) for t, s, p in trail if end_step - 2 <= t <= end_step + 250]
+                        for wi in range(len(window) - 1):
+                            t0, (s0, p0) = window[wi]
+                            t1, (s1, p1) = window[wi + 1]
+                            if t0 - end_step > MAX_PRE_BATTLE_WAIT_STEPS:
+                                break
+                            if (
+                                s0 == rseg
+                                and _manhattan(p0, rsq) <= 1
+                                and t1 - t0 >= 15
+                                and not any(
+                                    other.id != conv.id
+                                    and other.episode == conv.episode
+                                    and t0 < other.map_step_start < t1
+                                    for other in convs
+                                )
+                            ):
+                                followed_by_battle = True
+                                break
                 if followed_by_battle:
                     if not conv.text.strip() and not conv.crops and conv.npc is None and conv.sign is None:
                         self._mark_battle_start(conv)
@@ -2032,8 +2097,131 @@ class NPCRegistry(StrategistArtifact):
                                              or npc_model.is_routine_conversation(self, conv)):
                     npc.needs = None
 
+    def _normalize_coordinates(self, gmap: GlobalMap) -> None:
+        for npc in self.npcs.values():
+            for s in npc.sightings:
+                s.segment, s.square = gmap.resolve(s.segment, s.square)
+        for conv in self.conversations.values():
+            rseg, rsq = gmap.resolve(conv.segment, conv.square)
+            if conv.target is not None:
+                _, t_from_seg = gmap.resolve(conv.segment, conv.target)
+                _, t_from_rseg = gmap.resolve(rseg, conv.target)
+                if _manhattan(t_from_seg, rsq) <= 2 or _manhattan(t_from_seg, rsq) <= _manhattan(t_from_rseg, rsq):
+                    conv.target = t_from_seg
+                else:
+                    conv.target = t_from_rseg
+            conv.segment, conv.square = rseg, rsq
+        by_place: Dict[Tuple[int, Cell], Sign] = {}
+        for sign_id, sign in list(self.signs.items()):
+            rseg, rsq = gmap.resolve(sign.segment, sign.square)
+            sign.segment, sign.square = rseg, rsq
+            existing = by_place.get((rseg, rsq))
+            if existing is not None and existing.id != sign.id:
+                for cid in sign.conversations:
+                    if cid not in existing.conversations:
+                        existing.conversations.append(cid)
+                    if cid in self.conversations:
+                        self.conversations[cid].sign = existing.id
+                if sign.text and not existing.text:
+                    existing.text = sign.text
+                existing.episode = max(existing.episode, sign.episode)
+                self.signs.pop(sign_id, None)
+            else:
+                by_place[(rseg, rsq)] = sign
+        for track in self._tracks.values():
+            track.segment, track.square = gmap.resolve(track.segment, track.square)
+        if self.tagged_squares:
+            new_tagged: Dict[Tuple[int, Cell], bool] = {}
+            for key, val in self.tagged_squares.items():
+                rkey = gmap.resolve(*key)
+                new_tagged[rkey] = new_tagged.get(rkey, False) or bool(val)
+            self.tagged_squares = new_tagged
+        if self.maybe_squares:
+            new_maybe: Dict[Tuple[int, Cell], MaybeSquare] = {}
+            for key, m in self.maybe_squares.items():
+                rkey = gmap.resolve(*key)
+                prev = new_maybe.get(rkey)
+                if prev is None or (prev.verdict is None and m.verdict is not None) or m.frames > prev.frames:
+                    new_maybe[rkey] = m
+            self.maybe_squares = new_maybe
+
+    def _split_distant_same_segment_sightings(self, gmap: GlobalMap) -> None:
+        for npc in list(self.live_npcs()):
+            if len(npc.sightings) <= 1 or (npc.real_name and npc.name_type == "personal"):
+                continue
+            by_seg: Dict[int, List[Sighting]] = {}
+            for s in npc.sightings:
+                rseg, _ = self.place(gmap, s)
+                by_seg.setdefault(rseg, []).append(s)
+            for rseg, sights in by_seg.items():
+                squares = list({self.place(gmap, s)[1] for s in sights})
+                if _spread(squares) <= NEAR:
+                    continue
+                clusters: List[Set[Cell]] = []
+                remaining = set(squares)
+                while remaining:
+                    seed = remaining.pop()
+                    comp = {seed}
+                    queue = [seed]
+                    while queue:
+                        cur = queue.pop()
+                        neighbours = {q for q in remaining if _manhattan(cur, q) <= NEAR}
+                        if neighbours:
+                            comp |= neighbours
+                            remaining -= neighbours
+                            queue.extend(neighbours)
+                    clusters.append(comp)
+                if len(clusters) <= 1:
+                    continue
+                anchor_sq: Optional[Cell] = None
+                for cid in reversed(npc.conversations):
+                    c = self.conversations.get(cid)
+                    if c is not None and gmap.resolve(c.segment, c.square)[0] == rseg:
+                        if c.target is not None:
+                            anchor_sq = c.target
+                            break
+                        _, c_sq = gmap.resolve(c.segment, c.square)
+                        anchor_sq = c_sq
+                        break
+                if anchor_sq is None:
+                    newest_in_seg = max(sights, key=lambda s: s.map_step)
+                    anchor_sq = self.place(gmap, newest_in_seg)[1]
+                clusters.sort(key=lambda comp: min(_manhattan(q, anchor_sq) for q in comp))
+                keep_comp = clusters[0]
+                other_comps = clusters[1:]
+                kept_sights = [
+                    s for s in npc.sightings
+                    if self.place(gmap, s)[0] != rseg or self.place(gmap, s)[1] in keep_comp
+                ]
+                npc.sightings = kept_sights
+                look = self.look_of(npc)
+                for comp in other_comps:
+                    comp_sights = [s for s in sights if self.place(gmap, s)[1] in comp]
+                    if not comp_sights:
+                        continue
+                    already_covered = any(
+                        other.id != npc.id
+                        and any(
+                            self.place(gmap, os)[0] == rseg and self.place(gmap, os)[1] in comp
+                            for os in other.sightings
+                        )
+                        for other in self.live_npcs()
+                    )
+                    if already_covered:
+                        continue
+                    first_s = min(comp_sights, key=lambda s: s.map_step)
+                    split_npc = self._new_npc(look, None, [], first_s.map_step)
+                    split_npc.created = (first_s.episode, first_s.map_step)
+                    split_npc.kind = "person" if npc.kind == "trainer" else npc.kind
+                    split_npc.description = npc.description
+                    split_npc.sightings = list(comp_sights)
+                    self.covisible.add(frozenset((npc.id, split_npc.id)))
+
     def consolidate(self) -> None:
         gmap = self._gmap
+        if gmap is not None:
+            self._normalize_coordinates(gmap)
+            self._split_distant_same_segment_sightings(gmap)
         for a, b in sorted(self._look_merges):
             a, b = self.look_aliases.get(a, a), self.look_aliases.get(b, b)
             if a != b and a in self.looks and b in self.looks:
@@ -2041,6 +2229,8 @@ class NPCRegistry(StrategistArtifact):
         self._look_merges = set()
         if gmap is not None:
             self._reconcile_conversations()
+            self._normalize_coordinates(gmap)
+            self._split_distant_same_segment_sightings(gmap)
         people = sorted(self.live_npcs(), key=lambda n: n.created)
         for i, older in enumerate(people):
             if older.merged_into is not None:
@@ -2048,7 +2238,7 @@ class NPCRegistry(StrategistArtifact):
             for newer in people[i + 1:]:
                 if newer.merged_into is not None or self.look_of(newer).id != self.look_of(older).id:
                     continue
-                if frozenset((older.id, newer.id)) in self.covisible:
+                if not self.can_merge_npcs(older, newer, gmap, max_same_segment_dist=NEAR):
                     continue
                 a, b = self.last_seen(gmap, older), self.last_seen(gmap, newer)
                 if a and b and a[0] == b[0] and _manhattan(a[1], b[1]) <= NEAR:
@@ -2072,7 +2262,7 @@ class NPCRegistry(StrategistArtifact):
                     step()
                 except Exception as e:
                     log_warn(f"NPC registry: {label} skipped: {type(e).__name__}: {e}")
-        npc_model._settle_routine_npc_needs(self)
+        npc_model._settle_routine_npc_needs(self, gmap)
 
     @update
     def end_episode(self, gmap: GlobalMap, vlm_caller: Optional[Callable[[str], Callable[..., Any]]] = None) -> None:
@@ -2296,7 +2486,8 @@ class NPCRegistry(StrategistArtifact):
         seg_cells = gmap.segments[segment] if 0 <= segment < len(gmap.segments) else {}
         for mark in self.map_people(gmap, segment):
             cell = (mark.square[0] - gmap.pos[0], mark.square[1] - gmap.pos[1])
-            if not mark.on_screen and not mark.earlier and cell not in people:
+            is_stationary = not mark.earlier or mark.kind == "trainer"
+            if not mark.on_screen and is_stationary and cell not in people:
                 if self.in_view(gmap, mark.square) and self._episode - mark.last_seen[0] <= STALE_MARK_EPISODES:
                     people[cell] = mark.npc_id
                     remembered.add(cell)

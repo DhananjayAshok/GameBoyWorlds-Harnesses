@@ -242,20 +242,49 @@ def _describe(reg, gmap, npc, number: int, met: bool = False) -> str:
     return text + (f', said: "{said[:120]}"' if said else "")
 
 
-def _candidates(reg, npc) -> List[Any]:
+def _resolved_sightings_by_segment(reg, npc, gmap=None) -> Dict[int, List[Tuple[int, int]]]:
+    g = gmap if gmap is not None else getattr(reg, "_gmap", None)
+    by_seg: Dict[int, List[Tuple[int, int]]] = {}
+    for s in getattr(npc, "sightings", ()):
+        seg, sq = g.resolve(s.segment, s.square) if g is not None else (s.segment, s.square)
+        by_seg.setdefault(seg, []).append(sq)
+    return by_seg
+
+
+def _candidates(reg, npc, gmap=None) -> List[Any]:
     out, seen = [], {npc.id}
-    npc_segs = {s.segment for s in getattr(npc, "sightings", ())}
+    if frozenset() in getattr(reg, "covisible", ()):
+        pass
+    npc_by_seg = _resolved_sightings_by_segment(reg, npc, gmap)
+    npc_has_personal_name = bool(npc.real_name and npc.name_type == "personal")
     for cid in npc.candidates:
         if cid not in reg.npcs:
             continue
         other = reg.get(cid)
         if other.id in seen or other.merged_into is not None:
             continue
-        other_segs = {s.segment for s in getattr(other, "sightings", ())}
-        same_segment = bool(npc_segs and other_segs and (npc_segs & other_segs))
+        if frozenset((npc.id, other.id)) in getattr(reg, "covisible", set()):
+            continue
+        if hasattr(reg, "can_merge_npcs") and not reg.can_merge_npcs(other, npc, gmap):
+            continue
+        other_by_seg = _resolved_sightings_by_segment(reg, other, gmap)
+        shared_segs = set(npc_by_seg) & set(other_by_seg)
+        same_local_place = False
+        if shared_segs:
+            for seg in shared_segs:
+                min_dist = min(
+                    abs(a[0] - b[0]) + abs(a[1] - b[1])
+                    for a in npc_by_seg[seg]
+                    for b in other_by_seg[seg]
+                )
+                if min_dist <= 4:
+                    same_local_place = True
+                    break
         has_personal_name = bool(other.real_name and other.name_type == "personal")
-        has_story_talk = bool(other.description and _interacted_with(reg, other))
-        if not (same_segment or has_personal_name or has_story_talk):
+        if npc_has_personal_name and has_personal_name and npc.real_name.casefold() != other.real_name.casefold():
+            continue
+        has_story_talk = bool(not shared_segs and other.description and _interacted_with(reg, other) and has_personal_name)
+        if not (same_local_place or has_personal_name or has_story_talk):
             continue
         seen.add(other.id)
         out.append(other)
@@ -335,7 +364,10 @@ def _replies(out: Any, n: int) -> List[str]:
 
 
 def try_merge(reg, keep, drop) -> bool:
+    keep, drop = reg.get(keep.id), reg.get(drop.id)
     if keep.id == drop.id or frozenset((keep.id, drop.id)) in reg.covisible:
+        return False
+    if hasattr(reg, "can_merge_npcs") and not reg.can_merge_npcs(keep, drop):
         return False
     keep_look, drop_look = reg.look_of(keep), reg.look_of(drop)
     if keep_look.id != drop_look.id:
@@ -421,21 +453,42 @@ def sanitize_character_looks(reg) -> None:
                 npc.description = None
 
 
-def _settle_routine_npc_needs(reg) -> None:
+def _adopt_peer_description(reg, npc) -> None:
+    peers = [
+        n for n in reg.live_npcs()
+        if n.id != npc.id and reg.look_of(n).id == reg.look_of(npc).id and n.description
+    ]
+    if peers and not npc.description:
+        best_kind, best_desc = Counter((p.kind, p.description) for p in peers).most_common(1)[0][0]
+        if npc.kind == "unknown" and best_kind != "unknown":
+            npc.kind = best_kind
+        npc.description = best_desc
+
+
+def _settle_routine_npc_needs(reg, gmap=None) -> None:
     sanitize_character_looks(reg)
     for npc in reg.live_npcs():
         convs = [reg.conversations[cid] for cid in npc.conversations
                  if cid in reg.conversations and reg.conversations[cid].trigger != "battle_start"]
-        if not convs:
-            continue
-        if all(is_routine_conversation(reg, c) for c in convs):
+        if convs and all(is_routine_conversation(reg, c) for c in convs):
+            if npc.needs == "judge":
+                _adopt_peer_description(reg, npc)
             npc.needs = None
+            continue
+        if npc.needs == "judge" and _interacted_with(reg, npc):
+            cands = _candidates(reg, npc, gmap)
+            if not cands:
+                _adopt_peer_description(reg, npc)
+                npc.needs = None
 
 
 def run_model(reg, vlm_card: Callable[..., Any], vlm_judge: Callable[..., Any], game: str, gmap) -> None:
-    _settle_routine_npc_needs(reg)
+    _settle_routine_npc_needs(reg, gmap)
     cards = [n for n in reg.live_npcs() if n.needs == "card" and _interacted_with(reg, n)][:MAX_BATCH]
-    judges = [n for n in reg.live_npcs() if n.needs == "judge" and _interacted_with(reg, n)][:MAX_BATCH]
+    judges = [
+        n for n in reg.live_npcs()
+        if n.needs == "judge" and _interacted_with(reg, n) and bool(_candidates(reg, n, gmap))
+    ][:MAX_BATCH]
     if cards:
         _cards(reg, cards, vlm_card, game, gmap)
     if judges:
@@ -452,7 +505,7 @@ def _failed(reg, npc) -> None:
 def _cards(reg, people, vlm_call, game: str, gmap) -> None:
     prompts, images, cands = [], [], []
     for npc in people:
-        others = _candidates(reg, npc)
+        others = _candidates(reg, npc, gmap)
         cands.append(others)
         block = ""
         if others:
@@ -525,9 +578,15 @@ def _apply_card(reg, npc, card: Dict[str, Any]) -> None:
 
 
 def _judges(reg, people, vlm_call, game: str, gmap) -> None:
+    active_people = []
     prompts, images, cands = [], [], []
     for npc in people:
-        others = _candidates(reg, npc)
+        others = _candidates(reg, npc, gmap)
+        if not others:
+            _adopt_peer_description(reg, npc)
+            npc.needs = None
+            continue
+        active_people.append(npc)
         cands.append(others)
         seen = reg.last_seen(gmap, npc)
         lines = "\n".join(_describe(reg, gmap, o, k + 1, met=True) for k, o in enumerate(others))
@@ -536,8 +595,10 @@ def _judges(reg, people, vlm_call, game: str, gmap) -> None:
         pics = ([screen_with_box(npc.context, npc.context_cell)] if npc.context is not None and npc.context_cell
                 else [sprite_x4(reg.look_of(npc).views[0])])
         images.append(pics + [look_sheet(reg.look_of(o)) for o in others[:1]])
-    out = _replies(vlm_call(texts=prompts, images=images, max_new_tokens=1500), len(people))
-    for npc, others, reply in zip(people, cands, out):
+    if not active_people:
+        return
+    out = _replies(vlm_call(texts=prompts, images=images, max_new_tokens=1500), len(active_people))
+    for npc, others, reply in zip(active_people, cands, out):
         if not others:
             npc.needs = None
             continue

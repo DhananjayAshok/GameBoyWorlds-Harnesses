@@ -274,7 +274,10 @@ class GlobalMap(StrategistArtifact):
             )
             out: set = set()
             for mark in npcs.map_people(self, si):
-                if getattr(mark, "stale", False) or getattr(mark, "earlier", None):
+                if getattr(mark, "stale", False):
+                    continue
+                earlier = getattr(mark, "earlier", None)
+                if earlier and getattr(mark, "kind", None) != "trainer":
                     continue
                 sq = getattr(mark, "square", None)
                 if sq is None or sq == cur_pos or visits.get(sq, 0) > 0:
