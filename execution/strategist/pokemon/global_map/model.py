@@ -1502,6 +1502,19 @@ class GlobalMap(StrategistArtifact):
                     live_kinds[(x, y)] = lk
         visits = self.visits[self.segment] if self.segment < len(self.visits) else Counter()
         px, py = self.pos
+        prior_window = 50
+        pre_seg: Dict[Cell, MapCell] = {}
+        n_recent_priors = 0
+        for g_cell, c_cell in seg.items():
+            if abs(g_cell[0] - px) <= 8 and abs(g_cell[1] - py) <= 8:
+                pr = getattr(c_cell, "prior", None)
+                if pr is not None and (self.step - int(pr[4]) > prior_window) and (self.step - c_cell.last_seen <= prior_window):
+                    pk, pt, ph, pfs, pls, ppix = pr
+                    pre_seg[g_cell] = MapCell(pk, pt, ph, pfs, pls, ppix)
+                    n_recent_priors += 1
+                elif not (self.step - c_cell.first_seen <= prior_window and self.step - c_cell.last_seen <= prior_window):
+                    pre_seg[g_cell] = c_cell
+        use_pre_seg = n_recent_priors >= 8
         scores: Dict[Cell, Dict[str, Any]] = {}
         for dx in range(-2, 3):
             for dy in range(-2, 3):
@@ -1511,6 +1524,11 @@ class GlobalMap(StrategistArtifact):
                 if (dx, dy) != (0, 0) and self._blacks_out(frame, self.segment, cand, (0, 0)):
                     continue
                 m, ov = self._screen_agreement(seg, local, cand, blank_local, local_pixels)
+                m_pre, ov_pre = (
+                    self._screen_agreement(pre_seg, local, cand, blank_local, local_pixels)
+                    if use_pre_seg
+                    else (0, 0)
+                )
                 vis_match = vis_total = 0
                 lm_match = lm_mismatch = 0
                 vis_blk = vis_wlk = 0
@@ -1543,11 +1561,21 @@ class GlobalMap(StrategistArtifact):
                     and "obstacle" in cand_cell.tags
                     and visits.get(cand, 0) == 0
                 )
+                pre_cand_cell = pre_seg.get(cand) if use_pre_seg else cand_cell
+                pre_on_blocked = (
+                    pre_cand_cell is not None
+                    and pre_cand_cell.kind == BLOCKED
+                    and "obstacle" in pre_cand_cell.tags
+                    and visits.get(cand, 0) == 0
+                )
                 scores[(dx, dy)] = {
                     "pos": cand,
                     "m": m,
                     "ov": ov,
                     "frac": m / ov if ov else 0.0,
+                    "m_pre": m_pre,
+                    "ov_pre": ov_pre,
+                    "frac_pre": m_pre / ov_pre if ov_pre else 0.0,
                     "vis_match": vis_match,
                     "vis_total": vis_total,
                     "lm_match": lm_match,
@@ -1555,49 +1583,71 @@ class GlobalMap(StrategistArtifact):
                     "vis_blk": vis_blk,
                     "vis_wlk": vis_wlk,
                     "on_blocked": on_blocked,
+                    "pre_on_blocked": pre_on_blocked,
                 }
         s0 = scores.get((0, 0))
         if s0 is None:
             return None
         cands = []
         for d, sc in scores.items():
-            if d == (0, 0) or sc["ov"] < 20 or sc["on_blocked"]:
+            if d == (0, 0):
                 continue
             self_per = pixel_diff(a, a, d[0] * GRID_SKIP, -d[1] * GRID_SKIP)
             if self_per is not None and self_per <= 0.01:
                 continue
             dist = abs(d[0]) + abs(d[1])
             qualifies = False
-            if sc["frac"] >= 0.85 and (
-                sc["frac"] - s0["frac"] >= 0.08
-                or (sc["lm_match"] > s0["lm_match"] and sc["lm_mismatch"] < s0["lm_mismatch"] and sc["frac"] - s0["frac"] >= 0.04)
-                or (sc["vis_total"] >= 4 and sc["vis_match"] == sc["vis_total"] and s0["vis_match"] < s0["vis_total"] and sc["frac"] - s0["frac"] >= 0.05)
-                or (s0["on_blocked"] and sc["vis_blk"] <= s0["vis_blk"] and sc["frac"] - s0["frac"] >= 0.04)
+            used_pre = False
+            if sc["ov"] >= 20 and not sc["on_blocked"]:
+                if sc["frac"] >= 0.85 and (
+                    sc["frac"] - s0["frac"] >= 0.08
+                    or (sc["lm_match"] > s0["lm_match"] and sc["lm_mismatch"] < s0["lm_mismatch"] and sc["frac"] - s0["frac"] >= 0.04)
+                    or (sc["vis_total"] >= 4 and sc["vis_match"] == sc["vis_total"] and s0["vis_match"] < s0["vis_total"] and sc["frac"] - s0["frac"] >= 0.05)
+                    or (s0["on_blocked"] and sc["vis_blk"] <= s0["vis_blk"] and sc["frac"] - s0["frac"] >= 0.04)
+                ):
+                    qualifies = True
+                elif (
+                    was_off_grid
+                    and dist == 1
+                    and sc["frac"] - s0["frac"] >= 0.08
+                    and sc["vis_total"] >= 3
+                    and sc["vis_match"] == sc["vis_total"]
+                    and s0["vis_match"] < s0["vis_total"]
+                ):
+                    qualifies = True
+                elif (
+                    dist == 1
+                    and s0["vis_blk"] >= 3
+                    and sc["vis_blk"] == 0
+                    and sc["vis_wlk"] > s0["vis_wlk"]
+                ):
+                    qualifies = True
+            if (
+                not qualifies
+                and use_pre_seg
+                and sc["ov_pre"] >= 20
+                and not sc["pre_on_blocked"]
+                and sc["frac_pre"] >= 0.85
+                and sc["frac_pre"] - s0["frac_pre"] >= 0.15
             ):
                 qualifies = True
-            elif (
-                was_off_grid
-                and dist == 1
-                and sc["frac"] - s0["frac"] >= 0.08
-                and sc["vis_total"] >= 3
-                and sc["vis_match"] == sc["vis_total"]
-                and s0["vis_match"] < s0["vis_total"]
-            ):
-                qualifies = True
-            elif (
-                dist == 1
-                and s0["vis_blk"] >= 3
-                and sc["vis_blk"] == 0
-                and sc["vis_wlk"] > s0["vis_wlk"]
-            ):
-                qualifies = True
+                used_pre = True
             if qualifies:
-                cands.append(((sc["frac"], -sc["vis_blk"], sc["vis_wlk"], sc["m"], -dist), sc["pos"]))
+                eff_frac = sc["frac_pre"] if used_pre else sc["frac"]
+                eff_m = sc["m_pre"] if used_pre else sc["m"]
+                cands.append(((eff_frac, -sc["vis_blk"], sc["vis_wlk"], eff_m, -dist), sc["pos"], used_pre))
         if not cands:
             return None
         cands.sort(reverse=True)
+        best_pos = cands[0][1]
+        if cands[0][2]:
+            for g_cell, c_cell in list(seg.items()):
+                pr = getattr(c_cell, "prior", None)
+                if pr is not None and (self.step - int(pr[4]) > prior_window) and (self.step - c_cell.last_seen <= prior_window):
+                    pk, pt, ph, pfs, pls, ppix = pr
+                    seg[g_cell] = MapCell(pk, pt, ph, pfs, pls, ppix)
         self.stats["within_segment_snaps"] += 1
-        return cands[0][1]
+        return best_pos
 
     def _blacks_out(self, frame: np.ndarray, segment: int, pos: Cell, shift: Cell = (0, 0)) -> bool:
         seg = self.segments[segment]
@@ -1796,6 +1846,20 @@ class GlobalMap(StrategistArtifact):
             ):
                 continue
             if old is None or old.kind in (OCCUPIED, UNKNOWN) or c.last_seen >= old.last_seen:
+                if (
+                    old is not None
+                    and old.kind not in (OCCUPIED, UNKNOWN)
+                    and old.hashes != c.hashes
+                    and getattr(c, "prior", None) is None
+                ):
+                    c.prior = getattr(old, "prior", None) or (
+                        old.kind,
+                        old.tags,
+                        old.hashes,
+                        old.first_seen,
+                        old.last_seen,
+                        old.pixels.copy() if old.pixels is not None else None,
+                    )
                 dst[g] = c
         for (x, y), v in self.visits[source].items():
             self.visits[target][(x + dx, y + dy)] += v
@@ -3116,12 +3180,63 @@ class GlobalMap(StrategistArtifact):
         )
         return single + blocks
 
+    def _is_drifted_same_segment_door(self, segment: int, dp: Cell, dq: Cell) -> bool:
+        if dp == dq or max(abs(dp[0] - dq[0]), abs(dp[1] - dq[1])) > DOOR_SNAP_REACH:
+            return False
+        seg = self.segments[segment] if 0 <= segment < len(self.segments) else {}
+        if not seg:
+            return False
+
+        def _door_cell(c: Optional[MapCell]) -> Optional[MapCell]:
+            if c is None:
+                return None
+            if is_door(c):
+                return c
+            pr = getattr(c, "prior", None)
+            if pr is not None:
+                pk, pt, ph, pfs, pls, ppix = pr
+                mc = MapCell(pk, pt, ph, pfs, pls, ppix)
+                if is_door(mc):
+                    return mc
+            return None
+
+        cp = _door_cell(seg.get(dp))
+        cq = _door_cell(seg.get(dq))
+        if cp is None or cq is None or not _cells_match(cp.hashes, cp.pixels, cq):
+            return False
+        for p_new, p_old in ((dp, dq), (dq, dp)):
+            m = tot = used_prior = 0
+            for ox in range(-4, 5):
+                for oy in range(-3, 4):
+                    c1 = seg.get((p_new[0] + ox, p_new[1] + oy))
+                    c2 = seg.get((p_old[0] + ox, p_old[1] + oy))
+                    if c1 is None or c2 is None:
+                        continue
+                    c2_eff = c2
+                    if (ox, oy) != (0, 0) and getattr(c2, "prior", None) is not None:
+                        pk, pt, ph, pfs, pls, ppix = c2.prior
+                        c2_eff = MapCell(pk, pt, ph, pfs, pls, ppix)
+                        used_prior += 1
+                    u1 = len(set(c1.hashes)) == 1
+                    u2 = len(set(c2_eff.hashes)) == 1
+                    if u1 and u2:
+                        continue
+                    tot += 1
+                    if not u1 and not u2 and _cells_match(c1.hashes, c1.pixels, c2_eff):
+                        m += 1
+            if used_prior >= 3 and tot >= 12 and m >= 0.70 * tot:
+                return True
+        return False
+
     def _same_door(self, segment: int, p: Cell, q: Cell) -> bool:
         if max(abs(p[0] - q[0]), abs(p[1] - q[1])) <= DOOR_REACH:
             return True
         if 0 <= segment < len(self.segments) and self.segments[segment]:
             dp, dq = self._door_at(segment, p), self._door_at(segment, q)
-            return max(abs(dp[0] - dq[0]), abs(dp[1] - dq[1])) <= DOOR_REACH
+            if max(abs(dp[0] - dq[0]), abs(dp[1] - dq[1])) <= DOOR_REACH:
+                return True
+            if max(abs(dp[0] - dq[0]), abs(dp[1] - dq[1])) <= DOOR_SNAP_REACH:
+                return self._is_drifted_same_segment_door(segment, dp, dq)
         return False
 
     @staticmethod

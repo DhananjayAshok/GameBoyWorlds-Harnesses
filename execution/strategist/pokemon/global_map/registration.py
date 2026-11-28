@@ -297,8 +297,7 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
               passed_frames: Optional[Iterable[np.ndarray]] = None) -> Optional[Tuple[int, Cell]]:
     if direction in SCREEN_UNIT:
         ux, uy = SCREEN_UNIT[direction]
-        # far shifts are where repeating textures alias, so look at most one cell past the reported count
-        cap = max_steps if reported is None else min(max_steps, reported + 1)
+        cap = max_steps
         span = range(-PX_SLACK, cap * GRID_SKIP + PX_SLACK + 1)
     else:
         ux, uy, span = 0, 0, range(-PX_SLACK, PX_SLACK + 1)
@@ -337,18 +336,21 @@ def _register(before: np.ndarray, after: np.ndarray, direction: Optional[str], m
         and _is_periodic_open_step(before, after, ux, uy)
         and scrolled_along is not False
     )
-    if periodic_step and reported == 0:
+    runner_up_diff = min((d for k, (d, _) in best_by_k.items() if k != k_best and k >= 0), default=1.0)
+    clear_pixel_winner = not structural and k_best > 0 and (runner_up_diff - diff >= 0.008)
+    if periodic_step and reported == 0 and not clear_pixel_winner:
         k_best = 1
         diff, s = best_by_k[1]
     elif (
-        reported is not None
+        not clear_pixel_winner
+        and reported is not None
         and reported in best_by_k
         and best_by_k[reported][0] <= threshold
-        and (best_by_k[reported][0] <= diff + AMBIGUITY_MARGIN or k_best > 0)
+        and (best_by_k[reported][0] <= diff + 0.005 or (k_best == 0 and best_by_k[reported][0] <= diff + AMBIGUITY_MARGIN))
     ):
         k_best = reported
         diff, s = best_by_k[k_best]
-    else:
+    elif not clear_pixel_winner:
         tied = [k for k, (d, _) in best_by_k.items() if d <= diff + AMBIGUITY_MARGIN and k >= 0]
         if len(tied) > 1:
             if reported is not None and reported in tied:
