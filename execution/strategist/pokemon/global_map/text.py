@@ -146,12 +146,13 @@ def _mapped_paths_from_start(
     )
     blocked_targets = blocked_target_cells(gmap, gmap.segment, eff_moves)
     stat_npcs = gmap.stationary_npc_squares(gmap.segment) if hasattr(gmap, "stationary_npc_squares") else set()
-    best: Dict[Cell, int] = {start: 0}
+    visits = gmap.visits[gmap.segment] if 0 <= gmap.segment < len(getattr(gmap, "visits", ())) else {}
+    best: Dict[Cell, Tuple[int, int]] = {start: (0, 0)}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
-    heap = [(0, start)]
+    heap = [(0, 0, start)]
     while heap:
-        cost, cell = heapq.heappop(heap)
-        if cost > best[cell]:
+        cost, tie_pen, cell = heapq.heappop(heap)
+        if (cost, tie_pen) > best[cell]:
             continue
         cell_blocked_dirs = set(eff_moves.get(cell, ())) if eff_moves else set()
         for direction, (dx, dy) in DIRECTIONS.items():
@@ -184,9 +185,18 @@ def _mapped_paths_from_start(
                 step = STEP_COSTS[c.kind]
             else:
                 continue
-            if cost + step < best.get(nxt, cost + step + 1):
-                best[nxt], previous[nxt] = cost + step, (cell, direction, move)
-                heapq.heappush(heap, (cost + step, nxt))
+            nxt_cell = seg.get(nxt)
+            nxt_tags = getattr(nxt_cell, "tags", ()) if nxt_cell is not None else ()
+            if "tall grass" in nxt_tags:
+                step_pen = 2
+            elif visits.get(nxt, 0) == 0:
+                step_pen = 1
+            else:
+                step_pen = 0
+            cand = (cost + step, tie_pen + step_pen)
+            if cand < best.get(nxt, (cand[0] + 1, cand[1] + 1)):
+                best[nxt], previous[nxt] = cand, (cell, direction, move)
+                heapq.heappush(heap, (cand[0], cand[1], nxt))
     return previous
 
 

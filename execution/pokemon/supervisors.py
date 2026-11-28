@@ -1873,7 +1873,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
         if not self._out_of_calls():
             return None
         if not re.search(
-            r"\b(?:action\s+budget|budget\s*\(\s*\d+\s*/\s*\d+\s*\)|exhausted|out\s+of\s+(?:action\s+)?calls|no\s+actions?\s+remaining)\b",
+            r"\b(?:action\s+budget|budget\s*\(\s*\d+\s*/\s*\d+\s*\)|exhausted|out\s+of\s+(?:action\s+)?calls|no\s+actions?\s+remaining|0\s+action\s+calls?\s+remaining)\b",
             judge_output or "",
             re.IGNORECASE,
         ):
@@ -1895,6 +1895,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     f"exhausting the episode action budget ({self._calls}/{self._max_steps}) without catching the "
                     f"target wild Pokemon does not complete the subgoal"
                 )
+        m_away = re.search(
+            r"\b(\d+)\s+(?:moves?|steps?|tiles?)\s+(?:away\s+from|north\s+of|south\s+of|east\s+of|west\s+of|short\s+of)\s+"
+            r"(?:the\s+)?[^.\n]{0,40}\b(?:door(?:way)?|entrance|center|mart|gym|house|cottage|ladder|stairs|staircase|gatehouse)\b",
+            judge_output or "",
+            re.IGNORECASE,
+        )
+        if m_away and int(m_away.group(1)) >= 2:
+            return (
+                f"exhausting the episode action budget ({self._calls}/{self._max_steps}) while still "
+                f"{m_away.group(0)} does not complete the destination task"
+            )
         return None
 
     def _unfinished_corridor_traversal_note(
@@ -2101,6 +2112,25 @@ class PokemonPlayThroughSupervisor(Supervisor):
             unfinished_note = self._unfinished_open_corridor_target_note(self.plan[-1], local_kinds)
         return unfinished_note
 
+    def _unreached_task_destination_note(
+        self,
+        check_output: str,
+        local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
+    ) -> Optional[str]:
+        final_subgoal = self.plan[-1] if self.plan else ""
+        budget_note = self._budget_exhausted_unfinished_subgoal_note(final_subgoal, check_output, local_kinds)
+        if budget_note is not None:
+            return budget_note
+        m_away = re.search(
+            r"\b(\d+)\s+(?:moves?|steps?|tiles?)\s+(?:away\s+from|north\s+of|south\s+of|east\s+of|west\s+of|short\s+of)\s+"
+            r"(?:the\s+)?[^.\n]{0,40}\b(?:door(?:way)?|entrance|center|mart|gym|house|cottage|ladder|stairs|staircase|gatehouse)\b",
+            check_output or "",
+            re.IGNORECASE,
+        )
+        if m_away and int(m_away.group(1)) >= 2:
+            return f"the player is still {m_away.group(0)} and has not reached the task's destination"
+        return None
+
     def _task_check(self, frame, *, can_continue: bool = True) -> Tuple[bool, str]:
         remaining_calls = max(0, self._max_steps - self._calls)
         local_kinds = self._current_local_kinds()
@@ -2115,12 +2145,15 @@ class PokemonPlayThroughSupervisor(Supervisor):
             continuation_note = (
                 "\nNote: No further continuation replan will occur in this episode. Judge strictly whether the stages "
                 "named in \"Your task\" have already been achieved on screen; do not answer no merely to use remaining "
-                "action calls for extra forward movement."
+                "action calls for extra forward movement, and do not answer yes if a specific destination doorway, building "
+                "entrance, ladder, or staircase named in \"Your task\" has not yet been reached."
             )
         prompt = self._fill_prompt(PLAYTHROUGH_TASK_CHECK_PROMPT).replace("[CONTINUATION_NOTE]", continuation_note)
         output = self._vlm_call("task_check", texts=prompt, images=[frame])
         summary = (parse_key_value(output, "Summary") or "").strip()
         complete = bool(parse_yes_no(output, "Task complete"))
+        if complete and unfinished_note is None:
+            unfinished_note = self._unreached_task_destination_note(f"{output}\n{summary}", local_kinds)
         if complete and unfinished_note:
             complete = False
             summary = f"{summary} ({unfinished_note}.)"
@@ -2756,6 +2789,12 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     MAX_DETERMINISTIC_CORRIDOR_CHAIN = 3
 
+    @staticmethod
+    def _normalize_ascii_text(text: Optional[str]) -> str:
+        import unicodedata
+
+        return unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii").lower()
+
     def _projected_door_route_next_leg(
         self,
         gmap,
@@ -2770,12 +2809,17 @@ class PokemonPlayThroughSupervisor(Supervisor):
         doors = gmap.reachable_door_list(a_seg)
         if not doors:
             return None
-        combined = f"{self._task or ''} {subgoal or ''}".lower()
+        plan_text = " ".join(self.plan) if self.plan else ""
+        raw_context = f"{self._task or ''} {self._guidance or ''} {subgoal or ''} {plan_text}"
+        combined = self._normalize_ascii_text(raw_context)
+        subgoal_and_task = self._normalize_ascii_text(f"{self._task or ''} {subgoal or ''} {plan_text}")
+        mentioned_coords = set(parse_all_cells(raw_context))
         start_seg = gmap.resolve(self._start_place[0], self._start_place[1])[0] if self._start_place is not None else None
         start_pos = gmap.resolve(self._start_place[0], self._start_place[1])[1] if self._start_place is not None else None
         seg_blocked = self._current_segment_blocked_moves()
         walked = walked_squares(gmap, a_seg)
         candidates: List[Tuple[int, int, str]] = []
+        stop_words = {"area", "the", "and", "overworld", "interior", "floor"}
         for door in doors:
             leads_to = door.get("leads_to")
             if leads_to is not None and gmap.resolve(leads_to, (0, 0))[0] == a_seg:
@@ -2786,20 +2830,44 @@ class PokemonPlayThroughSupervisor(Supervisor):
             dx, dy = goal_cell[0] - a_pos[0], goal_cell[1] - a_pos[1]
             if in_bounds((dx, dy)) or abs(dx) + abs(dy) <= 6:
                 continue
-            priority = 2
-            if leads_to is None:
+            rel_start = (
+                (goal_cell[0] - start_pos[0], goal_cell[1] - start_pos[1])
+                if (start_seg == a_seg and start_pos is not None)
+                else None
+            )
+            coord_matched = (
+                (dx, dy) in mentioned_coords
+                or (rel_start is not None and rel_start in mentioned_coords)
+                or goal_cell in mentioned_coords
+            )
+            priority = 4
+            if coord_matched:
                 priority = 0
+            elif leads_to is None:
+                priority = 2
             else:
                 try:
-                    label = (gmap.area_label(leads_to) or "").lower()
-                    words = [w for w in re.findall(r"[a-z0-9]+", label) if len(w) >= 3 and w not in ("area", "the", "and")]
-                    if words and any(w in combined for w in words):
-                        priority = 0
-                    elif any(k in combined for k in ("gatehouse", "door", "entrance", "exit", "route", "town", "city")):
+                    label = self._normalize_ascii_text(gmap.area_label(leads_to))
+                    primary_label = label.split("(")[0].strip()
+                    primary_words = [
+                        w for w in re.findall(r"[a-z0-9]+", primary_label)
+                        if len(w) >= 3 and w not in stop_words
+                    ]
+                    all_words = [
+                        w for w in re.findall(r"[a-z0-9]+", label)
+                        if len(w) >= 3 and w not in stop_words
+                    ]
+                    if primary_words and all(w in subgoal_and_task for w in primary_words):
                         priority = 1
+                    elif primary_words and any(w in subgoal_and_task for w in primary_words):
+                        priority = 2
+                    elif all_words and any(w in combined for w in all_words):
+                        priority = 3
+                    elif any(k in combined for k in ("gatehouse", "door", "entrance", "exit", "route", "town", "city")):
+                        priority = 3
                 except Exception:  # noqa: BLE001
                     pass
-            if priority >= 2:
+            if priority >= 4:
                 continue
             snapped = _snap(gmap, a_seg, goal_cell, walked)
             if snapped is None:
@@ -3004,33 +3072,55 @@ class PokemonPlayThroughSupervisor(Supervisor):
         next_dir: Optional[str] = None
         mapped_next_arg: Optional[str] = None
 
-        for t in targets:
-            n_leg = t.get("next_leg") or ""
-            dist = t.get("path_steps") or t.get("steps") or 0
-            if not n_leg.startswith("MoveOff(") or dist <= 6 or t.get("on_screen"):
-                continue
-            cand_arg = n_leg[len("MoveOff("):-1]
-            cand_dir = parse_edge_direction(cand_arg)
+        wants_frontier_exploration = bool(
+            re.search(r"\b(?:explore|reveal|sweep|unexplored)\b", combined_goal_text, re.IGNORECASE)
+        )
+        effective_subgoal_dirs = list(subgoal_dirs)
+        if (
+            len(effective_subgoal_dirs) > 1
+            and move_dir in open_runs_by_dir
+            and move_dir in effective_subgoal_dirs
+            and effective_subgoal_dirs[-1] == move_dir
+        ):
+            effective_subgoal_dirs = [move_dir]
+
+        door_arg = self._projected_door_route_next_leg(gmap, a_seg, a_pos, after_kinds, subgoal)
+        if door_arg is not None and not wants_frontier_exploration:
+            cand_dir = parse_edge_direction(door_arg)
             if (
                 cand_dir in open_runs_by_dir
                 and cand_dir != opposite_dir
-                and (not subgoal_dirs or cand_dir in subgoal_dirs)
+                and (not effective_subgoal_dirs or cand_dir in effective_subgoal_dirs)
             ):
                 next_dir = cand_dir
-                mapped_next_arg = cand_arg
-                break
+                mapped_next_arg = door_arg
 
         if mapped_next_arg is None:
-            door_arg = self._projected_door_route_next_leg(gmap, a_seg, a_pos, after_kinds, subgoal)
-            if door_arg is not None:
-                cand_dir = parse_edge_direction(door_arg)
+            for t in targets:
+                n_leg = t.get("next_leg") or ""
+                dist = t.get("path_steps") or t.get("steps") or 0
+                if not n_leg.startswith("MoveOff(") or dist <= 6 or t.get("on_screen"):
+                    continue
+                cand_arg = n_leg[len("MoveOff("):-1]
+                cand_dir = parse_edge_direction(cand_arg)
                 if (
                     cand_dir in open_runs_by_dir
                     and cand_dir != opposite_dir
-                    and (not subgoal_dirs or cand_dir in subgoal_dirs)
+                    and (not effective_subgoal_dirs or cand_dir in effective_subgoal_dirs)
                 ):
                     next_dir = cand_dir
-                    mapped_next_arg = door_arg
+                    mapped_next_arg = cand_arg
+                    break
+
+        if mapped_next_arg is None and door_arg is not None:
+            cand_dir = parse_edge_direction(door_arg)
+            if (
+                cand_dir in open_runs_by_dir
+                and cand_dir != opposite_dir
+                and (not effective_subgoal_dirs or cand_dir in effective_subgoal_dirs)
+            ):
+                next_dir = cand_dir
+                mapped_next_arg = door_arg
 
         if mapped_next_arg is None and move_dir in open_runs_by_dir:
             open_runs = open_runs_by_dir[move_dir]
