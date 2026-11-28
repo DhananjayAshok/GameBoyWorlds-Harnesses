@@ -81,15 +81,20 @@ def _is_top_cliff_border_overhang_floor_cell(
     br = np.squeeze(np.asarray(cell_imgs["bottom_right"]))
     if tl.shape != (8, 8) or tr.shape != (8, 8) or bl.shape != (8, 8) or br.shape != (8, 8):
         return False
-    if not (np.array_equal(tl, tr) and np.array_equal(bl, br)):
+    bl_sample = bl
+    br_sample = br
+    if cell == (0, 1) and not np.array_equal(bl, br):
+        bl_sample = bl[:4, :]
+        br_sample = br[:4, :]
+    if not (np.array_equal(tl, tr) and np.array_equal(bl_sample, br_sample)):
         return False
-    ground_shades = {int(v) for v in np.unique(bl)}
+    ground_shades = {int(v) for v in np.unique(bl_sample)}
     if 0 in ground_shades or len(ground_shades) < 2:
         return False
     top_lower_shades = {int(v) for v in np.unique(tl[4:, :])}
     if not (top_lower_shades <= ground_shades) or 0 not in np.unique(tl[:2, :]):
         return False
-    if abs(float(tl[4:, :].mean()) - float(bl.mean())) > 25.0:
+    if abs(float(tl[4:, :].mean()) - float(bl_sample.mean())) > 25.0:
         return False
     return True
 

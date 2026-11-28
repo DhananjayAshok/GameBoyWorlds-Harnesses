@@ -29,6 +29,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_party_menu_selection_screen, is_same_battle_frame,
                                                  is_start_menu_screen, is_tm_hm_item_name,
                                                  is_tm_hm_pack_pocket, is_tm_hm_startup_dialogue_frame,
+                                                 healing_item_restore_amount,
                                                  is_healing_item_name, is_item_use_subbox_screen,
                                                  is_party_boost_item_name, is_party_consumable_item_name,
                                                  is_status_heal_item_for_status,
@@ -2354,7 +2355,7 @@ Choose what to do next:
 - fight: attack, and say which of the four moves to use (1 is the top one; use your strongest non-resisted damaging move with PP left rather than non-damaging accuracy/stat moves against lower-level opponents you can defeat directly, and prefer STAB damaging moves over low-power non-STAB utility HMs like CUT when neither is resisted; if the opponent is using an escalating multi-turn attack like ROLLOUT or FURY CUTTER that doubles in power each consecutive hit and you cannot knock it out in one hit, use an accuracy-lowering move like SMOKESCREEN, SAND-ATTACK, or FLASH immediately if available and not yet applied; if a move was already shown to be "not very effective" or had no effect against the current opponent and another damaging move with PP left is available that is not resisted, switch to that non-resisted damaging move rather than repeating the resisted move, even if a general battle tip prefers the resisted move)
 - progress: press through battle text, or continue when there is no choice to make
 - run: try to escape. This never works against another trainer
-- bag: open the bag to use an item; choose this in a trainer battle whenever your active Pokemon's HP is at or below 50% of max HP (do not gamble on knocking out a healthy opponent first when your HP is at or below 50%), unless the opponent's HP bar is already at critical red (nearly empty) and you can finish it off immediately on this turn with a damaging move, or a note below says the bag has no usable item
+- bag: open the bag to use an item; choose this in a trainer battle whenever your active Pokemon's HP is at or below 50% of max HP (do not gamble on knocking out a healthy opponent first when your HP is at or below 50%), unless the opponent's HP bar is already at critical red (nearly empty) and you can finish it off immediately on this turn with a damaging move, or the opponent's attack deals as much or more damage per turn than your healing item restores (or leaves you in 1-hit KO range, making bag healing futile/net-negative), or a note below says the bag has no usable item or says not to heal from the bag
 - pokemon: open your team to switch; only choose it if switching is needed
 
 Respond in exactly this format:
@@ -2473,6 +2474,11 @@ Press: <one of up, down, left, right, confirm, back>
         self._immune_moves_for_opponent: Dict[int, str] = {}
         self._opponent_escalating_move: Optional[str] = None
         self._opponent_accuracy_lowered: int = 0
+        self._last_opponent_damage: Optional[int] = None
+        self._max_opponent_damage: int = 0
+        self._last_heal_amount: Optional[int] = None
+        self._last_turn_was_net_negative_heal: bool = False
+        self._turn_start_hp: Optional[Tuple[int, int]] = None
         self._seen_bag_items: List[str] = list(party_state.items) if party_state is not None else []
         self._bag_item_quantities: Dict[str, Optional[int]] = (
             dict(party_state.quantities) if party_state is not None else {}
@@ -2777,14 +2783,20 @@ Press: <one of up, down, left, right, confirm, back>
         "WHIRLPOOL",
     )
 
+    def _reset_opponent_combat_stats(self) -> None:
+        self._resisted_moves_for_opponent.clear()
+        self._immune_moves_for_opponent.clear()
+        self._opponent_escalating_move = None
+        self._opponent_accuracy_lowered = 0
+        self._last_opponent_damage = None
+        self._max_opponent_damage = 0
+        self._last_turn_was_net_negative_heal = False
+
     def _update_opponent_tracking(self, frame: Optional[np.ndarray] = None, texts: Optional[List[str]] = None) -> None:
         if texts:
             joined = "\n".join(texts)
             if re.search(r"\b(?:sent\s+out|fainted!|about\s+to\s+use)\b", joined, re.IGNORECASE):
-                self._resisted_moves_for_opponent.clear()
-                self._immune_moves_for_opponent.clear()
-                self._opponent_escalating_move = None
-                self._opponent_accuracy_lowered = 0
+                self._reset_opponent_combat_stats()
             m_esc = re.search(
                 r"\b(?:Enemy|Wild|Foe)\s+[A-Z0-9♀♂.'-]+\s+used\s+(ROLLOUT|FURY\s+CUTTER|RAGE|BIDE)!",
                 joined,
@@ -2805,11 +2817,124 @@ Press: <one of up, down, left, right, confirm, back>
             opp = read_battle_opponent_hud_name(frame)
             if opp:
                 if self._current_opponent_name and opp != self._current_opponent_name:
-                    self._resisted_moves_for_opponent.clear()
-                    self._immune_moves_for_opponent.clear()
-                    self._opponent_escalating_move = None
-                    self._opponent_accuracy_lowered = 0
+                    self._reset_opponent_combat_stats()
                 self._current_opponent_name = opp
+
+    def _best_available_heal_amount(self, max_hp: int) -> Optional[int]:
+        amounts = [
+            amt
+            for it in self._seen_bag_items
+            if is_healing_item_name(it)
+            for amt in (healing_item_restore_amount(it, max_hp),)
+            if amt is not None
+        ]
+        if amounts:
+            return max(amounts)
+        if self._last_heal_amount is not None:
+            return self._last_heal_amount
+        task_text = (self._task or "").upper()
+        task_amounts = [
+            amt
+            for it in (
+                "FULL RESTORE",
+                "MAX POTION",
+                "HYPER POTION",
+                "MOOMOO MILK",
+                "LEMONADE",
+                "SODA POP",
+                "SUPER POTION",
+                "FRESH WATER",
+                "GOLD BERRY",
+                "POTION",
+                "BERRY",
+            )
+            if it in task_text
+            for amt in (healing_item_restore_amount(it, max_hp),)
+            if amt is not None
+        ]
+        if task_amounts:
+            return max(task_amounts)
+        return None
+
+    def _get_bag_healing_futility(self, cur_hp: int, max_hp: int) -> Optional[Tuple[int, int, int]]:
+        if max_hp <= 0 or cur_hp >= max_hp:
+            return None
+        obs_dmg = self._last_opponent_damage if self._last_opponent_damage is not None else self._max_opponent_damage
+        if not obs_dmg or obs_dmg <= 0:
+            return None
+        best_heal = self._best_available_heal_amount(max_hp)
+        if best_heal is None:
+            if self._last_turn_was_net_negative_heal:
+                best_heal = self._last_heal_amount or 20
+            else:
+                return None
+        healed_hp = min(max_hp, cur_hp + best_heal)
+        actual_gain = max(0, healed_hp - cur_hp)
+        if (
+            self._last_turn_was_net_negative_heal
+            or actual_gain <= obs_dmg
+            or healed_hp <= obs_dmg
+        ):
+            return (obs_dmg, best_heal, healed_hp)
+        return None
+
+    def _record_turn_hp_transition(
+        self,
+        pre_turn_hp: Optional[Tuple[int, int]],
+        turn_records: List[EnvironmentStepRecord],
+        texts: List[str],
+        *,
+        used_heal_item: Optional[str] = None,
+    ) -> None:
+        joined = "\n".join(texts or ())
+        if re.search(r"\b(?:sent\s+out|fainted!|about\s+to\s+use)\b", joined, re.IGNORECASE):
+            return
+        raw_pairs: List[Tuple[int, int]] = []
+        if pre_turn_hp is not None:
+            raw_pairs.append(pre_turn_hp)
+        for rec in turn_records or ():
+            for fr in (rec.frame_before, rec.frame_after):
+                hp = read_battle_hud_hp(fr) or read_party_menu_hp(fr)
+                if hp is not None:
+                    raw_pairs.append(hp)
+        cur_after = read_battle_hud_hp(self._current_frame()) or read_party_menu_hp(self._current_frame())
+        if cur_after is not None:
+            raw_pairs.append(cur_after)
+        if len(raw_pairs) < 2:
+            return
+        target_max = pre_turn_hp[1] if pre_turn_hp is not None else raw_pairs[-1][1]
+        if target_max <= 0:
+            return
+        hps = [hp[0] for hp in raw_pairs if hp[1] == target_max]
+        if len(hps) < 2:
+            return
+        start_hp = hps[0]
+        end_hp = hps[-1]
+        peak_hp = max(hps)
+        m_rec = re.search(r"\b(?:recovered\s+by|restored|recovered)\s+(\d{1,3})\b", joined, re.IGNORECASE)
+        text_amt = int(m_rec.group(1)) if m_rec else None
+        item_amt = (
+            healing_item_restore_amount(used_heal_item, target_max)
+            if used_heal_item and is_healing_item_name(used_heal_item)
+            else None
+        )
+        healed_on_turn = (peak_hp > start_hp) or (text_amt is not None) or (item_amt is not None)
+        if healed_on_turn:
+            eff_peak = max(peak_hp, min(target_max, start_hp + (text_amt or item_amt or 0)))
+            obs_heal = max(eff_peak - start_hp, text_amt or 0, item_amt or 0)
+            if obs_heal > 0:
+                self._last_heal_amount = obs_heal
+            if end_hp < eff_peak:
+                dmg = eff_peak - end_hp
+                self._last_opponent_damage = dmg
+                self._max_opponent_damage = max(self._max_opponent_damage, dmg)
+            self._last_turn_was_net_negative_heal = end_hp <= start_hp
+        else:
+            self._last_turn_was_net_negative_heal = False
+            if end_hp < start_hp:
+                dmg = start_hp - end_hp
+                self._last_opponent_damage = dmg
+                self._max_opponent_damage = max(self._max_opponent_damage, dmg)
 
     def _record_move_effectiveness(self, move_slot: Optional[int], texts: List[str]) -> str:
         if move_slot is None or not texts:
@@ -3280,17 +3405,26 @@ Press: <one of up, down, left, right, confirm, back>
             or self._last_seen_player_hp()
         )
         live_status = self._last_seen_player_status(cur_frame)
+        futility_info: Optional[Tuple[int, int, int]] = None
         if live_hp is not None:
             cur_hp, max_hp = live_hp
             deficit = max(0, max_hp - cur_hp)
             pct = int(round(100.0 * cur_hp / max_hp)) if max_hp > 0 else 100
             status_suffix = f", status: {live_status}" if live_status else ""
             opp_critical = is_battle_opponent_critical_hp(cur_frame)
+            futility_info = self._get_bag_healing_futility(cur_hp, max_hp)
             low_hp_note = ""
             if opp_critical:
                 low_hp_note = (
                     " — Opponent HP is CRITICAL (nearly empty HP bar): if you have a damaging move with PP left "
                     "that can knock out the opponent this turn, choose fight to finish off the opponent immediately before healing"
+                )
+            elif futility_info is not None:
+                obs_dmg, best_heal, healed_hp = futility_info
+                low_hp_note = (
+                    f" — DO NOT HEAL FROM BAG: opponent's attack deals ~{obs_dmg} HP per hit while your best bag healing item "
+                    f"restores at most {best_heal} HP (to {healed_hp}/{max_hp} HP, net-negative and within 1-hit KO range); "
+                    f"choose fight to attack with your strongest non-resisted damaging move"
                 )
             elif max_hp > 0 and cur_hp * 2 <= max_hp and not self._bag_unavailable:
                 low_hp_note = (
@@ -3401,6 +3535,13 @@ Press: <one of up, down, left, right, confirm, back>
             lines.append(
                 "Note: You already checked the bag in this battle and had no usable item — "
                 "do NOT choose bag again; choose fight instead."
+            )
+        elif futility_info is not None and live_hp is not None:
+            obs_dmg, best_heal, healed_hp = futility_info
+            lines.append(
+                f"Note: Bag healing is futile against the current opponent (incoming damage is ~{obs_dmg} HP/turn "
+                f"vs at most +{best_heal} HP healed to {healed_hp}/{live_hp[1]} HP) — do NOT choose bag; "
+                f"choose fight to attack immediately."
             )
         if not lines:
             return ""
@@ -3582,12 +3723,13 @@ Press: <one of up, down, left, right, confirm, back>
         return self.extract_player_status_from_text("\n".join(self.dialogue_text))
 
     def _reconcile_move_with_reasoning(self, move: Optional[int], output: str) -> Optional[int]:
-        if move is None or not self._move_names or move not in self._move_names:
+        if not self._move_names:
             return move
         up_out = (output or "").upper()
-        chosen_name = self._move_names[move].upper().strip()
-        if chosen_name and (chosen_name in up_out or chosen_name[:6] in up_out):
-            return move
+        if move is not None and move in self._move_names:
+            chosen_name = self._move_names[move].upper().strip()
+            if chosen_name and (chosen_name in up_out or chosen_name[:6] in up_out):
+                return move
         matched_slots: List[Tuple[int, int]] = []
         for slot, m_name in self._move_names.items():
             if slot == move or slot in self._zero_pp_slots:
@@ -3605,14 +3747,15 @@ Press: <one of up, down, left, right, confirm, back>
             return matched_slots[-1][1]
         return move
 
-    def _choose_move(self, output: str) -> Optional[int]:
+    def _choose_move(self, output: str, *, prompt_if_missing: bool = False) -> Optional[int]:
         self._scan_move_menu_frame(self._current_frame())
         move = self._reconcile_move_with_reasoning(parse_int(output, "Move", lo=1, hi=4), output)
-        for _ in range(self.MOVE_ATTEMPTS):
+        for attempt_idx in range(self.MOVE_ATTEMPTS):
             if move is not None and move not in self._zero_pp_slots:
                 return move
-            reason = "move has 0 PP left" if (move is not None and move in self._zero_pp_slots) else "no move number"
-            self._record_invalid(output, reason=reason)
+            if not (prompt_if_missing and attempt_idx == 0 and move is None):
+                reason = "move has 0 PP left" if (move is not None and move in self._zero_pp_slots) else "no move number"
+                self._record_invalid(output, reason=reason)
             frame = self._current_frame()
             self._scan_move_menu_frame(frame)
             prompt = (self.MOVE_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
@@ -3620,7 +3763,7 @@ Press: <one of up, down, left, right, confirm, back>
                       .replace("[PREVIOUS]", output[:self.MAX_PREVIOUS_CHARS]))
             output = self._vlm_call(self.MOVE_TAG, texts=prompt, images=[frame],
                                     max_new_tokens=self.MAX_NEW_TOKENS)
-            move = parse_int(output, "Move", lo=1, hi=4)
+            move = self._reconcile_move_with_reasoning(parse_int(output, "Move", lo=1, hi=4), output)
         if move is not None and move in self._zero_pp_slots:
             for candidate in (1, 2, 3, 4):
                 if candidate not in self._zero_pp_slots and (
@@ -4056,16 +4199,32 @@ Press: <one of up, down, left, right, confirm, back>
                                 entry += " (closed the bag without using an item; do not choose bag again)"
                         elif presses > 0 or auto_item_steps:
                             self._consume_selected_bag_item(self._selected_bag_item)
+                        used_menu_bag_item = self._selected_bag_item if (presses > 0 or auto_item_steps) else None
                         self._selected_bag_item = None
+                    else:
+                        used_menu_bag_item = None
                     if self._in_pokemon_menu and (
                         self._agent_state() != AgentState.IN_MENU
                         or is_battle_command_menu(self._current_frame())
                     ):
                         self._in_pokemon_menu = False
+                else:
+                    used_menu_bag_item = None
                 entry += self._format_auto_suffix(presses, dismisses)
                 texts = self._read_new_text(turn_records, new_turn=True)
                 if texts:
+                    self._update_opponent_tracking(frame=self._current_frame(), texts=texts)
                     entry += "\n  text on screen: " + " / ".join(texts)
+                else:
+                    self._update_opponent_tracking(frame=self._current_frame())
+                if not self._in_bag_menu and (presses > 0 or auto_item_steps):
+                    self._record_turn_hp_transition(
+                        self._turn_start_hp,
+                        turn_records,
+                        texts,
+                        used_heal_item=used_menu_bag_item,
+                    )
+                    self._turn_start_hp = None
                 self.history.append(entry)
                 if self._exited_to_free_roam:
                     return self._record_outcome(AgentState.FREE_ROAM)
@@ -4092,6 +4251,11 @@ Press: <one of up, down, left, right, confirm, back>
                     )
                     frame = self._current_frame()
             self._scan_move_menu_frame(frame)
+            pre_turn_hp = (
+                read_battle_hud_hp(frame)
+                or read_party_menu_hp(frame)
+                or self._last_seen_player_hp()
+            )
             move_menu_open = is_move_selection_screen(frame)
             prompt = (self.STEP_PROMPT.replace("[INSTRUCTIONS]", self._instructions_block())
                       .replace("[HISTORY]", self._history_block()))
@@ -4106,13 +4270,33 @@ Press: <one of up, down, left, right, confirm, back>
                     return self._fail(BATTLE_UNREADABLE, "action_unreadable", output)
                 continue
             consecutive_invalid = 0
+            overrode_futile_bag = False
+            if option == "bag" and pre_turn_hp is not None:
+                futility = self._get_bag_healing_futility(pre_turn_hp[0], pre_turn_hp[1])
+                if futility is not None:
+                    live_status = self._last_seen_player_status(frame)
+                    wants_ball = bool(
+                        re.search(
+                            r"\b(?:catch|capture|poke\s*ball|poké\s*ball|great\s*ball|ultra\s*ball)\b",
+                            self._task or "",
+                            re.IGNORECASE,
+                        )
+                    )
+                    has_status_cure = bool(
+                        live_status
+                        and any(is_status_heal_item_for_status(it, live_status) for it in self._seen_bag_items)
+                    )
+                    if not wants_ball and not has_status_cure:
+                        option = "fight"
+                        overrode_futile_bag = True
 
             turn_records = []
             presses, dismisses = 0, 0
             used_move_slot: Optional[int] = None
+            used_heal_item: Optional[str] = None
             if move_menu_open and option == "fight":
                 entry = f"- step {step + 1}: chose fight"
-                move = self._choose_move(output)
+                move = self._choose_move(output, prompt_if_missing=overrode_futile_bag)
                 if move is None:
                     entry += ", but no move number was given"
                 else:
@@ -4213,6 +4397,7 @@ Press: <one of up, down, left, right, confirm, back>
                         entry += " (the bag is empty — only CANCEL — so closed it; do not choose bag again)"
                     elif self._agent_state() == AgentState.IN_MENU:
                         self._in_bag_menu = True
+                        self._turn_start_hp = pre_turn_hp
                         self._bag_scrolled_in_opening = False
                         self._scan_bag_menu_frame(self._current_frame())
                         bag_note, b_presses, b_dismisses = self._auto_navigate_in_battle_bag(turn_records)
@@ -4222,6 +4407,9 @@ Press: <one of up, down, left, right, confirm, back>
                             return self._fail(BATTLE_TRUNCATED, "truncated")
                         if bag_note:
                             entry += bag_note
+                            m_sel = re.search(r"\(selected\s+([A-Z0-9 .'-]+?)(?:,|\))", bag_note)
+                            if m_sel:
+                                used_heal_item = m_sel.group(1).strip()
                         presses += b_presses
                         dismisses += b_dismisses
 
@@ -4231,7 +4419,7 @@ Press: <one of up, down, left, right, confirm, back>
                     attack = None
                     move = None
                     if record.action_success == 0:
-                        move = self._choose_move(output)
+                        move = self._choose_move(output, prompt_if_missing=overrode_futile_bag)
                         if move is None:
                             entry += ", but no move number was given"
                         else:
@@ -4312,6 +4500,14 @@ Press: <one of up, down, left, right, confirm, back>
                 entry += "\n  text on screen: " + " / ".join(texts)
             else:
                 self._update_opponent_tracking(frame=self._current_frame())
+            if not self._in_bag_menu and not self._in_pokemon_menu:
+                self._record_turn_hp_transition(
+                    pre_turn_hp,
+                    turn_records,
+                    texts,
+                    used_heal_item=used_heal_item,
+                )
+                self._turn_start_hp = None
             self.history.append(entry)
             if self._exited_to_free_roam:
                 return self._record_outcome(AgentState.FREE_ROAM)

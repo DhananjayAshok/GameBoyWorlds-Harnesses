@@ -1028,6 +1028,12 @@ def is_battle_screen(frame: np.ndarray) -> bool:
         return False
     if is_overworld_menu_or_ui_screen(img):
         return False
+    if (
+        is_battle_command_menu(img)
+        or is_move_selection_screen(img)
+        or _read_tile_hp_fraction(img, ty=10, slash_tx=14) is not None
+    ):
+        return True
     upper = img[:BATTLE_UPPER_BOTTOM, :]
     if float((upper >= DIALOGUE_BOX_WHITE).mean()) < BATTLE_MIN_UPPER_WHITE_FRACTION:
         return False
@@ -1870,6 +1876,19 @@ def is_healing_item_name(name: str) -> bool:
     if any(b in up for b in ("PSNCURE", "PRZCURE", "MINT BERRY", "BURNT BERRY", "ICE BERRY", "MIRACLEBERRY")):
         return False
     return any(up == target or target in up for target in HEALING_ITEM_NAMES)
+
+
+def healing_item_restore_amount(name: str, max_hp: int = 999) -> Optional[int]:
+    """Return the HP restored by an HP-healing item name, or None if not an HP-restoring item."""
+    if not is_healing_item_name(name):
+        return None
+    up = re.sub(r"\s*\(X\d+\)\s*$", "", (name or "").strip().upper())
+    if "FULL RESTORE" in up or "MAX POTION" in up:
+        return max(1, int(max_hp))
+    for amount in sorted(HP_RESTORE_AMOUNT_ITEMS, reverse=True):
+        if any(up == target or target in up for target in HP_RESTORE_AMOUNT_ITEMS[amount]):
+            return amount
+    return 20
 
 
 def is_status_heal_item_name(name: str) -> bool:
