@@ -576,13 +576,24 @@ def find_modal_preview_boxes(frame: np.ndarray):
         for bot_ty in range(top_ty + MODAL_MIN_SPAN_TILES, 16):
             for left_tx in range(1, 12):
                 for right_tx in range(left_tx + MODAL_MIN_SPAN_TILES, 19):
-                    if not all(h_border[top_ty][tx] and h_border[bot_ty][tx]
-                               for tx in range(left_tx + 1, right_tx)):
+                    if not all(
+                        h_border[top_ty][tx]
+                        and h_border[bot_ty][tx]
+                        and not v_border[top_ty][tx]
+                        and not v_border[bot_ty][tx]
+                        for tx in range(left_tx + 1, right_tx)
+                    ):
                         continue
-                    if not all(v_border[ty][left_tx] for ty in range(top_ty + 1, bot_ty)):
+                    if not all(
+                        v_border[ty][left_tx] and not h_border[ty][left_tx]
+                        for ty in range(top_ty + 1, bot_ty)
+                    ):
                         continue
                     r_end = min(bot_ty, 12) if right_tx >= 13 else bot_ty
-                    if not all(v_border[ty][right_tx] for ty in range(top_ty + 1, r_end)):
+                    if not all(
+                        v_border[ty][right_tx] and not h_border[ty][right_tx]
+                        for ty in range(top_ty + 1, r_end)
+                    ):
                         continue
                     y0, y1 = (top_ty + 1) * TILE_SIZE, bot_ty * TILE_SIZE
                     x0, x1 = (left_tx + 1) * TILE_SIZE, right_tx * TILE_SIZE
@@ -1446,6 +1457,44 @@ def read_battle_opponent_hud_name(frame: np.ndarray) -> Optional[str]:
         if len(name) >= 2 and name not in ("LEVEL", "HP"):
             return name
     return None
+
+
+def is_battle_opponent_critical_hp(frame: np.ndarray) -> bool:
+    """Return True when the opponent's battle HUD HP bar is visible and in critical low HP (<= ~20% fill)."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < 24 or img.shape[1] < 84:
+        return False
+    if read_battle_opponent_hud_name(img) is None:
+        return False
+    gen1_frame = bool((img[18, 32:80] < DARK_INK).mean() >= 0.85 and (img[21, 32:80] < DARK_INK).mean() >= 0.85)
+    gen2_frame = bool((img[22, 32:80] < DARK_INK).mean() >= 0.85 and (img[19:21, 27:32] < DARK_INK).mean() >= 0.85)
+    if not (gen1_frame or gen2_frame):
+        return False
+    bar = img[19:21, 32:80]
+    filled_px = int(((bar < LIGHT_BACKGROUND).all(axis=0)).sum())
+    if gen1_frame:
+        return 1 <= filled_px <= 10
+    if not (is_battle_decision_screen(img) or filled_px > 0):
+        return False
+    return filled_px <= 10
+
+
+def is_unrevealed_battle_intro_frame(frame: Optional[np.ndarray]) -> bool:
+    """Return True during the initial IN_BATTLE sprite slide-in before the two-line intro text or HUD renders."""
+    if frame is None or not hasattr(frame, "shape") or frame.ndim < 2:
+        return False
+    if has_menu_cursor(frame) or read_battle_opponent_hud_name(frame) or read_battle_hud_hp(frame):
+        return False
+    if not has_bottom_dialogue_box(frame):
+        return True
+    grey = frame[:, :, 0] if frame.ndim == 3 else frame
+    if grey.shape[0] < 136 or grey.shape[1] < 104:
+        return False
+    line1_ink = int((grey[104:120, 8:104] < 128).sum())
+    line2_ink = int((grey[120:136, 8:104] < 128).sum())
+    return line1_ink <= 16 or line2_ink <= 16
 
 
 def is_no_pp_dialogue_frame(frame: np.ndarray) -> bool:

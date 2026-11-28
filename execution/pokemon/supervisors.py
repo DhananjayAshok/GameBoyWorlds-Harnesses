@@ -14,6 +14,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  is_overworld_menu_or_ui_screen,
                                                  is_overworld_pack_menu, is_pack_screen,
                                                  is_party_menu_screen, is_status_heal_item_name,
+                                                 is_unrevealed_battle_intro_frame,
                                                  read_battle_hud_hp, read_move_learning_dialogue_status,
                                                  read_tile_text)
 from execution.perception.pokemon.navigation import (DIRECTIONS, LEDGE, LEDGE_LEFT, WALKABLE, X_RANGE, Y_RANGE,
@@ -31,7 +32,8 @@ from execution.pokemon.executors import (CombatExecutor, DialogueExecutor, FreeE
                                          MENU_LEFT_TO_BATTLE, MENU_LEFT_TO_DIALOGUE, MENU_OK,
                                          MOVE_OK, MOVE_TARGET_AMBIGUOUS,
                                          OffScreenMoveExecutor, OnScreenMoveExecutor,
-                                         effective_agent_state, settle_overworld_free_roam,
+                                         drop_prefix_crops, effective_agent_state,
+                                         extract_bottom_dialogue_crop, settle_overworld_free_roam,
                                          settle_overworld_menu_state)
 from execution.pokemon.prompts import (PLAYTHROUGH_ACHIEVABLE_PROMPT, PLAYTHROUGH_AFTER_BLOCK,
                                        PLAYTHROUGH_AREA_MAP_BLOCK, PLAYTHROUGH_ATTEMPTS_BLOCK,
@@ -2024,7 +2026,33 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _tips_text(self) -> str:
         return "\n".join(f"- {tip}" for tip in self._battle_tips)
 
+    MAX_BATTLE_INTRO_SETTLE_TICKS = 10
+
+    def _settle_battle_intro_frame(
+        self,
+        frame,
+        pending_crops: Optional[List[Any]] = None,
+    ) -> Tuple[Any, Optional[List[Any]]]:
+        crops = list(pending_crops) if pending_crops else []
+        for _ in range(self.MAX_BATTLE_INTRO_SETTLE_TICKS):
+            if (
+                self._env_done()
+                or self._agent_state() != AgentState.IN_BATTLE
+                or not is_unrevealed_battle_intro_frame(frame)
+            ):
+                break
+            _, frame = self._step_wait_action()
+            crop = extract_bottom_dialogue_crop(frame)
+            if crop is not None:
+                drop_prefix_crops([crop], crops)
+        crop = extract_bottom_dialogue_crop(frame)
+        if crop is not None:
+            drop_prefix_crops([crop], crops)
+        return frame, (crops if crops else pending_crops)
+
     def _battle_instructions(self, frame) -> str:
+        if self._agent_state() == AgentState.IN_BATTLE and is_unrevealed_battle_intro_frame(frame):
+            frame, _ = self._settle_battle_intro_frame(frame)
         self._scan_frame_for_party_move_status(frame)
         tips = PLAYTHROUGH_BATTLE_TIPS_BLOCK.replace("[TIPS]", self._tips_text()) if self._battle_tips else ""
         hp_line = self._party_hp_block()
@@ -2361,6 +2389,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         else str(handled["dialogue"])
                     )
             elif state == AgentState.IN_BATTLE:
+                if is_unrevealed_battle_intro_frame(frame):
+                    frame, pending_crops = self._settle_battle_intro_frame(frame, pending_crops)
                 is_wild_flee = (
                     (
                         self._is_wild_encounter_dialogue(pre_battle_dialogue)

@@ -118,6 +118,8 @@ class PartyInventoryState(StrategistArtifact):
             self.record_learned_move(m)
         for raw_m, raw_p in (learned_move_holders or {}).items():
             self.record_learned_move(raw_m, raw_p)
+        self.active_move_names: Dict[int, str] = {}
+        self.active_move_types: Dict[int, str] = {}
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -125,6 +127,10 @@ class PartyInventoryState(StrategistArtifact):
             self.learned_moves = []
         if not hasattr(self, "learned_move_holders") or self.learned_move_holders is None:
             self.learned_move_holders = {}
+        if not hasattr(self, "active_move_names") or self.active_move_names is None:
+            self.active_move_names = {}
+        if not hasattr(self, "active_move_types") or self.active_move_types is None:
+            self.active_move_types = {}
 
     @staticmethod
     def normalize_move_name(move_name: Optional[str]) -> str:

@@ -14,6 +14,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  has_top_dialogue_box,
                                                  is_battle_command_menu, is_battle_decision_screen,
                                                  is_battle_defeat_text, is_battle_menu_crop,
+                                                 is_battle_opponent_critical_hp,
                                                  is_battle_screen, is_blank_or_fade_frame,
                                                  is_cutscene_frame_changing,
                                                  is_screen_wide_cutscene_change,
@@ -192,7 +193,7 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
 
 
 INTERACT_SETTLE_WAIT = 2
-INTERACT_POST_DIALOGUE_SETTLE_WAIT = 4
+INTERACT_POST_DIALOGUE_SETTLE_WAIT = 5
 INTERACT_MAX_CUTSCENE_WAIT = 30
 INTERACT_POST_MOTION_WAIT = 5
 INTERACT_POST_WARP_BANNER_WAIT = 6
@@ -333,6 +334,13 @@ def settle_overworld_free_roam(
         before_frame, after_frame = step_wait_fn()
         waited += 1
         state = get_state_fn()
+        if state == AgentState.IN_MENU and is_false_overworld_menu_state(after_frame):
+            state = AgentState.FREE_ROAM
+        if state == AgentState.IN_MENU and settle_menu_fn is not None and not is_done_fn():
+            state = settle_menu_fn()
+            after_frame = get_frame_fn()
+            if state == AgentState.IN_MENU and is_false_overworld_menu_state(after_frame):
+                state = AgentState.FREE_ROAM
         if state != AgentState.FREE_ROAM or is_done_fn():
             break
         if stop_on_overlay and (_is_overlay(after_frame) or is_battle_screen(after_frame)):
@@ -379,7 +387,7 @@ def settle_overworld_free_roam(
         if end_step is not None:
             try:
                 if record_dialogue_settled:
-                    if waited > settle_wait:
+                    if waited >= max(5, settle_wait):
                         env._last_settled_step = end_step
                     elif waited >= settle_wait:
                         env._last_dialogue_settled_step = end_step
@@ -2341,10 +2349,10 @@ class CombatExecutor(PolicyExecutor):
 The image is the current battle screen.
 [HISTORY]
 Choose what to do next:
-- fight: attack, and say which of the four moves to use (1 is the top one; if a move was already shown to be "not very effective" or had no effect against the current opponent and another damaging move with PP left is available that is not resisted, switch to that non-resisted damaging move rather than repeating the resisted move, even if a general battle tip prefers the resisted move)
+- fight: attack, and say which of the four moves to use (1 is the top one; use your strongest non-resisted damaging move with PP left rather than non-damaging accuracy/stat moves against lower-level opponents you can defeat directly; if a move was already shown to be "not very effective" or had no effect against the current opponent and another damaging move with PP left is available that is not resisted, switch to that non-resisted damaging move rather than repeating the resisted move, even if a general battle tip prefers the resisted move)
 - progress: press through battle text, or continue when there is no choice to make
 - run: try to escape. This never works against another trainer
-- bag: open the bag to use an item; choose this in a trainer battle whenever your active Pokemon's HP is at or below 50% of max HP (do not gamble on knocking out the opponent first when your HP is at or below 50%), unless a note below says the bag has no usable item
+- bag: open the bag to use an item; choose this in a trainer battle whenever your active Pokemon's HP is at or below 50% of max HP (do not gamble on knocking out a healthy opponent first when your HP is at or below 50%), unless the opponent's HP bar is already at critical red (nearly empty) and you can finish it off immediately on this turn with a damaging move, or a note below says the bag has no usable item
 - pokemon: open your team to switch; only choose it if switching is needed
 
 Respond in exactly this format:
@@ -2449,8 +2457,12 @@ Press: <one of up, down, left, right, confirm, back>
         self._saw_battle_state: bool = False
         self._battle_place: Optional[Tuple[int, Tuple[int, int]]] = None
         self.battle_lost: bool = False
-        self._move_names: Dict[int, str] = {}
-        self._move_types: Dict[int, str] = {}
+        self._move_names: Dict[int, str] = (
+            dict(party_state.active_move_names) if (party_state is not None and getattr(party_state, "active_move_names", None)) else {}
+        )
+        self._move_types: Dict[int, str] = (
+            dict(party_state.active_move_types) if (party_state is not None and getattr(party_state, "active_move_types", None)) else {}
+        )
         self._move_pp: Dict[int, Tuple[int, int]] = {}
         self._zero_pp_slots: Dict[int, str] = {}
         self._known_zero_pp_names: set = set()
@@ -2783,6 +2795,8 @@ Press: <one of up, down, left, right, confirm, back>
         if names:
             for slot, name in names.items():
                 self._move_names[slot] = name
+                if self._party_state is not None:
+                    self._party_state.active_move_names[slot] = name
                 if slot in self._zero_pp_slots and not self._zero_pp_slots[slot]:
                     self._zero_pp_slots[slot] = name
                 for known_name in list(self._known_zero_pp_names):
@@ -2793,6 +2807,8 @@ Press: <one of up, down, left, right, confirm, back>
         mtype = read_move_menu_type(frame)
         if slot is not None and mtype:
             self._move_types[slot] = mtype
+            if self._party_state is not None:
+                self._party_state.active_move_types[slot] = mtype
         if slot is not None and pp is not None:
             self._move_pp[slot] = pp
             if pp[0] == 0:
@@ -3229,8 +3245,14 @@ Press: <one of up, down, left, right, confirm, back>
             deficit = max(0, max_hp - cur_hp)
             pct = int(round(100.0 * cur_hp / max_hp)) if max_hp > 0 else 100
             status_suffix = f", status: {live_status}" if live_status else ""
+            opp_critical = is_battle_opponent_critical_hp(cur_frame)
             low_hp_note = ""
-            if max_hp > 0 and cur_hp * 2 <= max_hp and not self._bag_unavailable:
+            if opp_critical:
+                low_hp_note = (
+                    " — Opponent HP is CRITICAL (nearly empty HP bar): if you have a damaging move with PP left "
+                    "that can knock out the opponent this turn, choose fight to finish off the opponent immediately before healing"
+                )
+            elif max_hp > 0 and cur_hp * 2 <= max_hp and not self._bag_unavailable:
                 low_hp_note = (
                     " — LOW HP (<= 50% max HP): in a trainer battle, choose bag to heal now "
                     "rather than gambling on fight"
@@ -3483,9 +3505,33 @@ Press: <one of up, down, left, right, confirm, back>
             return last_hud_status
         return self.extract_player_status_from_text("\n".join(self.dialogue_text))
 
+    def _reconcile_move_with_reasoning(self, move: Optional[int], output: str) -> Optional[int]:
+        if move is None or not self._move_names or move not in self._move_names:
+            return move
+        up_out = (output or "").upper()
+        chosen_name = self._move_names[move].upper().strip()
+        if chosen_name and (chosen_name in up_out or chosen_name[:6] in up_out):
+            return move
+        matched_slots: List[Tuple[int, int]] = []
+        for slot, m_name in self._move_names.items():
+            if slot == move or slot in self._zero_pp_slots:
+                continue
+            token = m_name.upper().strip()
+            if not token:
+                continue
+            pos = up_out.rfind(token)
+            if pos == -1 and len(token) >= 6:
+                pos = up_out.rfind(token[:6])
+            if pos != -1:
+                matched_slots.append((pos, slot))
+        if matched_slots:
+            matched_slots.sort()
+            return matched_slots[-1][1]
+        return move
+
     def _choose_move(self, output: str) -> Optional[int]:
         self._scan_move_menu_frame(self._current_frame())
-        move = parse_int(output, "Move", lo=1, hi=4)
+        move = self._reconcile_move_with_reasoning(parse_int(output, "Move", lo=1, hi=4), output)
         for _ in range(self.MOVE_ATTEMPTS):
             if move is not None and move not in self._zero_pp_slots:
                 return move
@@ -5671,7 +5717,7 @@ DIALOGUE_LEFT_TO_BATTLE = 4
 DIALOGUE_NOT_IN_DIALOGUE = -1
 DIALOGUE_STUCK = -2
 
-DIALOGUE_SETTLE_WAIT = 4
+DIALOGUE_SETTLE_WAIT = 5
 DIALOGUE_MAX_CUTSCENE_WAIT = 30
 DIALOGUE_POST_MOTION_WAIT = 5
 DIALOGUE_POST_WARP_BANNER_WAIT = 6
@@ -5679,7 +5725,7 @@ DIALOGUE_FANFARE_RETRY_LIMIT = 4
 DIALOGUE_BUTTON_SETTLE_WAIT = 2
 DIALOGUE_TOP_BOX_PRESSES = 4
 DIALOGUE_TOP_BOX_SCROLL_WAITS = 3
-FREE_SETTLE_WAIT = 4
+FREE_SETTLE_WAIT = 5
 MENU_SETTLE_WAIT = 1
 
 LEFT_DIALOGUE_CODES = {
