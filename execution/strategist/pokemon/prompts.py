@@ -262,11 +262,11 @@ Current location:
 
 Your notepad:
 [NOTEPAD]
-
+[KNOWLEDGE_BLOCK]
 Here is the player's report of the episode:
 [DIGEST]
 
-Has this goal been achieved, in this episode or before it? Answer Yes only if the report or your notepad clearly shows it has happened.
+Has this goal been achieved, in this episode or before it? Answer Yes only if the report or your notepad clearly shows it has happened. If the goal combines multiple preparation or excursion steps (such as buying supplies at a shop AND training/catching or completing a route excursion before re-challenging a Gym Leader) and your notepad's `Immediate plan` still lists unfinished route-training, catching, or landmark steps before returning to the Gym, completing only the shopping step does NOT achieve the goal yet (`Achieved: No`). Likewise, arriving outside an unentered building doorway at the end of a route does not achieve a route-excursion or landmark goal until the player has entered the doorway and completed the interaction inside.
 
 Keep `Reasoning:` concise (at most 2-3 sentences). Respond in exactly this format:
 Reasoning: <in 2-3 concise sentences, the evidence for and against>

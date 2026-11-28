@@ -880,12 +880,7 @@ class PokemonStrategist:
         if self._healing_bag_empty:
             parts.append("bag was already checked and has no usable healing items")
         status = "; ".join(parts)
-        if last_hp is not None and fought_after_hp <= 0:
-            low_hp = last_hp[0] * 2 <= last_hp[1]
-        elif last_hp is not None:
-            low_hp = (last_hp[0] * 2 <= last_hp[1]) or fought_after_hp >= 3
-        else:
-            low_hp = fought >= 3
+        low_hp = self._is_party_hp_low()
         if low_hp:
             if self._healing_bag_empty:
                 warning = (
@@ -1165,6 +1160,242 @@ class PokemonStrategist:
             return ""
         return "\nWhat you know from your knowledge database:\n" + "\n".join(lines) + "\n"
 
+    def _is_party_hp_low(self) -> bool:
+        fought = self._fought_since_heal
+        last_hp = self._last_battle_hp
+        fought_after_hp = self._fought_since_last_hp
+        if last_hp is not None and fought_after_hp <= 0:
+            return last_hp[0] * 2 <= last_hp[1]
+        if last_hp is not None:
+            return (last_hp[0] * 2 <= last_hp[1]) or fought_after_hp >= 3
+        return fought >= 3
+
+    def _active_story_summary(self) -> str:
+        if not has_recorded_knowledge(self.knowledge):
+            return ""
+        for path, node in tree_entries(self.knowledge):
+            if len(path) == 2 and path[1] == "Active Story":
+                desc = (node.description or "").strip()
+                if desc and desc not in DEFAULT_CATEGORY_DESCRIPTIONS:
+                    return compact_active_story(desc).strip()
+        return ""
+
+    def _route_terminus_unentered_door(self) -> Optional[Dict[str, Any]]:
+        from execution.strategist.pokemon.global_map.text import sector
+
+        gmap = self.global_map
+        if not gmap.current:
+            return None
+        cur_seg, cur_pos = gmap.resolve(gmap.segment, gmap.pos)
+        if gmap.info(cur_seg).kind == "building":
+            return None
+        doors_here = gmap.reachable_door_list(cur_seg)
+        if not doors_here:
+            return None
+        entered_cells: List[Tuple[int, int]] = []
+        entered_dists: List[int] = []
+        unentered_candidates: List[Tuple[int, Tuple[int, int], Dict[str, Any]]] = []
+        for d in doors_here:
+            cells = d.get("cells") or []
+            if not cells:
+                continue
+            best_cell = min(cells, key=lambda c: abs(c[0] - cur_pos[0]) + abs(c[1] - cur_pos[1]))
+            dist = abs(best_cell[0] - cur_pos[0]) + abs(best_cell[1] - cur_pos[1])
+            if d.get("leads_to") is not None:
+                entered_cells.extend(cells)
+                entered_dists.append(dist)
+            else:
+                unentered_candidates.append((dist, best_cell, d))
+        if not unentered_candidates:
+            return None
+        min_entered_dist = min(entered_dists) if entered_dists else None
+        if min_entered_dist is not None and min_entered_dist < 35:
+            return None
+        if min_entered_dist is None:
+            has_known_gym = any(
+                "gym" in (gmap.info(s).name or "").lower()
+                for s in range(len(gmap.segments))
+                if gmap.segments[s]
+            )
+            if not has_known_gym:
+                return None
+        unentered_candidates.sort(key=lambda item: item[0])
+        nearest_dist, nearest_cell, _ = unentered_candidates[0]
+        if nearest_dist > 15 or nearest_dist == 0:
+            return None
+        if entered_cells:
+            dist_from_entered = min(
+                abs(nearest_cell[0] - ec[0]) + abs(nearest_cell[1] - ec[1])
+                for ec in entered_cells
+            )
+            if dist_from_entered < 35:
+                return None
+        dx, dy = nearest_cell[0] - cur_pos[0], nearest_cell[1] - cur_pos[1]
+        return {
+            "dx": dx,
+            "dy": dy,
+            "steps": nearest_dist,
+            "sector": sector(dx, dy),
+            "cell": nearest_cell,
+            "min_entered_dist": min_entered_dist if min_entered_dist is not None else 40,
+        }
+
+    def _sync_excursion_goal(self, n: int) -> None:
+        from execution.strategist.pokemon.global_map.text import frontier_targets
+
+        gmap = self.global_map
+        if not gmap.current:
+            return
+        subtree = self.goals.frontier()
+        if subtree is None:
+            return
+        path = self.goals.path_to(subtree)
+        if path is None:
+            return
+        cur_seg, cur_pos = gmap.resolve(gmap.segment, gmap.pos)
+        seg_kind = gmap.info(cur_seg).kind
+        if seg_kind == "building":
+            return
+
+        doors_here = gmap.reachable_door_list(cur_seg)
+        entered_dists = [
+            min(abs(c[0] - cur_pos[0]) + abs(c[1] - cur_pos[1]) for c in (d.get("cells") or []))
+            for d in doors_here
+            if d.get("leads_to") is not None and (d.get("cells") or [])
+        ]
+        min_entered_dist = min(entered_dists) if entered_dists else None
+
+        terminus = self._route_terminus_unentered_door()
+        if subtree.root.source == "excursion" and terminus is None:
+            if min_entered_dist is not None and min_entered_dist <= 25:
+                self.goals.set_status(
+                    path,
+                    "complete",
+                    "Returned to town after completing the route excursion.",
+                    episode_number=n,
+                )
+                next_sub = self.goals.frontier()
+                if next_sub is not None:
+                    next_path = self.goals.path_to(next_sub)
+                    if next_path is not None:
+                        self.goals.set_frontier(next_path, n, episode_number=n)
+                return
+
+        if self._is_party_hp_low():
+            return
+
+        story = self._active_story_summary()
+        story_suffix = f" Active story context: {story}" if story else ""
+
+        if terminus is not None:
+            dx, dy = terminus["dx"], terminus["dy"]
+            steps, sec = terminus["steps"], terminus["sector"]
+            min_ent = terminus["min_entered_dist"]
+            landmark_desc = (
+                f"Enter the unentered building doorway at ({dx}, {dy}) at the end of the route "
+                f"and interact with the person inside"
+            )
+            landmark_details = (
+                f"You have reached an unentered building doorway at ({dx}, {dy}) ({steps} steps {sec} "
+                f"from current position {cur_pos}, while previously visited town buildings are {min_ent}+ "
+                f"steps away). Enter ({dx}, {dy}) and talk to the person or complete the event inside "
+                f"before backtracking toward town or the Gym.{story_suffix}"
+            )
+            if subtree.root.source == "excursion":
+                if subtree.root.description != landmark_desc or subtree.root.details != landmark_details:
+                    self.goals.edit(
+                        path,
+                        description=landmark_desc,
+                        details=landmark_details,
+                        achievable_without_subgoals=n,
+                        episode_number=n,
+                    )
+                return
+            if f"({dx}, {dy})" not in (subtree.root.description or ""):
+                self.goals.add_under(
+                    path,
+                    GoalNode(
+                        description=landmark_desc,
+                        details=landmark_details,
+                        source="excursion",
+                        source_description="Unentered building doorway reached at the terminus of a distant route excursion",
+                        achievable_without_subgoals=n,
+                        frontier_since=n,
+                    ),
+                    episode_number=n,
+                )
+                self.goals.edit(path, achievable_without_subgoals=None, episode_number=n)
+                new_frontier = self.goals.frontier()
+                if new_frontier is not None:
+                    new_path = self.goals.path_to(new_frontier)
+                    if new_path is not None:
+                        self.goals.set_frontier(new_path, n, episode_number=n)
+            return
+
+        if subtree.root.source == "excursion":
+            return
+
+        desc_lower = (subtree.root.description or "").lower()
+        is_gym_goal = any(kw in desc_lower for kw in ("gym", "leader"))
+        if not is_gym_goal:
+            return
+        if any(c.root.source == "excursion" and c.root.status == "complete" for c in subtree.subtrees):
+            return
+        if min_entered_dist is None or min_entered_dist < 35:
+            return
+        local = (
+            cell_kinds(
+                self._identified,
+                gmap.ledge_patterns,
+                gmap.walk_patterns,
+                self._screen_people(),
+                gmap.left_ledge_patterns,
+                self._local_blocked_cells(),
+                global_map=gmap,
+            )
+            if self._identified
+            else None
+        )
+        targets, _ = frontier_targets(gmap, local, blocked_moves=self._current_segment_blocked_moves())
+        if not targets or targets[0]["steps"] > 15:
+            return
+        notepad_text = self.notepad.text or ""
+        if re.search(
+            r"Immediate plan:\s*\n\s*1\.\s*(?:Walk|Return|Head|Go)\s+(?:back\s+)?(?:west|south|to\s+.*\b(?:Pok[eé]mon\s+Center|Gym|City|Town))",
+            notepad_text,
+            re.IGNORECASE,
+        ):
+            return
+        nearest = targets[0]
+        excursion_desc = (
+            "Traverse the current outdoor route to battle trainers, explore the route frontier, "
+            "and visit any landmark at the end of the route"
+        )
+        excursion_details = (
+            f"Advance along the unexplored route frontier (nearest unexplored edge at "
+            f"({nearest['dx']}, {nearest['dy']}), {nearest['steps']} steps {nearest['sector']}), "
+            f"battle trainers along the path for experience, and enter any unentered building doorway "
+            f"at the end of the route before returning to challenge the Gym Leader.{story_suffix}"
+        )
+        self.goals.add_under(
+            path,
+            GoalNode(
+                description=excursion_desc,
+                details=excursion_details,
+                source="excursion",
+                source_description="Active outdoor route excursion far from the Gym",
+                achievable_without_subgoals=n,
+                frontier_since=n,
+            ),
+            episode_number=n,
+        )
+        self.goals.edit(path, achievable_without_subgoals=None, episode_number=n)
+        new_frontier = self.goals.frontier()
+        if new_frontier is not None:
+            new_path = self.goals.path_to(new_frontier)
+            if new_path is not None:
+                self.goals.set_frontier(new_path, n, episode_number=n)
+
     def _fill(self, prompt: str) -> str:
         notepad_text = self.notepad.text.strip()
         if notepad_text and self.global_map.current:
@@ -1173,6 +1404,20 @@ class PokemonStrategist:
                 self.global_map,
                 self._current_segment_blocked_moves(),
             )
+        terminus = self._route_terminus_unentered_door()
+        if terminus is not None and not self._is_party_hp_low():
+            tdx, tdy = terminus["dx"], terminus["dy"]
+            t_note = (
+                f"- Route terminus priority: You are currently {terminus['steps']} steps {terminus['sector']} "
+                f"from the unentered building doorway at ({tdx}, {tdy}) (`NOT entered yet`). Enter ({tdx}, {tdy}) "
+                f"and talk to the person inside before backtracking across the route toward town."
+            )
+            if f"({tdx}, {tdy})" not in notepad_text or re.search(
+                r"Immediate plan:\s*\n\s*1\.\s*(?:Walk|Return|Head|Go)\s+(?:west|south|back)",
+                notepad_text,
+                re.IGNORECASE,
+            ):
+                notepad_text = f"{notepad_text}\n{t_note}".strip() if notepad_text else t_note
         return (prompt.replace("[GAME]", self._game)
                 .replace("[RECENT_BLOCK]", self._recent_block())
                 .replace("[MAX_STEPS]", str(self._supervisor_max_steps))
@@ -1505,13 +1750,15 @@ class PokemonStrategist:
             return
         place = f" ({gmap.area_label(gmap.resolve(defeat['segment'], defeat['pos'])[0])})" if defeat else ""
         self._remember_all([f"The player lost a battle in episode {n}{place}: {answer['wrong']}"], n)
-        if answer["prepare"]:
+        prepares = answer.get("prepares") or ([answer["prepare"]] if answer.get("prepare") else [])
+        if prepares:
             frontier = self.goals.frontier()
             if frontier is not None:
                 path = self.goals.path_to(frontier)
                 details = f"Added after losing a battle in episode {n}: {answer['wrong']}"
-                self.goals.add_under(path, GoalNode(description=answer["prepare"], details=details, source="defeat"),
-                                     episode_number=n)
+                for prep in prepares:
+                    self.goals.add_under(path, GoalNode(description=prep, details=details, source="defeat"),
+                                         episode_number=n)
                 self.goals.edit(path, achievable_without_subgoals=None, episode_number=n)
                 new_frontier_path = self.goals.path_to(self.goals.frontier())
                 self.goals.set_frontier(new_frontier_path, n, episode_number=n)
@@ -1671,6 +1918,7 @@ class PokemonStrategist:
         return self.report
 
     def _plan_goals(self, n: int) -> None:
+        self._sync_excursion_goal(n)
         subtree = self.goals.frontier()
         if subtree is None:
             return
@@ -1678,13 +1926,13 @@ class PokemonStrategist:
         since = subtree.root.frontier_since
         if path != self.goals.frontier_path or since is None:
             self.goals.set_frontier(path, n, episode_number=n)
-            if subtree.root.source in ("subgoal_creation", "defeat"):
+            if subtree.root.source in ("subgoal_creation", "defeat", "excursion"):
                 self.goals.edit(path, achievable_without_subgoals=n, episode_number=n)
                 return
             unsuccessful_for = 0
         else:
             if (subtree.root.achievable_without_subgoals is not None
-                    or subtree.root.source in ("subgoal_creation", "defeat")) and not self._explore_now:
+                    or subtree.root.source in ("subgoal_creation", "defeat", "excursion")) and not self._explore_now:
                 if subtree.root.achievable_without_subgoals is None:
                     self.goals.edit(path, achievable_without_subgoals=n, episode_number=n)
                 return
@@ -1789,10 +2037,23 @@ class PokemonStrategist:
         if record.status == "lost_battle":
             closed = []
         else:
-            closed = check_goals(self.goals, report.digest, self.notepad.text, self._vlm_caller, self._game, n,
-                                 current=self._current_place(), parameters=self._parameters,
-                                 episode_status=record.status, subgoal_every=self._subgoal_every,
-                                 explore=self._explore_context_block())
+            self._sync_excursion_goal(n)
+            closed = check_goals(
+                self.goals,
+                report.digest,
+                self.notepad.text,
+                self._vlm_caller,
+                self._game,
+                n,
+                current=self._current_place(),
+                parameters=self._parameters,
+                episode_status=record.status,
+                subgoal_every=self._subgoal_every,
+                explore=self._explore_context_block(),
+                knowledge_block=self._knowledge_context_block(),
+                has_unentered_terminus_door=(self._route_terminus_unentered_door() is not None),
+            )
+            self._sync_excursion_goal(n)
         summary, town = self._review(report.digest, fallback_summary=supervisor_summary)
         record.summary = summary or record.summary
         town_event = record_new_town(self.guide, town, self._current_place(), n, self._parameters)
@@ -1806,14 +2067,14 @@ class PokemonStrategist:
         if closed:
             if any(status == "complete" for _, status in closed):
                 self.guide.mark_goal_completed(self.global_map, episode_number=n)
-            if extracted or any(len(path) <= 3 for path, _ in closed):
+            if any(len(path) <= 3 for path, _ in closed):
                 self.notepad.clear(episode_number=n)
         if (
             record.status == "completed"
             and not extracted
             and not named_new_segment
             and not new_blocked_moves
-            and not any(len(path) <= 3 for path, _ in closed)
+            and not closed
             and self.notepad.text.strip()
         ):
             self._update_notepad_deterministically(record.summary, n)

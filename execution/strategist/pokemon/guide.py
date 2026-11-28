@@ -234,15 +234,20 @@ def _parse_reflection(guide: StrategyGuide):
         if len(wrong) != 1 or not wrong[0].strip():
             return None, "There must be exactly one `Wrong:` line saying what went wrong."
         plan = field_values(output, "Plan")
-        if len(plan) != 1:
-            return None, "There must be exactly one `Plan:` line: CONTINUE, or PREPARE | <subgoal>."
-        parts = [p.strip() for p in plan[0].split("|", 1)]
-        if parts[0].upper().rstrip(".") == "CONTINUE":
+        if not plan:
+            return None, "There must be at least one `Plan:` line: CONTINUE, or PREPARE | <subgoal>."
+        prepares: List[str] = []
+        if len(plan) == 1 and plan[0].split("|", 1)[0].strip().upper().rstrip(".") == "CONTINUE":
             prepare = None
-        elif parts[0].upper() == "PREPARE" and len(parts) == 2 and parts[1]:
-            prepare = parts[1]
         else:
-            return None, f"`Plan:` must be CONTINUE, or PREPARE | <subgoal>. Got: {plan[0]!r}"
+            for item in plan:
+                parts = [p.strip() for p in item.split("|", 1)]
+                if parts[0].upper() == "PREPARE" and len(parts) == 2 and parts[1]:
+                    if parts[1].lower() not in (seen.lower() for seen in prepares):
+                        prepares.append(parts[1])
+                else:
+                    return None, f"`Plan:` must be CONTINUE, or PREPARE | <subgoal>. Got: {item!r}"
+            prepare = prepares[0] if prepares else None
         back = field_values(output, "Return")
         if len(back) != 1 or back[0].strip().upper().rstrip(".") not in ("YES", "NO"):
             return None, "There must be exactly one `Return:` line, YES or NO."
@@ -253,7 +258,7 @@ def _parse_reflection(guide: StrategyGuide):
         if len(guide.rules_for(BATTLE)) + adds > MAX_BATTLE_TIPS:
             return None, (f"You may keep at most {MAX_BATTLE_TIPS} battle tips; remove or rewrite one of yours "
                           f"instead of adding.")
-        return {"wrong": wrong[0].strip(), "changes": changes, "prepare": prepare,
+        return {"wrong": wrong[0].strip(), "changes": changes, "prepare": prepare, "prepares": prepares,
                 "return": back[0].strip().upper().startswith("YES")}, None
     return parse
 

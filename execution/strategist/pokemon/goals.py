@@ -252,11 +252,12 @@ def _routes_text(routes: List[Tuple[str, Optional[str]]]) -> str:
 
 
 def _goal_prompt(template: str, game: str, path: GoalPath, subtree: GoalSubtree, notepad: str,
-                 current: str = "Unknown") -> str:
+                 current: str = "Unknown", knowledge_block: str = "") -> str:
     return (template.replace("[GAME]", game)
             .replace("[GOAL]", _goal_text(path, subtree))
             .replace("[CURRENT]", current or "Unknown")
-            .replace("[NOTEPAD]", _notepad_text(notepad)))
+            .replace("[NOTEPAD]", _notepad_text(notepad))
+            .replace("[KNOWLEDGE_BLOCK]", knowledge_block or ""))
 
 
 def _distinct(values: List[str], key: str) -> Tuple[Optional[List[str]], Optional[str]]:
@@ -433,13 +434,19 @@ def _should_decide_goal(subtree: GoalSubtree, episode_number: int,
 def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCaller, game: str,
                 episode_number: int, current: str = "Unknown",
                 parameters: Optional[dict] = None, episode_status: Optional[str] = None,
-                subgoal_every: int = 5, explore: str = "(none)") -> List[Tuple[GoalPath, str]]:
+                subgoal_every: int = 5, explore: str = "(none)",
+                knowledge_block: str = "",
+                has_unentered_terminus_door: bool = False) -> List[Tuple[GoalPath, str]]:
     closed: List[Tuple[GoalPath, str]] = []
     subtree = goals.frontier()
     checked_active = False
     while subtree is not None:
         path = goals.path_to(subtree)
-        prompt = _goal_prompt(P.GOAL_CHECK_PROMPT, game, path, subtree, notepad, current).replace("[DIGEST]", digest)
+        if has_unentered_terminus_door and subtree.root.source in ("excursion", "defeat"):
+            return closed
+        prompt = (_goal_prompt(P.GOAL_CHECK_PROMPT, game, path, subtree, notepad, current,
+                               knowledge_block=knowledge_block)
+                  .replace("[DIGEST]", digest))
         achieved = ask(vlm_caller("goal_check"), prompt, _parse_achieved, "Goal check", GOAL_ATTEMPTS,
                        parameters)
         if achieved is None:
@@ -464,15 +471,16 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
         if subtree.root.frontier_since is None:
             break
         if (
-            completed_node.source in ("subgoal_creation", "defeat")
-            and subtree.root.source == "initial"
+            completed_node.source in ("subgoal_creation", "defeat", "excursion")
             and next_path == completed_path[:-1]
         ):
             child_desc = (completed_node.description or "").lower()
             parent_desc = (subtree.root.description or "").lower()
-            if "visit the city" in parent_desc and not any(
+            if subtree.root.source == "initial" and "visit the city" in parent_desc and not any(
                 kw in child_desc for kw in ("visit the city", "reach the city", "arrive in", "enter the city")
             ):
+                break
+            if any(kw in parent_desc for kw in ("gym", "leader")) and "gym" not in (current or "").lower():
                 break
     return closed
 

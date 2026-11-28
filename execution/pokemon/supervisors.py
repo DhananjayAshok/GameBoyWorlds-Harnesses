@@ -1571,6 +1571,8 @@ class PokemonPlayThroughSupervisor(Supervisor):
             if unfinished_note is None:
                 unfinished_note = self._unfinished_open_corridor_target_note(subgoal, after_kinds)
             if unfinished_note is None:
+                unfinished_note = self._unfinished_corridor_traversal_note(after_kinds, subgoal=subgoal)
+            if unfinished_note is None:
                 unfinished_note = self._budget_exhausted_unfinished_subgoal_note(subgoal, output, after_kinds)
             if unfinished_note:
                 complete = False
@@ -1734,12 +1736,18 @@ class PokemonPlayThroughSupervisor(Supervisor):
     def _unfinished_corridor_traversal_note(
         self,
         local_kinds: Optional[Dict[Tuple[int, int], str]] = None,
+        *,
+        subgoal: Optional[str] = None,
     ) -> Optional[str]:
         remaining_calls = max(0, self._max_steps - self._calls)
-        if remaining_calls < 4:
+        if remaining_calls < 2:
             return None
         if self._agent_state() != AgentState.FREE_ROAM or self._is_in_dialogue():
             return None
+        if self._last_seen_battle_hp is not None:
+            cur_hp, max_hp = self._last_seen_battle_hp
+            if max_hp > 0 and cur_hp * 2 <= max_hp:
+                return None
         gmap = self._global_map()
         place = self._current_map_place()
         if gmap is None or place is None or self._start_place is None:
@@ -1747,11 +1755,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
         cur_seg, cur_pos = place
         s_seg, s_pos = gmap.resolve(self._start_place[0], self._start_place[1])
         same_seg = cur_seg == s_seg
-        if not same_seg:
-            cur_kind = gmap.info(cur_seg).kind
-            start_kind = gmap.info(s_seg).kind
-            if cur_kind == "building" or start_kind == "building":
-                return None
+        cur_kind = gmap.info(cur_seg).kind
+        start_kind = gmap.info(s_seg).kind
+        if cur_kind == "building" or start_kind == "building":
+            return None
         move_legs = 0
         net_steps = 0
         for b_place, _, a_place in self._leg_departures:
@@ -1769,13 +1776,32 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 net_steps += 5
         if same_seg:
             net_steps = abs(cur_pos[0] - s_pos[0]) + abs(cur_pos[1] - s_pos[1])
-        if move_legs == 0 or move_legs >= 3:
+        if move_legs == 0:
             return None
-        if net_steps >= 15:
+        if re.search(
+            r"\b(?:heal|potion|menu|poke\s*mart|pokemon\s*center|talk|speak|interact|pick\s+up|collect|cut|teach|learn|buy|sell)\b",
+            self._task or "",
+            re.IGNORECASE,
+        ):
             return None
-        if re.search(r"\b(?:heal|potion|menu|poke\s*mart|pokemon\s*center|talk|speak|interact|pick\s+up|collect)\b",
-                     self._task or "", re.IGNORECASE):
-            return None
+        is_ongoing_route_task = bool(
+            re.search(
+                r"\b(?:continue\s+(?:walking\s+|heading\s+)?(?:north|south|east|west|up|down|left|right|along|through|into)"
+                r"|follow\s+the\s+.*\b(?:route|path|corridor|bridge)"
+                r"|battl(?:e|ing)\s+(?:any\s+|the\s+)?trainers)\b",
+                self._task or "",
+                re.IGNORECASE,
+            )
+        )
+        if move_legs >= 3 or net_steps >= 15:
+            if not is_ongoing_route_task:
+                return None
+            if move_legs >= 6 and not re.search(
+                r"\bbattl(?:e|ing)\s+(?:any\s+|the\s+)?trainers\b",
+                self._task or "",
+                re.IGNORECASE,
+            ) and remaining_calls < 3:
+                return None
         dir_map = {
             "north": "up", "up": "up",
             "south": "down", "down": "down",
@@ -1789,14 +1815,27 @@ class PokemonPlayThroughSupervisor(Supervisor):
                 task_dirs.append(d)
         if not task_dirs:
             return None
+        active_dirs = list(task_dirs)
+        if subgoal and (move_legs >= 3 or len(task_dirs) > 1):
+            sg_dirs = []
+            for m in re.finditer(r"\b(north|south|east|west|up|down|left|right)\b", subgoal, re.IGNORECASE):
+                d = dir_map[m.group(1).lower()]
+                if d not in sg_dirs:
+                    sg_dirs.append(d)
+            if sg_dirs:
+                active_dirs = sg_dirs
         if local_kinds is not None:
-            for d in DIRECTIONS:
-                for (lx, ly), kind in local_kinds.items():
-                    if abs(lx) + abs(ly) <= 6 and kind == "item":
-                        return None
+            for (lx, ly), kind in local_kinds.items():
+                if abs(lx) + abs(ly) <= 6 and kind == "item":
+                    return None
         targets, _ = frontier_targets(gmap, local_kinds, blocked_moves=self._current_segment_blocked_moves())
-        doors_here = gmap.reachable_door_list()
-        unentered_doors = [d for d in doors_here if d["leads_to"] is None]
+        doors_here = gmap.reachable_door_list(cur_seg)
+        unentered_doors = [d for d in doors_here if d.get("leads_to") is None]
+        for d in unentered_doors:
+            for gx, gy in d.get("cells") or ():
+                rel = (gx - cur_pos[0], gy - cur_pos[1])
+                if in_bounds(rel) or (abs(rel[0]) + abs(rel[1]) <= 8):
+                    return None
         if not targets and not unentered_doors:
             return None
         if local_kinds is not None:
@@ -1811,7 +1850,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
                         return None
         open_task_dirs = []
         if local_kinds is not None:
-            for d in task_dirs:
+            for d in active_dirs:
                 cells = edge_cells(local_kinds, d)
                 if not cells:
                     continue
@@ -1820,15 +1859,54 @@ class PokemonPlayThroughSupervisor(Supervisor):
                     open_task_dirs.append(d)
         if not open_task_dirs:
             return None
-        if targets:
-            nearest = targets[0]
+
+        def _target_matches_dirs(t: Dict[str, Any], dirs: List[str]) -> bool:
+            tdx, tdy = t.get("dx", 0), t.get("dy", 0)
+            n_leg = t.get("next_leg") or ""
+            for d in dirs:
+                if is_on_edge((tdx, tdy), d) or n_leg.startswith(f"MoveOff({d} via "):
+                    return True
+                if d == "right" and tdx > 0:
+                    return True
+                if d == "left" and tdx < 0:
+                    return True
+                if d == "up" and tdy > 0:
+                    return True
+                if d == "down" and tdy < 0:
+                    return True
+            return False
+
+        forward_targets = [t for t in targets if _target_matches_dirs(t, open_task_dirs)]
+        if targets and not forward_targets and not unentered_doors:
+            return None
+        chosen_targets = forward_targets or targets
+        if chosen_targets:
+            nearest = chosen_targets[0]
+            tdx, tdy = nearest.get("dx", 0), nearest.get("dy", 0)
             dist = nearest.get("path_steps") if nearest.get("path_steps") is not None else nearest.get("steps")
-            if same_seg and dist is not None and dist <= 6 and nearest.get("on_screen"):
+            on_open_edge = any(is_on_edge((tdx, tdy), d) for d in open_task_dirs)
+            if (
+                same_seg
+                and dist is not None
+                and dist <= 6
+                and nearest.get("on_screen")
+                and not on_open_edge
+                and not any(
+                    not t.get("on_screen") or any(is_on_edge((t.get("dx", 0), t.get("dy", 0)), d) for d in open_task_dirs)
+                    for t in chosen_targets
+                )
+            ):
                 return None
-            leg_str = f" [next on-screen leg: {nearest['next_leg']}]" if nearest.get("next_leg") else ""
+            next_leg = nearest.get("next_leg")
+            if on_open_edge:
+                for d in open_task_dirs:
+                    if is_on_edge((tdx, tdy), d):
+                        next_leg = f"MoveOff({d} via ({tdx}, {tdy}))"
+                        break
+            leg_str = f" [next on-screen leg: {next_leg}]" if next_leg else ""
             route_info = (
-                f"nearest unexplored edge is at ({nearest['dx']}, {nearest['dy']}), {nearest['steps']} steps {nearest['sector']}"
-                + (f" (mapped route, {nearest['path_steps']} moves: {nearest['path_moves']}{leg_str})" if nearest.get("path_moves") else "")
+                f"nearest unexplored edge is at ({tdx}, {tdy}), {nearest['steps']} steps {nearest['sector']}"
+                + (f" (mapped route, {nearest['path_steps']} moves: {nearest['path_moves']}{leg_str})" if nearest.get("path_moves") else leg_str)
             )
         else:
             route_info = f"{len(unentered_doors)} unentered door(s)/stairs remain in this area"
@@ -1851,7 +1929,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
             local_kinds = self._current_local_kinds()
         unfinished_note = self._unfinished_room_exploration_note(self._task, local_kinds)
         if unfinished_note is None:
-            unfinished_note = self._unfinished_corridor_traversal_note(local_kinds)
+            unfinished_note = self._unfinished_corridor_traversal_note(
+                local_kinds,
+                subgoal=self.plan[-1] if self.plan else None,
+            )
         if unfinished_note is None and self.plan:
             unfinished_note = self._unfinished_open_corridor_target_note(self.plan[-1], local_kinds)
         return unfinished_note
