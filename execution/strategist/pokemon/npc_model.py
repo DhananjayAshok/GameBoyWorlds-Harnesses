@@ -95,8 +95,8 @@ ITEM_PICKUP_PATTERN = re.compile(
     r"(?:\s+(?:[A-Za-z0-9.'♂♀\-]{1,12}\s+)?put\s+the\s+[\s\S]{1,60}?\s+in\s+the\s+[A-Z0-9\s]+POCKET\.)?\s*$"
 )
 GIFT_OR_QUEST_PATTERN = re.compile(
-    r"\b(?:received|got\s+a?\s*[A-Z0-9]|handed|delivered|gave\s+you|take\s+this|took\s+the|order\s+came\s+in)\b",
-    re.IGNORECASE,
+    r"(?:(?i:\b(?:received|handed|delivered|gave\s+you|take\s+this|took\s+the|order\s+came\s+in)\b)"
+    r"|\b[Gg]ot\s+(?:(?:a|an|the)\s+)?[A-Z0-9][A-Z0-9'é\-]*\b)"
 )
 NAMED_SPEAKER_INTRO_PATTERN = re.compile(
     r"(?:\b(?:I'm|I\s+am|My\s+name's|My\s+name\s+is)\s+(?!OK\b)(?:[A-Z]{2,}\b|\?{2,})|(?i:\b(?:GYM\s+LEADER|ELITE\s+FOUR|CHAMPION)\b))"

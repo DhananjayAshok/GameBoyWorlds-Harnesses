@@ -901,6 +901,12 @@ class NPCRegistry(StrategistArtifact):
             self._last_battle_step = self._gmap.step
             self._last_battle_pos = self._gmap.resolve(self._gmap.segment, self._gmap.pos)
 
+    @staticmethod
+    def _same_or_step_square(gmap: GlobalMap, seg_a: int, sq_a: Cell, seg_b: int, sq_b: Cell) -> bool:
+        ra, qa = gmap.resolve(seg_a, sq_a)
+        rb, qb = gmap.resolve(seg_b, sq_b)
+        return ra == rb and _manhattan(qa, qb) <= 1
+
     def _recent_pre_battle_conversation(self, allow_stationary_wait: bool = False) -> Optional[Conversation]:
         if self._last_closed is None or self._gmap is None or self._moved_since_close:
             return None
@@ -912,7 +918,7 @@ class NPCRegistry(StrategistArtifact):
         end_step = conv.map_step_end if conv.map_step_end is not None else conv.map_step_start
         if not allow_stationary_wait and self._gmap.step - end_step > MAX_PRE_BATTLE_WAIT_STEPS:
             return None
-        if self._gmap.resolve(self._gmap.segment, self._gmap.pos) != self._gmap.resolve(conv.segment, conv.square):
+        if not self._same_or_step_square(self._gmap, self._gmap.segment, self._gmap.pos, conv.segment, conv.square):
             return None
         return conv
 
@@ -1525,7 +1531,8 @@ class NPCRegistry(StrategistArtifact):
             and not self._moved_since_close
             and self._last_battle_step is not None
             and 0 <= g.step - self._last_battle_step <= MAX_PRE_BATTLE_WAIT_STEPS
-            and self._last_battle_pos == g.resolve(g.segment, g.pos)
+            and self._last_battle_pos is not None
+            and self._same_or_step_square(g, self._last_battle_pos[0], self._last_battle_pos[1], g.segment, g.pos)
         )
         conv = Conversation(
             id=self._next("conv"), npc=speaker, sign=None, episode=self._episode, map_step_start=g.step,
@@ -1921,7 +1928,7 @@ class NPCRegistry(StrategistArtifact):
                     other.id != conv.id and other.episode == conv.episode
                     and (other.trigger == "battle_start" or other.led_to == "battle")
                     and 0 <= other.map_step_start - end_step <= MAX_PRE_BATTLE_WAIT_STEPS
-                    and gmap.resolve(other.segment, other.square) == (rseg, rsq)
+                    and self._same_or_step_square(gmap, other.segment, other.square, rseg, rsq)
                     for other in convs
                 )
                 if followed_by_battle:
@@ -1937,7 +1944,7 @@ class NPCRegistry(StrategistArtifact):
                     for prev in reversed(convs[:idx]):
                         if prev.episode != conv.episode or prev.trigger == "battle_start":
                             continue
-                        if gmap.resolve(prev.segment, prev.square) != (rseg, rsq):
+                        if not self._same_or_step_square(gmap, prev.segment, prev.square, rseg, rsq):
                             break
                         if prev.led_to == "battle" or prev.outcome == "battle":
                             conv.outcome = "battle"
