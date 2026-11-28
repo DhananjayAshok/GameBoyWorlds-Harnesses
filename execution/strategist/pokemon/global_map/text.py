@@ -530,7 +530,17 @@ def _unentered_door_cues(gmap: GlobalMap, door_cells: List[Cell]) -> str:
     cues = []
     if sign_cells:
         nearest = min(sign_cells, key=lambda s: abs(s[0] - px) + abs(s[1] - py))
-        cues.append(f"adjacent signpost at ({nearest[0] - px}, {nearest[1] - py})")
+        facility_label = None
+        if hasattr(gmap, "cell_facility_sign_label"):
+            for sc in sorted(sign_cells, key=lambda s: abs(s[0] - px) + abs(s[1] - py)):
+                facility_label = gmap.cell_facility_sign_label(gmap.segment, sc)
+                if facility_label:
+                    nearest = sc
+                    break
+        if facility_label:
+            cues.append(f"adjacent {facility_label} at ({nearest[0] - px}, {nearest[1] - py})")
+        else:
+            cues.append(f"adjacent signpost at ({nearest[0] - px}, {nearest[1] - py})")
     if unmapped_above:
         cues.append("upper roof/facade above doorway not yet seen")
     return ("; " + "; ".join(cues)) if cues else ""

@@ -436,13 +436,20 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
                 parameters: Optional[dict] = None, episode_status: Optional[str] = None,
                 subgoal_every: int = 5, explore: str = "(none)",
                 knowledge_block: str = "",
-                has_unentered_terminus_door: bool = False) -> List[Tuple[GoalPath, str]]:
+                has_unentered_terminus_door: bool = False,
+                has_unvisited_pokecenter_in_area: bool = False) -> List[Tuple[GoalPath, str]]:
     closed: List[Tuple[GoalPath, str]] = []
     subtree = goals.frontier()
     checked_active = False
     while subtree is not None:
         path = goals.path_to(subtree)
         if has_unentered_terminus_door and subtree.root.source in ("excursion", "defeat"):
+            return closed
+        if (
+            has_unvisited_pokecenter_in_area
+            and subtree.root.source == "initial"
+            and "visit the city" in (subtree.root.description or "").lower()
+        ):
             return closed
         prompt = (_goal_prompt(P.GOAL_CHECK_PROMPT, game, path, subtree, notepad, current,
                                knowledge_block=knowledge_block)
@@ -476,8 +483,11 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
         ):
             child_desc = (completed_node.description or "").lower()
             parent_desc = (subtree.root.description or "").lower()
-            if subtree.root.source == "initial" and "visit the city" in parent_desc and not any(
-                kw in child_desc for kw in ("visit the city", "reach the city", "arrive in", "enter the city")
+            if subtree.root.source == "initial" and "visit the city" in parent_desc and (
+                has_unvisited_pokecenter_in_area
+                or not any(
+                    kw in child_desc for kw in ("visit the city", "reach the city", "arrive in", "enter the city")
+                )
             ):
                 break
             if any(kw in parent_desc for kw in ("gym", "leader")) and "gym" not in (current or "").lower():

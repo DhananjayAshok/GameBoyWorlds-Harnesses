@@ -251,12 +251,36 @@ class GlobalMap(StrategistArtifact):
     """Segments of global grid, the player's place on them, and the bookkeeping to explain both."""
 
     # Set by MappingEnvironment to the tile recognizer's palette-independent hash; not saved.
-    _TRANSIENT = ("canonical_hash", "_seg_index_cache", "_overlap_cache", "_npcs")
+    _TRANSIENT = ("canonical_hash", "_seg_index_cache", "_overlap_cache", "_npcs", "_tile_lookup")
     canonical_hash: Optional[Callable[[np.ndarray], Optional[str]]] = None
     _npcs: Optional[Any] = None
+    _tile_lookup: Optional[Dict[str, Any]] = None
 
     def attach_npcs(self, npcs: Optional[Any]) -> None:
         self._npcs = npcs
+
+    def cell_facility_sign_label(self, segment: Optional[int], cell: Cell) -> Optional[str]:
+        lookup = getattr(self, "_tile_lookup", None)
+        if not lookup:
+            return None
+        si = self.segment if segment is None else segment
+        si = self.resolve(si, (0, 0))[0]
+        seg = self.segments[si] if 0 <= si < len(self.segments) else {}
+        c = seg.get(cell)
+        if c is None or not c.hashes:
+            return None
+        descs = [
+            (getattr(lookup.get(h), "description", "") or "").lower()
+            for h in c.hashes
+            if h and h in lookup
+        ]
+        if any("mart" in d for d in descs):
+            return "Poké Mart sign"
+        if any("pokemon center" in d or "pokémon center" in d or "poke center" in d for d in descs):
+            return "Pokémon Center sign"
+        if any("gym" in d for d in descs):
+            return "Gym sign"
+        return None
 
     def stationary_npc_squares(self, segment: Optional[int] = None) -> set:
         npcs = getattr(self, "_npcs", None)
@@ -2054,6 +2078,14 @@ class GlobalMap(StrategistArtifact):
             )
         ):
             return True
+        if (
+            overlap.get("trail_anchored")
+            and overlap.get("matches", 0) >= 24
+            and overlap.get("agreement", 0.0) >= 0.9
+            and self.info(source).kind == OUTDOORS
+            and self.info(target).kind == OUTDOORS
+        ):
+            return True
         if judge is None:
             return False
         same = judge(source, target, overlap)
@@ -2103,8 +2135,8 @@ class GlobalMap(StrategistArtifact):
         best = None
         for bx, by in base_offsets:
             for dx in range(-2, 3):
-                for dy in range(-5, 6):
-                    if abs(dx) + abs(dy) > 5:
+                for dy in range(-10, 11):
+                    if abs(dx) + abs(dy) > 10:
                         continue
                     ox, oy = bx + dx, by + dy
                     matches = total = 0
@@ -2122,7 +2154,17 @@ class GlobalMap(StrategistArtifact):
                             if _cells_match(c.hashes, c.pixels, c_dst):
                                 matches += 1
                     needed_shared = min(CONSOLIDATE_MIN_CELLS, max(15, int(0.4 * len(src_uniform))))
-                    if total >= needed_shared and matches >= 0.65 * total:
+                    high_precision_collar = (
+                        abs(dx) + abs(dy) <= 10
+                        and total >= 20
+                        and matches >= 20
+                        and matches >= 0.85 * total
+                    )
+                    if (
+                        abs(dx) + abs(dy) <= 5
+                        and total >= needed_shared
+                        and matches >= 0.65 * total
+                    ) or high_precision_collar:
                         score = (matches, matches / total, -abs(dx) - abs(dy))
                         if best is None or score > best[0]:
                             best = (score, (ox, oy), matches, total)
@@ -2137,6 +2179,7 @@ class GlobalMap(StrategistArtifact):
             "votes": matches,
             "rival": 0,
             "rival_agreement": 0.0,
+            "trail_anchored": True,
         }
 
     def _warp_anchored_overlap(self, source: int, target: int) -> Optional[Dict[str, Any]]:
@@ -3202,6 +3245,7 @@ class GlobalMap(StrategistArtifact):
                 > self.door_conflicts(base_warps, base_moves, self._same_door))
 
     def refresh(self, tile_lookup: Dict[str, Any]) -> int:
+        self._tile_lookup = tile_lookup
         self.prune_transient_segments()
         def _pattern_learnable(pattern: Tuple[Optional[str], ...], cell_pixels: Optional[np.ndarray] = None) -> bool:
             if not pattern or len(pattern) != 4 or None in pattern:

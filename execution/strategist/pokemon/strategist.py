@@ -1240,6 +1240,185 @@ class PokemonStrategist:
             "min_entered_dist": min_entered_dist if min_entered_dist is not None else 40,
         }
 
+    def _unvisited_pokemon_center_door_in_area(self) -> Optional[Dict[str, Any]]:
+        from execution.strategist.pokemon.global_map.routes import _snap, compress_moves, path_in_segment, walked_squares
+        from execution.strategist.pokemon.global_map.text import _obstacle_detour_info, project_route_next_leg, sector
+
+        gmap = self.global_map
+        if not gmap.current:
+            return None
+        cur_seg, (px, py) = gmap.resolve(gmap.segment, gmap.pos)
+        if gmap.info(cur_seg).kind == "building":
+            return None
+        if self._fought_since_heal <= 0 and self._fled_since_heal <= 0 and not self._is_party_hp_low():
+            return None
+        seg = gmap.segments[cur_seg]
+        if not seg:
+            return None
+        for d in gmap.reachable_door_list(cur_seg):
+            leads_to = d.get("leads_to")
+            if leads_to is not None:
+                lname = (gmap.info(gmap.resolve(leads_to, (0, 0))[0]).name or "").lower()
+                if "center" in lname and "mart" not in lname:
+                    return None
+        walked = walked_squares(gmap, cur_seg)
+        seg_blocked = self._current_segment_blocked_moves()
+        local = (
+            cell_kinds(
+                self._identified,
+                gmap.ledge_patterns,
+                gmap.walk_patterns,
+                self._screen_people(),
+                gmap.left_ledge_patterns,
+                self._local_blocked_cells(),
+                global_map=gmap,
+            )
+            if self._identified
+            else None
+        )
+        candidates: List[Dict[str, Any]] = []
+        for d in gmap.reachable_door_list(cur_seg):
+            if d.get("leads_to") is not None:
+                continue
+            cells = d.get("cells") or []
+            if not cells:
+                continue
+            is_pc = False
+            sign_rel = None
+            for dc in cells:
+                for ox in range(-3, 4):
+                    for oy in range(-1, 2):
+                        if (ox, oy) == (0, 0):
+                            continue
+                        nb = (dc[0] + ox, dc[1] + oy)
+                        c = seg.get(nb)
+                        if c is not None and "sign" in c.tags:
+                            label = (
+                                gmap.cell_facility_sign_label(cur_seg, nb)
+                                if hasattr(gmap, "cell_facility_sign_label")
+                                else None
+                            )
+                            if label == "Pokémon Center sign":
+                                is_pc = True
+                                sign_rel = (nb[0] - px, nb[1] - py)
+                                break
+                    if is_pc:
+                        break
+                if is_pc:
+                    break
+            if not is_pc:
+                continue
+            goal_cell = min(cells, key=lambda g: abs(g[0] - px) + abs(g[1] - py))
+            dx, dy = goal_cell[0] - px, goal_cell[1] - py
+            snapped = _snap(gmap, cur_seg, goal_cell, walked)
+            found = (
+                path_in_segment(gmap, cur_seg, (px, py), snapped, walked, blocked_moves=seg_blocked)
+                if snapped is not None
+                else None
+            )
+            path_moves = compress_moves(found[1]) if (found is not None and found[1]) else None
+            path_steps = len(found[1]) if found is not None else None
+            next_leg = (
+                project_route_next_leg(gmap, found[1], local_kinds=local, goal_rel=(dx, dy))
+                if (found is not None and found[1])
+                else None
+            )
+            detour_info = (
+                _obstacle_detour_info(gmap, goal_cell, local, blocked_moves=seg_blocked)
+                if path_moves is None
+                else None
+            )
+            candidates.append({
+                "dx": dx,
+                "dy": dy,
+                "steps": abs(dx) + abs(dy),
+                "sector": sector(dx, dy) if (dx or dy) else "here",
+                "cell": goal_cell,
+                "sign_rel": sign_rel,
+                "path_steps": path_steps,
+                "path_moves": path_moves,
+                "next_leg": next_leg,
+                "detour_info": detour_info,
+            })
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: (c["path_steps"] is None, c["path_steps"] or c["steps"], c["steps"]))
+        return candidates[0]
+
+    def _post_gym_defeat_unvisited_door_in_area(self) -> Optional[Dict[str, Any]]:
+        from execution.strategist.pokemon.global_map.routes import _snap, compress_moves, path_in_segment, walked_squares
+        from execution.strategist.pokemon.global_map.text import project_route_next_leg, sector
+
+        gmap = self.global_map
+        if not gmap.current or not self._healing_bag_empty:
+            return None
+        cur_seg, (px, py) = gmap.resolve(gmap.segment, gmap.pos)
+        if gmap.info(cur_seg).kind == "building":
+            return None
+        subtree = self.goals.frontier()
+        if subtree is None:
+            return None
+        desc_lower = (subtree.root.description or "").lower()
+        if not any(kw in desc_lower for kw in ("gym", "leader")):
+            return None
+        has_gym_defeat = any(
+            "gym" in (gmap.info(gmap.resolve(d["segment"], d["pos"])[0]).name or "").lower()
+            for d in getattr(gmap, "defeats", ())
+        )
+        if not has_gym_defeat:
+            return None
+        walked = walked_squares(gmap, cur_seg)
+        seg_blocked = self._current_segment_blocked_moves()
+        local = (
+            cell_kinds(
+                self._identified,
+                gmap.ledge_patterns,
+                gmap.walk_patterns,
+                self._screen_people(),
+                gmap.left_ledge_patterns,
+                self._local_blocked_cells(),
+                global_map=gmap,
+            )
+            if self._identified
+            else None
+        )
+        candidates: List[Dict[str, Any]] = []
+        for d in gmap.reachable_door_list(cur_seg):
+            if d.get("leads_to") is not None:
+                continue
+            cells = d.get("cells") or []
+            if not cells:
+                continue
+            goal_cell = min(cells, key=lambda g: abs(g[0] - px) + abs(g[1] - py))
+            dx, dy = goal_cell[0] - px, goal_cell[1] - py
+            snapped = _snap(gmap, cur_seg, goal_cell, walked)
+            found = (
+                path_in_segment(gmap, cur_seg, (px, py), snapped, walked, blocked_moves=seg_blocked)
+                if snapped is not None
+                else None
+            )
+            path_moves = compress_moves(found[1]) if (found is not None and found[1]) else None
+            path_steps = len(found[1]) if found is not None else None
+            next_leg = (
+                project_route_next_leg(gmap, found[1], local_kinds=local, goal_rel=(dx, dy))
+                if (found is not None and found[1])
+                else None
+            )
+            candidates.append({
+                "dx": dx,
+                "dy": dy,
+                "steps": abs(dx) + abs(dy),
+                "sector": sector(dx, dy) if (dx or dy) else "here",
+                "cell": goal_cell,
+                "path_steps": path_steps,
+                "path_moves": path_moves,
+                "next_leg": next_leg,
+            })
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: (c["path_steps"] is None, c["path_steps"] or c["steps"], c["steps"]))
+        return candidates[0]
+
     def _sync_excursion_goal(self, n: int) -> None:
         from execution.strategist.pokemon.global_map.text import frontier_targets
 
@@ -1264,6 +1443,132 @@ class PokemonStrategist:
             if d.get("leads_to") is not None and (d.get("cells") or [])
         ]
         min_entered_dist = min(entered_dists) if entered_dists else None
+
+        unvisited_pc = self._unvisited_pokemon_center_door_in_area()
+        if unvisited_pc is not None:
+            pc_dx, pc_dy = unvisited_pc["dx"], unvisited_pc["dy"]
+            pc_steps, pc_sec = unvisited_pc["steps"], unvisited_pc["sector"]
+            if unvisited_pc.get("path_moves"):
+                pc_route = f" (mapped route, {unvisited_pc['path_steps']} moves: {unvisited_pc['path_moves']})"
+            elif unvisited_pc.get("detour_info") and unvisited_pc["detour_info"].get("frontier_moves"):
+                di = unvisited_pc["detour_info"]
+                pc_route = (
+                    f" (nearest reachable unexplored edge toward this door is {di['frontier_rel']}, "
+                    f"mapped route, {di['frontier_steps']} moves: {di['frontier_moves']})"
+                )
+            else:
+                pc_route = ""
+            pc_desc = (
+                "Enter the unentered Pokémon Center doorway in this town, heal your party at the counter "
+                "to set the local respawn checkpoint, and exit back outside"
+            )
+            pc_details = (
+                f"The Pokémon Center doorway in this town is at relative ({pc_dx}, {pc_dy}) ({pc_steps} steps "
+                f"{pc_sec} from current position {cur_pos}, `NOT entered yet`){pc_route}. Walk to ({pc_dx}, {pc_dy}), "
+                f"enter the Pokémon Center, talk to the nurse at the counter to restore full HP/PP and register "
+                f"this town as your respawn checkpoint, and exit back outside before entering a Gym."
+            )
+            if subtree.root.source == "excursion" and "respawn checkpoint" in (subtree.root.description or ""):
+                if subtree.root.description != pc_desc or subtree.root.details != pc_details:
+                    self.goals.edit(
+                        path,
+                        description=pc_desc,
+                        details=pc_details,
+                        achievable_without_subgoals=n,
+                        episode_number=n,
+                    )
+                return
+            if "respawn checkpoint" not in (subtree.root.description or ""):
+                self.goals.add_under(
+                    path,
+                    GoalNode(
+                        description=pc_desc,
+                        details=pc_details,
+                        source="excursion",
+                        source_description="Unentered Pokémon Center discovered in town after battles without healing",
+                        achievable_without_subgoals=n,
+                        frontier_since=n,
+                    ),
+                    episode_number=n,
+                )
+                self.goals.edit(path, achievable_without_subgoals=None, episode_number=n)
+                new_frontier = self.goals.frontier()
+                if new_frontier is not None:
+                    new_path = self.goals.path_to(new_frontier)
+                    if new_path is not None:
+                        self.goals.set_frontier(new_path, n, episode_number=n)
+                return
+
+        if subtree.root.source == "excursion" and "respawn checkpoint" in (subtree.root.description or ""):
+            if self._fought_since_heal == 0 or unvisited_pc is None:
+                self.goals.set_status(
+                    path,
+                    "complete",
+                    "Healed at the town Pokémon Center and registered the local respawn checkpoint.",
+                    episode_number=n,
+                )
+                next_sub = self.goals.frontier()
+                if next_sub is not None:
+                    next_path = self.goals.path_to(next_sub)
+                    if next_path is not None:
+                        self.goals.set_frontier(next_path, n, episode_number=n)
+                subtree = self.goals.frontier()
+                if subtree is None:
+                    return
+                path = self.goals.path_to(subtree)
+                if path is None:
+                    return
+
+        post_defeat_door = self._post_gym_defeat_unvisited_door_in_area()
+        if post_defeat_door is not None:
+            sdx, sdy = post_defeat_door["dx"], post_defeat_door["dy"]
+            ssteps, ssec = post_defeat_door["steps"], post_defeat_door["sector"]
+            sroute = (
+                f" (mapped route, {post_defeat_door['path_steps']} moves: {post_defeat_door['path_moves']})"
+                if post_defeat_door.get("path_moves")
+                else ""
+            )
+            shop_desc = (
+                f"Enter the unentered town building doorway at ({sdx}, {sdy}) to explore the facility "
+                f"and restock Potions or supplies before re-challenging the Gym Leader"
+            )
+            shop_details = (
+                f"Your bag has 0 healing items (`healing_bag_empty`) after losing a Gym battle, and there is an "
+                f"unentered building doorway in this town at relative ({sdx}, {sdy}) ({ssteps} steps {ssec} from "
+                f"current position {cur_pos}, `NOT entered yet`){sroute}. Walk to and enter ({sdx}, {sdy}) to "
+                f"check if it is a Poké Mart or Department Store where you can buy Potions (or obtain an item/clue) "
+                f"before returning to the Gym."
+            )
+            if subtree.root.source == "excursion" and "restock Potions" in (subtree.root.description or ""):
+                if subtree.root.description != shop_desc or subtree.root.details != shop_details:
+                    self.goals.edit(
+                        path,
+                        description=shop_desc,
+                        details=shop_details,
+                        achievable_without_subgoals=n,
+                        episode_number=n,
+                    )
+                return
+            if "restock Potions" not in (subtree.root.description or ""):
+                self.goals.add_under(
+                    path,
+                    GoalNode(
+                        description=shop_desc,
+                        details=shop_details,
+                        source="excursion",
+                        source_description="Restock healing items or explore unvisited town buildings after Gym defeat with empty bag",
+                        achievable_without_subgoals=n,
+                        frontier_since=n,
+                    ),
+                    episode_number=n,
+                )
+                self.goals.edit(path, achievable_without_subgoals=None, episode_number=n)
+                new_frontier = self.goals.frontier()
+                if new_frontier is not None:
+                    new_path = self.goals.path_to(new_frontier)
+                    if new_path is not None:
+                        self.goals.set_frontier(new_path, n, episode_number=n)
+                return
 
         terminus = self._route_terminus_unentered_door()
         if subtree.root.source == "excursion" and terminus is None:
@@ -1404,8 +1709,46 @@ class PokemonStrategist:
                 self.global_map,
                 self._current_segment_blocked_moves(),
             )
+        unvisited_pc = self._unvisited_pokemon_center_door_in_area()
+        if unvisited_pc is not None:
+            pdx, pdy = unvisited_pc["dx"], unvisited_pc["dy"]
+            if unvisited_pc.get("path_moves"):
+                p_route = f" (mapped route, {unvisited_pc['path_steps']} moves: {unvisited_pc['path_moves']})"
+            elif unvisited_pc.get("detour_info") and unvisited_pc["detour_info"].get("frontier_moves"):
+                di = unvisited_pc["detour_info"]
+                p_route = (
+                    f" (nearest reachable unexplored edge toward this door is {di['frontier_rel']}, "
+                    f"mapped route, {di['frontier_steps']} moves: {di['frontier_moves']})"
+                )
+            else:
+                p_route = ""
+            pc_note = (
+                f"- Mandatory Pokémon Center checkpoint priority: The Pokémon Center doorway in this town at "
+                f"({pdx}, {pdy}) ({unvisited_pc['steps']} steps {unvisited_pc['sector']}){p_route} is `NOT entered yet`, "
+                f"and you have fought {self._fought_since_heal} battle(s) and fled {self._fled_since_heal} since your "
+                f"last heal. Walk to ({pdx}, {pdy}), enter the Pokémon Center, heal with the nurse to restore full "
+                f"HP/PP and register this town as your respawn checkpoint, and exit back outside BEFORE entering "
+                f"any Gym."
+            )
+            notepad_text = f"{notepad_text}\n{pc_note}".strip() if notepad_text else pc_note
+        else:
+            post_defeat_door = self._post_gym_defeat_unvisited_door_in_area()
+            if post_defeat_door is not None:
+                sdx, sdy = post_defeat_door["dx"], post_defeat_door["dy"]
+                s_route = (
+                    f" (mapped route, {post_defeat_door['path_steps']} moves: {post_defeat_door['path_moves']})"
+                    if post_defeat_door.get("path_moves")
+                    else ""
+                )
+                shop_note = (
+                    f"- Post-defeat preparation priority: Your bag has 0 healing items (`healing_bag_empty`) after "
+                    f"losing in the Gym, and the building doorway at ({sdx}, {sdy}) ({post_defeat_door['steps']} steps "
+                    f"{post_defeat_door['sector']}){s_route} is `NOT entered yet`. Walk to and enter ({sdx}, {sdy}) "
+                    f"to explore the building and buy Potions or obtain supplies BEFORE returning to the Gym."
+                )
+                notepad_text = f"{notepad_text}\n{shop_note}".strip() if notepad_text else shop_note
         terminus = self._route_terminus_unentered_door()
-        if terminus is not None and not self._is_party_hp_low():
+        if unvisited_pc is None and terminus is not None and not self._is_party_hp_low():
             tdx, tdy = terminus["dx"], terminus["dy"]
             t_note = (
                 f"- Route terminus priority: You are currently {terminus['steps']} steps {terminus['sector']} "
@@ -1434,7 +1777,6 @@ class PokemonStrategist:
         status = self.global_map.on_step(frame, self._identified if free else {}, free)
         self._consolidate()
         self.global_map.mark_explored(self.start_episode + self._episodes_run)
-        # People are read off the screen only where the map placed it; otherwise they are told as remembered.
         self._map_placed = status in PLACED_STATUS
         self._people_where = ("here" if self._map_placed
                               else "held" if not free and not self.global_map.faded else "away")
@@ -2052,6 +2394,7 @@ class PokemonStrategist:
                 explore=self._explore_context_block(),
                 knowledge_block=self._knowledge_context_block(),
                 has_unentered_terminus_door=(self._route_terminus_unentered_door() is not None),
+                has_unvisited_pokecenter_in_area=(self._unvisited_pokemon_center_door_in_area() is not None),
             )
             self._sync_excursion_goal(n)
         summary, town = self._review(report.digest, fallback_summary=supervisor_summary)
