@@ -266,7 +266,7 @@ class PokemonPlayThroughSupervisor(Supervisor):
 
     def _effective_state(self, frame=None, raw_state=None) -> AgentState:
         raw = self._agent_state() if raw_state is None else raw_state
-        if raw in (AgentState.IN_MENU, AgentState.FREE_ROAM):
+        if raw in (AgentState.IN_MENU, AgentState.FREE_ROAM, AgentState.IN_DIALOGUE):
             frame = self._current_frame() if frame is None else frame
             eff = effective_agent_state(raw, frame)
             if raw == AgentState.IN_MENU and eff == AgentState.IN_BATTLE and is_overworld_menu_or_ui_screen(frame):

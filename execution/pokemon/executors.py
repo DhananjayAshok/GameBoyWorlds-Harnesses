@@ -2333,6 +2333,13 @@ def effective_agent_state(raw_state: AgentState, frame: np.ndarray) -> AgentStat
                 return AgentState.IN_DIALOGUE
             if is_false_overworld_menu_state(frame):
                 return AgentState.FREE_ROAM
+    elif raw_state == AgentState.IN_DIALOGUE:
+        if (
+            (is_overworld_menu_or_ui_screen(frame) or is_tm_hm_startup_dialogue_frame(frame))
+            and not is_battle_screen(frame)
+            and not (has_top_dialogue_box(frame) and not has_menu_cursor(frame))
+        ):
+            return AgentState.IN_MENU
     elif raw_state == AgentState.FREE_ROAM:
         if (has_bottom_dialogue_box(frame)
                 or has_modal_preview_box(frame)
@@ -5019,6 +5026,214 @@ Press: <one of up, down, left, right, confirm, back>
             )
         )
 
+    NON_DAMAGING_REPLACEABLE_MOVES = (
+        "GROWL",
+        "LEER",
+        "TAIL WHIP",
+        "STRING SHOT",
+        "DEFENSE CURL",
+        "HARDEN",
+        "WITHDRAW",
+        "SPLASH",
+        "TELEPORT",
+        "SAND-ATTACK",
+        "SAND ATTACK",
+        "SMOKESCREEN",
+        "SMOKESCR",
+        "KINESIS",
+        "FLASH",
+        "SWEET SCENT",
+        "ROAR",
+        "WHIRLWIND",
+    )
+    WEAK_EARLY_NORMAL_MOVES = (
+        "TACKLE",
+        "SCRATCH",
+        "POUND",
+    )
+    PROTECTED_HM_MOVES = (
+        "CUT",
+        "FLY",
+        "SURF",
+        "STRENGTH",
+        "WATERFALL",
+        "WHIRLPOOL",
+    )
+
+    def _select_move_to_forget(self, moves: List[str]) -> Optional[Tuple[int, str]]:
+        if not moves:
+            return None
+        up_task = (self._task or "").upper()
+        keep_clause_moves = set()
+        for m_keep in re.finditer(
+            r"\b(?:KEEP|KEEPING|DO\s+NOT\s+(?:FORGET|OVERWRITE|REPLACE|DELETE)|NOT\s+(?:FORGET|OVERWRITE|REPLACE|DELETE))\b([^.;()]*)",
+            up_task,
+        ):
+            seg = m_keep.group(1)
+            for mv in moves:
+                if mv and len(mv) >= 3 and re.search(r"\b" + re.escape(mv) + r"\b", seg):
+                    keep_clause_moves.add(mv)
+        replace_clause_moves: List[Tuple[int, str]] = []
+        for m_rep in re.finditer(
+            r"\b(?:REPLACE|REPLACING|OVERWRITE|OVERWRITING|FORGET|FORGETTING|DELETE|DELETING)\b([^.;]*)",
+            up_task,
+        ):
+            seg = m_rep.group(1)
+            for idx, mv in enumerate(moves):
+                if (
+                    mv
+                    and len(mv) >= 3
+                    and mv not in keep_clause_moves
+                    and re.search(r"\b" + re.escape(mv) + r"\b", seg)
+                ):
+                    replace_clause_moves.append((idx, mv))
+        if replace_clause_moves:
+            return replace_clause_moves[0]
+        for idx, mv in enumerate(moves):
+            if mv in self.NON_DAMAGING_REPLACEABLE_MOVES and mv not in keep_clause_moves:
+                return (idx, mv)
+        for idx, mv in enumerate(moves):
+            if (
+                mv
+                and len(mv) >= 3
+                and mv not in keep_clause_moves
+                and mv not in self.PROTECTED_HM_MOVES
+                and re.search(r"\b" + re.escape(mv) + r"\b", up_task)
+            ):
+                return (idx, mv)
+        for idx, mv in enumerate(moves):
+            if mv in self.WEAK_EARLY_NORMAL_MOVES and mv not in keep_clause_moves:
+                return (idx, mv)
+        for idx, mv in enumerate(moves):
+            if mv not in self.PROTECTED_HM_MOVES and mv not in keep_clause_moves:
+                return (idx, mv)
+        return (0, moves[0])
+
+    def _auto_forget_move_on_list(self) -> Optional[str]:
+        cur_frame = self._get_state()["core"]["current_frame"]
+        forget_info = read_party_move_forget_list(cur_frame)
+        if forget_info is None:
+            return None
+        moves, _ = forget_info
+        chosen = self._select_move_to_forget(moves)
+        if chosen is None:
+            return None
+        target_idx, target_move = chosen
+        if self._current_call is None:
+            self._begin_scripted(f"select move {target_move} to forget")
+        for _ in range(6):
+            if self._last_terminated or self._last_truncated:
+                return None
+            cur_frame = self._get_state()["core"]["current_frame"]
+            cur_info = read_party_move_forget_list(cur_frame)
+            if cur_info is None:
+                break
+            cur_moves, cur_hi = cur_info
+            if cur_hi == target_move:
+                break
+            if cur_hi in cur_moves and target_move in cur_moves:
+                cur_i = cur_moves.index(cur_hi)
+                tgt_i = cur_moves.index(target_move)
+                step_dir = "down" if tgt_i > cur_i else "up"
+            elif target_idx > 0:
+                step_dir = "down"
+            else:
+                break
+            rec = self._take_action(MenuAction, menu_action=step_dir)
+            drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
+        if self._last_terminated or self._last_truncated:
+            return None
+        confirm_rec = self._take_action(MenuAction, menu_action="confirm")
+        drop_prefix_crops(captured_dialogue_crops([confirm_rec]), self.dialogue_crops)
+        self._scan_move_learning_frame(confirm_rec.frame_before)
+        self._scan_move_learning_frame(confirm_rec.frame_after)
+        return target_move
+
+    def _advance_party_move_learning_and_forget(
+        self,
+        pokemon_name: str,
+        tm_label: Optional[str] = None,
+    ) -> Optional[str]:
+        forgotten_move: Optional[str] = None
+        for _ in range(36):
+            if self._last_terminated or self._last_truncated:
+                return forgotten_move
+            cur_frame = self._get_state()["core"]["current_frame"]
+            self._scan_move_learning_frame(cur_frame)
+            if (
+                is_tm_hm_pack_pocket(cur_frame)
+                or is_gen1_item_list_screen(cur_frame)
+                or is_start_menu_screen(cur_frame)
+                or self._effective_menu_state(cur_frame) != AgentState.IN_MENU
+            ):
+                break
+            forget_info = read_party_move_forget_list(cur_frame)
+            if forget_info is not None:
+                _, cur_hi = forget_info
+                if cur_hi is None:
+                    wait_rec = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                    continue
+                forgot = self._auto_forget_move_on_list()
+                if forgot:
+                    forgotten_move = forgot
+                continue
+            if is_party_menu_screen(cur_frame) and has_party_subbox(cur_frame):
+                d_l1, d_l2 = read_dialogue_box_lines(cur_frame)
+                d_low = f"{d_l1} {d_l2}".lower()
+                if not has_menu_cursor(cur_frame):
+                    wait_rec = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                    continue
+                if "stop " in d_low or "abandon " in d_low or "give up" in d_low:
+                    no_rec = self._take_action(MenuAction, menu_action="back")
+                    drop_prefix_crops(captured_dialogue_crops([no_rec]), self.dialogue_crops)
+                    continue
+                yes_rec = self._take_action(MenuAction, menu_action="confirm")
+                drop_prefix_crops(captured_dialogue_crops([yes_rec]), self.dialogue_crops)
+                continue
+            if is_party_menu_selection_screen(cur_frame) and not has_bottom_dialogue_box(cur_frame):
+                break
+            if not has_bottom_dialogue_box(cur_frame) and not is_party_menu_screen(cur_frame):
+                wait_rec = self._take_action(WaitAction)
+                drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                continue
+            adv_rec = self._take_action(MenuAction, menu_action="confirm")
+            drop_prefix_crops(captured_dialogue_crops([adv_rec]), self.dialogue_crops)
+            self._scan_move_learning_frame(adv_rec.frame_before)
+            self._scan_move_learning_frame(adv_rec.frame_after)
+            if is_same_battle_frame(adv_rec.frame_before, adv_rec.frame_after):
+                wait_rec = self._take_action(WaitAction)
+                drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
+                self._scan_move_learning_frame(wait_rec.frame_after)
+        cur_after = self._get_state()["core"]["current_frame"]
+        self._scan_move_learning_frame(cur_after)
+        if (
+            self._last_move_teaching_outcome is not None
+            and self._last_move_teaching_outcome[0] in ("learned", "knows")
+        ) or (
+            forgotten_move is not None
+            and not is_party_menu_screen(cur_after)
+        ):
+            self._completed_tm_hm_party_attempt = True
+            if forgotten_move and self._party_state is not None:
+                self._party_state.record_forgotten_move(forgotten_move, pokemon_name)
+            if tm_label:
+                clean_tm = re.sub(r"\s*\(X\d+\)\s*$", "", tm_label.strip().upper())
+                if clean_tm.startswith("TM"):
+                    self._consume_confirmed_bag_item(clean_tm)
+                if (
+                    self._party_state is not None
+                    and not self._party_state.learned_move_since_defeat
+                    and (
+                        self._last_move_teaching_outcome is None
+                        or self._last_move_teaching_outcome[0] not in ("learned", "knows")
+                    )
+                ):
+                    self._party_state.record_learned_move(clean_tm, pokemon_name)
+                    self._last_move_teaching_outcome = ("learned", pokemon_name, clean_tm)
+        return forgotten_move
+
     def _match_tm_hm_target_row(self, rows: Optional[List[str]]) -> Optional[Tuple[int, str]]:
         if not rows or not self._task:
             return None
@@ -5026,20 +5241,39 @@ Press: <one of up, down, left, right, confirm, back>
         target_codes = set()
         for m in re.finditer(r"\bHM\s*0?(\d)\b", up_task):
             target_codes.add(f"H{m.group(1)}")
+            target_codes.add(f"HM0{m.group(1)}")
+            target_codes.add(f"HM{m.group(1)}")
         for m in re.finditer(r"\bH(\d)\b", up_task):
             target_codes.add(f"H{m.group(1)}")
+            target_codes.add(f"HM0{m.group(1)}")
         for m in re.finditer(r"\bTM\s*(\d{2})\b", up_task):
             target_codes.add(m.group(1))
+            target_codes.add(f"TM{m.group(1)}")
+        tried_tms = (
+            set(self._party_state.tried_or_incompatible_tms)
+            if self._party_state is not None
+            else set()
+        )
         for idx, row in enumerate(rows):
             if row == "CANCEL":
                 continue
             clean = re.sub(r"\s*\(X\d+\)\s*$", "", row.strip().upper())
+            if clean in tried_tms or clean in self._confirmed_bag_items:
+                continue
             parts = clean.split(None, 1)
             code = parts[0] if parts else ""
             move_name = parts[1] if len(parts) > 1 else clean
-            if code in target_codes:
+            if code in target_codes or clean in target_codes:
                 return (idx, clean)
             if len(move_name) >= 3 and re.search(r"\b" + re.escape(move_name) + r"\b", up_task):
+                return (idx, clean)
+        for idx, row in enumerate(rows):
+            if row == "CANCEL":
+                continue
+            clean = re.sub(r"\s*\(X\d+\)\s*$", "", row.strip().upper())
+            if clean in tried_tms or clean in self._confirmed_bag_items:
+                continue
+            if is_tm_hm_item_name(clean):
                 return (idx, clean)
         return None
 
@@ -5051,6 +5285,9 @@ Press: <one of up, down, left, right, confirm, back>
                 return False
             cur_frame = self._get_state()["core"]["current_frame"]
             if is_party_menu_screen(cur_frame):
+                if not is_party_menu_selection_screen(cur_frame):
+                    wait_rec = self._take_action(WaitAction)
+                    drop_prefix_crops(captured_dialogue_crops([wait_rec]), self.dialogue_crops)
                 return True
             if self._effective_menu_state(cur_frame) != AgentState.IN_MENU:
                 break
@@ -5067,9 +5304,9 @@ Press: <one of up, down, left, right, confirm, back>
             drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
         return is_party_menu_screen(self._get_state()["core"]["current_frame"])
 
-    def _auto_select_able_party_member_and_advance(self) -> Optional[str]:
+    def _auto_select_able_party_member_and_advance(self, tm_label: Optional[str] = None) -> Optional[str]:
         cur_frame = self._get_state()["core"]["current_frame"]
-        if not is_party_menu_selection_screen(cur_frame) or has_party_subbox(cur_frame):
+        if not is_party_menu_screen(cur_frame) or has_party_subbox(cur_frame):
             return None
         compat_list = read_party_menu_compatibility(cur_frame)
         if not compat_list:
@@ -5096,7 +5333,7 @@ Press: <one of up, down, left, right, confirm, back>
             if self._last_terminated or self._last_truncated:
                 return None
             cur_frame = self._get_state()["core"]["current_frame"]
-            if not is_party_menu_selection_screen(cur_frame) or has_party_subbox(cur_frame):
+            if not is_party_menu_screen(cur_frame) or has_party_subbox(cur_frame):
                 return None
             cursor_slot = read_party_menu_cursor_slot(cur_frame)
             if cursor_slot is None or cursor_slot == target_slot:
@@ -5106,33 +5343,74 @@ Press: <one of up, down, left, right, confirm, back>
             drop_prefix_crops(captured_dialogue_crops([rec]), self.dialogue_crops)
         if self._last_terminated or self._last_truncated:
             return None
-        before_confirm = self._get_state()["core"]["current_frame"]
         confirm_rec = self._take_action(MenuAction, menu_action="confirm")
         drop_prefix_crops(captured_dialogue_crops([confirm_rec]), self.dialogue_crops)
         if self._last_terminated or self._last_truncated:
             return target_name
-        after_confirm = self._get_state()["core"]["current_frame"]
-        if self._should_settle_menu_dialogue(before_confirm, after_confirm, "confirm"):
-            self._settle_menu_dialogue()
-            if self._last_terminated or self._last_truncated:
-                return target_name
-        cur_frame = self._get_state()["core"]["current_frame"]
-        if (
-            self._task_wants_move_teaching()
-            and is_party_menu_screen(cur_frame)
-            and has_party_subbox(cur_frame)
-            and read_party_move_forget_list(cur_frame) is None
-        ):
-            d_l1, _ = read_dialogue_box_lines(cur_frame)
-            if not (d_l1.lower().startswith("stop ") or d_l1.lower().startswith("abandon ")):
-                yes_before = cur_frame
-                yes_rec = self._take_action(MenuAction, menu_action="confirm")
-                drop_prefix_crops(captured_dialogue_crops([yes_rec]), self.dialogue_crops)
-                if not (self._last_terminated or self._last_truncated):
-                    yes_after = self._get_state()["core"]["current_frame"]
-                    if self._should_settle_menu_dialogue(yes_before, yes_after, "confirm"):
-                        self._settle_menu_dialogue()
+        if self._task_wants_move_teaching():
+            self._advance_party_move_learning_and_forget(
+                target_name,
+                tm_label=tm_label or self._active_menu_item or self._pending_bag_item,
+            )
+        else:
+            after_confirm = self._get_state()["core"]["current_frame"]
+            if self._should_settle_menu_dialogue(cur_frame, after_confirm, "confirm"):
+                self._settle_menu_dialogue()
         return target_name
+
+    def _handle_tm_hm_party_screen(self, target_label: str) -> bool:
+        cur_party_fr = self._get_state()["core"]["current_frame"]
+        compat_list = read_party_menu_compatibility(cur_party_fr)
+        able_slots = [(idx, name) for idx, name, st in compat_list if st == "ABLE"]
+        learned_slots = [(idx, name) for idx, name, st in compat_list if st == "LEARNED"]
+        if able_slots:
+            chosen_poke = self._auto_select_able_party_member_and_advance(tm_label=target_label)
+            if self._last_terminated or self._last_truncated:
+                return True
+            if chosen_poke:
+                cur_after = self._get_state()["core"]["current_frame"]
+                self._scan_move_learning_frame(cur_after)
+                if read_party_move_forget_list(cur_after) is not None:
+                    self.press_outcomes[-1] = (
+                        f"confirm (selected {target_label}, confirmed USE and YES, selected {chosen_poke}, and confirmed YES to delete an older move — choose which move to forget)"
+                    )
+                else:
+                    self.press_outcomes[-1] = (
+                        f"confirm (selected {target_label}, confirmed USE and YES, and taught the move to {chosen_poke})"
+                    )
+                return True
+            self.press_outcomes[-1] = (
+                f"confirm (selected {target_label} and confirmed USE and YES to open the party selection screen)"
+            )
+            return True
+        if compat_list and not able_slots:
+            clean_tm = re.sub(r"\s*\(X\d+\)\s*$", "", (target_label or "").strip().upper())
+            if learned_slots:
+                _, l_poke = learned_slots[0]
+                if self._party_state is not None and clean_tm:
+                    self._party_state.record_tried_or_incompatible_tm(clean_tm)
+                back_rec = self._take_action(MenuAction, menu_action="back")
+                drop_prefix_crops(captured_dialogue_crops([back_rec]), self.dialogue_crops)
+                self._completed_tm_hm_party_attempt = True
+                self.press_outcomes[-1] = (
+                    f"confirm (opened party screen: {l_poke} already knows {clean_tm}; backed out to item menu)"
+                )
+            else:
+                if self._party_state is not None and clean_tm:
+                    self._party_state.record_tried_or_incompatible_tm(clean_tm)
+                self._last_incompatible_tm = clean_tm
+                back_rec = self._take_action(MenuAction, menu_action="back")
+                drop_prefix_crops(captured_dialogue_crops([back_rec]), self.dialogue_crops)
+                remaining_matched = self._match_tm_hm_target_row(self._seen_bag_items)
+                if remaining_matched is None:
+                    self._completed_tm_hm_party_attempt = True
+                else:
+                    self._tm_hm_scrolled_in_opening = False
+                self.press_outcomes[-1] = (
+                    f"confirm (opened party screen: all party Pokemon are NOT ABLE to learn {clean_tm}; backed out to item menu)"
+                )
+            return False
+        return True
 
     def _auto_navigate_tm_hm_pocket_and_party(self) -> None:
         if (
@@ -5142,6 +5420,16 @@ Press: <one of up, down, left, right, confirm, back>
         ):
             return
         frame = self._get_state()["core"]["current_frame"]
+        if is_party_menu_screen(frame):
+            if read_party_move_forget_list(frame) is not None or has_party_subbox(frame):
+                self._advance_party_move_learning_and_forget(
+                    "party Pokemon",
+                    tm_label=self._active_menu_item or self._pending_bag_item,
+                )
+                return
+            if is_party_menu_selection_screen(frame):
+                self._handle_tm_hm_party_screen(self._active_menu_item or self._pending_bag_item or "TM")
+                return
         if (
             is_pack_screen(frame)
             and not is_tm_hm_pack_pocket(frame)
@@ -5203,21 +5491,95 @@ Press: <one of up, down, left, right, confirm, back>
                     if self._advance_tm_hm_use_to_party_screen():
                         if self._last_terminated or self._last_truncated:
                             return
-                        chosen_poke = self._auto_select_able_party_member_and_advance()
-                        if chosen_poke:
-                            cur_after = self._get_state()["core"]["current_frame"]
-                            if read_party_move_forget_list(cur_after) is not None:
-                                self.press_outcomes[-1] = (
-                                    f"confirm (selected {target_label}, confirmed USE and YES, selected {chosen_poke}, and confirmed YES to delete an older move — choose which move to forget)"
-                                )
-                            else:
-                                self.press_outcomes[-1] = (
-                                    f"confirm (selected {target_label}, confirmed USE and YES, and taught the move to {chosen_poke})"
-                                )
-                        else:
-                            self.press_outcomes[-1] = (
-                                f"confirm (selected {target_label} and confirmed USE and YES to open the party selection screen)"
-                            )
+                        self._handle_tm_hm_party_screen(target_label)
+            return
+        for _ in range(3):
+            if self._last_terminated or self._last_truncated or self._completed_tm_hm_party_attempt:
+                return
+            frame = self._get_state()["core"]["current_frame"]
+            if not is_gen1_item_list_screen(frame) or self._tm_hm_scrolled_in_opening:
+                break
+            info = self._scan_bag_frame(frame)
+            if info is None:
+                break
+            vis_items, has_more = info
+            matched_vis = self._match_tm_hm_target_row(vis_items)
+            matched_all = self._match_tm_hm_target_row(self._seen_bag_items)
+            if matched_vis is None and matched_all is None and not has_more:
+                break
+            if self._current_call is None:
+                self._begin_scripted("select TM/HM item in ITEM list")
+            self._tm_hm_scrolled_in_opening = True
+            target_label: Optional[str] = None
+            for _ in range(16):
+                if self._last_terminated or self._last_truncated:
+                    return
+                cur_frame = self._get_state()["core"]["current_frame"]
+                cur_info = self._scan_bag_frame(cur_frame)
+                if cur_info is None:
+                    break
+                cur_vis, cur_more = cur_info
+                cur_row = read_bag_cursor_row(cur_frame, tracked_index=self._bag_cursor_idx)
+                m_vis = self._match_tm_hm_target_row(cur_vis)
+                if m_vis is not None:
+                    _, tgt = m_vis
+                    if cur_row == tgt:
+                        target_label = tgt
+                        break
+                    if cur_row == "CANCEL":
+                        step_dir = "up"
+                    elif cur_row in cur_vis:
+                        step_dir = "down" if cur_vis.index(tgt) > cur_vis.index(cur_row) else "up"
+                    else:
+                        step_dir = "down" if cur_more else "up"
+                else:
+                    m_seen = self._match_tm_hm_target_row(self._seen_bag_items)
+                    if m_seen is not None and cur_vis and cur_vis[0] in self._seen_bag_items:
+                        _, tgt = m_seen
+                        step_dir = (
+                            "up"
+                            if self._seen_bag_items.index(tgt) < self._seen_bag_items.index(cur_vis[0])
+                            else "down"
+                        )
+                    elif cur_more and not self._saw_bag_bottom:
+                        step_dir = "down"
+                    else:
+                        break
+                self._bag_scrolled_in_opening = True
+                n_vis = len(cur_vis)
+                max_idx = n_vis if not cur_more else max(0, n_vis - 1)
+                if self._bag_cursor_idx is not None:
+                    if step_dir == "down":
+                        self._bag_cursor_idx = min(max_idx, self._bag_cursor_idx + 1)
+                    elif step_dir == "up":
+                        self._bag_cursor_idx = max(0, self._bag_cursor_idx - 1)
+                step_rec = self._take_action(MenuAction, menu_action=step_dir)
+                drop_prefix_crops(captured_dialogue_crops([step_rec]), self.dialogue_crops)
+                self.presses.append(step_dir)
+                self.press_outcomes.append(step_dir)
+            if self._last_terminated or self._last_truncated or not target_label:
+                return
+            self._active_menu_item = target_label
+            self._pending_bag_item = target_label
+            sel_rec = self._take_action(MenuAction, menu_action="confirm")
+            drop_prefix_crops(captured_dialogue_crops([sel_rec]), self.dialogue_crops)
+            self.presses.append("confirm")
+            self.press_outcomes.append(f"confirm (selected {target_label})")
+            if self._last_terminated or self._last_truncated:
+                return
+            after_sel = self._get_state()["core"]["current_frame"]
+            if is_item_use_subbox_screen(after_sel):
+                use_rec = self._take_action(MenuAction, menu_action="confirm")
+                drop_prefix_crops(captured_dialogue_crops([use_rec]), self.dialogue_crops)
+                if self._last_terminated or self._last_truncated:
+                    return
+                if self._advance_tm_hm_use_to_party_screen():
+                    if self._last_terminated or self._last_truncated:
+                        return
+                    if self._handle_tm_hm_party_screen(target_label):
+                        break
+                    continue
+            break
 
     def _auto_scroll_bag_for_status_item(self) -> None:
         frame = self._get_state()["core"]["current_frame"]
@@ -5865,58 +6227,12 @@ Press: <one of up, down, left, right, confirm, back>
                 if self._last_truncated:
                     return self._finish(MENU_TRUNCATED, "truncated")
                 if reached_party:
-                    cur_party_fr = self._get_state()["core"]["current_frame"]
-                    compat_list = read_party_menu_compatibility(cur_party_fr)
-                    able_slots = [(idx, name) for idx, name, st in compat_list if st == "ABLE"]
-                    learned_slots = [(idx, name) for idx, name, st in compat_list if st == "LEARNED"]
-                    if able_slots:
-                        chosen_poke = self._auto_select_able_party_member_and_advance()
-                        if self._last_terminated:
-                            return self._finish(MENU_TERMINATED, "terminated")
-                        if self._last_truncated:
-                            return self._finish(MENU_TRUNCATED, "truncated")
-                        if chosen_poke:
-                            cur_after_tm = self._get_state()["core"]["current_frame"]
-                            self._scan_move_learning_frame(cur_after_tm)
-                            if read_party_move_forget_list(cur_after_tm) is not None:
-                                self.press_outcomes[-1] = (
-                                    f"confirm (confirmed USE and YES, selected {chosen_poke}, and confirmed YES to delete an older move — choose which move to forget)"
-                                )
-                            else:
-                                self.press_outcomes[-1] = (
-                                    f"confirm (confirmed USE and YES, and taught the move to {chosen_poke})"
-                                )
-                        else:
-                            self.press_outcomes[-1] = (
-                                "confirm (confirmed USE and YES to open the party selection screen — "
-                                "select an ABLE party Pokemon with confirm to teach the move)"
-                            )
-                    elif compat_list and not able_slots:
-                        tm_code = self._active_menu_item or self._pending_bag_item or ""
-                        if learned_slots:
-                            _, l_poke = learned_slots[0]
-                            if self._party_state is not None and tm_code:
-                                self._party_state.record_tried_or_incompatible_tm(tm_code)
-                            back_rec = self._take_action(MenuAction, menu_action="back")
-                            drop_prefix_crops(captured_dialogue_crops([back_rec]), self.dialogue_crops)
-                            self._completed_tm_hm_party_attempt = True
-                            self.press_outcomes[-1] = (
-                                f"confirm (opened party screen: {l_poke} already knows {tm_code}; backed out to item menu)"
-                            )
-                        else:
-                            if self._party_state is not None and tm_code:
-                                self._party_state.record_tried_or_incompatible_tm(tm_code)
-                            self._last_incompatible_tm = tm_code
-                            back_rec = self._take_action(MenuAction, menu_action="back")
-                            drop_prefix_crops(captured_dialogue_crops([back_rec]), self.dialogue_crops)
-                            if not any(
-                                self._bag_target_matches(it) and it != tm_code
-                                for it in self._seen_bag_items
-                            ):
-                                self._completed_tm_hm_party_attempt = True
-                            self.press_outcomes[-1] = (
-                                f"confirm (opened party screen: all party Pokemon are NOT ABLE to learn {tm_code}; backed out to item menu)"
-                            )
+                    tm_code = self._active_menu_item or self._pending_bag_item or "TM"
+                    self._handle_tm_hm_party_screen(tm_code)
+                    if self._last_terminated:
+                        return self._finish(MENU_TERMINATED, "terminated")
+                    if self._last_truncated:
+                        return self._finish(MENU_TRUNCATED, "truncated")
             after_frame = self._get_state()["core"]["current_frame"]
             if press == "back" and is_start_menu_screen(after_frame) and not has_menu_cursor(after_frame):
                 for _ in range(2):

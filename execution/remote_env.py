@@ -131,7 +131,12 @@ class RemoteEnvironment:
             raise
 
     def _absorb(self, out: dict, *, frame_changed: bool) -> None:
-        from execution.perception.pokemon.battle import is_false_overworld_menu_state
+        from execution.perception.pokemon.battle import (
+            is_battle_screen,
+            is_false_overworld_menu_state,
+            is_overworld_menu_or_ui_screen,
+            is_tm_hm_startup_dialogue_frame,
+        )
 
         obs = out["obs"]
         signals = obs.get("signals") or {}
@@ -143,11 +148,19 @@ class RemoteEnvironment:
                        if key in LAST_ACTION_FIELDS}
         current_frame = to_frame(obs["frame"])
         raw_state = AgentState[signals["agent_state"]]
-        agent_state = (
-            AgentState.FREE_ROAM
-            if raw_state == AgentState.IN_MENU and is_false_overworld_menu_state(current_frame)
-            else raw_state
-        )
+        if raw_state == AgentState.IN_MENU and is_false_overworld_menu_state(current_frame):
+            agent_state = AgentState.FREE_ROAM
+        elif (
+            raw_state == AgentState.IN_DIALOGUE
+            and (
+                is_overworld_menu_or_ui_screen(current_frame)
+                or is_tm_hm_startup_dialogue_frame(current_frame)
+            )
+            and not is_battle_screen(current_frame)
+        ):
+            agent_state = AgentState.IN_MENU
+        else:
+            agent_state = raw_state
         self._info = {"core": {**last_action, "current_frame": current_frame,
                                "frame_changed": frame_changed},
                       "pokemon_core": {"agent_state": agent_state,
@@ -293,6 +306,7 @@ class RemoteEnvironment:
         is_move = action is MoveStepsAction or (isinstance(action, type) and issubclass(action, MoveStepsAction))
         is_interact = action is InteractAction or (isinstance(action, type) and issubclass(action, InteractAction))
         is_open_menu = action is OpenMenuAction or (isinstance(action, type) and issubclass(action, OpenMenuAction))
+        is_menu = action is MenuAction or (isinstance(action, type) and issubclass(action, MenuAction))
         p_core = getattr(self, "_info", {}).get("pokemon_core", {})
         in_false_menu = (
             p_core.get("raw_agent_state") == AgentState.IN_MENU
@@ -319,7 +333,14 @@ class RemoteEnvironment:
             return self.get_observation(), 0.0, terminated, self.done and not terminated, info
 
         out = self._session.step(format_action(action, kwargs))
-        if not out.get("valid") and p_core.get("agent_state") == AgentState.FREE_ROAM:
+        if not out.get("valid") and is_menu:
+            menu_opt = str(kwargs.get("menu_action") or "").strip().lower()
+            menu_btn = {"confirm": "a", "back": "b", "up": "up", "down": "down", "left": "left", "right": "right"}.get(menu_opt)
+            if menu_btn is not None:
+                out = self._session.step(f"button({menu_btn})")
+                if out.get("valid"):
+                    out["obs"]["action_success"] = 0
+        elif not out.get("valid") and p_core.get("agent_state") == AgentState.FREE_ROAM:
             if is_move:
                 direction = kwargs.get("direction", "up")
                 steps = int(kwargs.get("steps") or 1)

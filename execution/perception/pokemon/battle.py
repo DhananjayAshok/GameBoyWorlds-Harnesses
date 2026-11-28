@@ -781,7 +781,20 @@ def is_party_menu_screen(frame: np.ndarray) -> bool:
         return True
     if (
         len(read_tile_text(img, 0, 3, 13)) >= 2
-        and any(is_party_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]) for ty in (1, 3, 5, 7, 9, 11))
+        and (
+            any(is_party_cursor_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 0:TILE_SIZE]) for ty in (1, 3, 5, 7, 9, 11))
+            or _read_hud_level_on_row(img, 0, 11, 19) is not None
+            or any(tok in read_tile_text(img, 1, 10, 20) for tok in ("ABLE", "LEARNED"))
+        )
+    ):
+        return True
+    if (
+        float(light[0:TILE_SIZE, 3 * TILE_SIZE:GRID_COLS * TILE_SIZE].mean()) >= 0.95
+        and len(read_tile_text(img, 1, 3, 13)) >= 2
+        and (
+            _read_hud_level_on_row(img, 2, 7, 13) is not None
+            or any(tok in read_tile_text(img, 2, 10, 20) for tok in ("ABLE", "LEARNED"))
+        )
     ):
         return True
     return False
@@ -933,6 +946,28 @@ def has_right_aligned_ui_box(frame: np.ndarray) -> bool:
     )
 
 
+def has_gen1_item_box_border(frame: np.ndarray) -> bool:
+    """Return True when the Generation 1 ITEM list box border is drawn on the upper screen (with or without a sub-box or bottom dialogue box)."""
+    if frame is None:
+        return False
+    img = _grey_frame(frame)
+    if img.shape[0] < 13 * TILE_SIZE or img.shape[1] < GRID_COLS * TILE_SIZE:
+        return False
+    if is_party_menu_screen(img) or is_pack_screen(img):
+        return False
+    if not all(is_horizontal_border_tile(img[2 * TILE_SIZE:3 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+               for tx in range(5, 19)):
+        return False
+    if not all(is_vertical_border_tile(img[ty * TILE_SIZE:(ty + 1) * TILE_SIZE, 4 * TILE_SIZE:5 * TILE_SIZE])
+               for ty in range(3, 12)):
+        return False
+    if not all(is_horizontal_border_tile(img[12 * TILE_SIZE:13 * TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE])
+               for tx in range(5, 13)):
+        return False
+    inner = img[3 * TILE_SIZE:12 * TILE_SIZE, 5 * TILE_SIZE:13 * TILE_SIZE]
+    return float((inner >= LIGHT_BACKGROUND).mean()) >= 0.70
+
+
 def is_overworld_menu_or_ui_screen(frame: np.ndarray) -> bool:
     """Return True if the screen displays an overworld or full-screen menu/UI layout (party, Pack, Start menu, Gen 1 item list, top box, or modal preview)."""
     if frame is None:
@@ -948,6 +983,7 @@ def is_overworld_menu_or_ui_screen(frame: np.ndarray) -> bool:
         or is_start_menu_screen(img)
         or is_gen1_item_list_screen(img)
         or is_item_use_subbox_screen(img)
+        or has_gen1_item_box_border(img)
     )
 
 
@@ -1736,11 +1772,11 @@ def is_tm_hm_startup_dialogue_frame(frame: np.ndarray) -> bool:
     line1, line2 = read_dialogue_box_lines(frame, tx_start=1, tx_end=15)
     l1_low = line1.lower()
     l2_low = line2.lower()
-    if "booted up" in l1_low or l1_low.startswith("booted ") or "booted a" in l1_low:
+    if "booted up" in l1_low or l1_low.startswith("booted") or "booted a" in l1_low:
         return True
-    if l1_low.startswith("it contain") or "contained" in l1_low:
+    if l1_low.startswith("it contain") or l1_low.startswith("it ontain") or "contained" in l1_low or "ontained" in l1_low:
         return True
-    if l1_low.startswith("teach ") or l2_low.startswith("to a p"):
+    if l1_low.startswith("teach ") or l1_low.startswith("tea h ") or l2_low.startswith("to a p") or l1_low.startswith("use tm on") or l1_low.startswith("use hm on"):
         return True
     return False
 
