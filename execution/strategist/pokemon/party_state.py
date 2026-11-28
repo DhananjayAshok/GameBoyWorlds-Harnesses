@@ -125,6 +125,7 @@ class PartyInventoryState(StrategistArtifact):
         self.last_defeat_party_level: Optional[int] = None
         self.last_defeat_healing_bag_empty: bool = False
         self.learned_move_since_defeat: bool = False
+        self.tried_or_incompatible_tms: List[str] = []
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -146,6 +147,8 @@ class PartyInventoryState(StrategistArtifact):
             self.last_defeat_healing_bag_empty = False
         if not hasattr(self, "learned_move_since_defeat"):
             self.learned_move_since_defeat = False
+        if not hasattr(self, "tried_or_incompatible_tms") or self.tried_or_incompatible_tms is None:
+            self.tried_or_incompatible_tms = []
 
     @staticmethod
     def normalize_move_name(move_name: Optional[str]) -> str:
@@ -192,7 +195,7 @@ class PartyInventoryState(StrategistArtifact):
         if is_new:
             self.learned_moves.append(norm_move)
             if getattr(self, "last_defeat_episode", None) is not None and (
-                episode_number is None or episode_number > self.last_defeat_episode
+                episode_number is None or episode_number >= self.last_defeat_episode
             ):
                 self.learned_move_since_defeat = True
         if norm_poke:
@@ -238,6 +241,12 @@ class PartyInventoryState(StrategistArtifact):
         if not text:
             return False
         changed = False
+        for m_incompat in re.finditer(
+            r"\[TM/HM incompatible with party in menu:\s*(TM\s*\d+|HM\s*\d+)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            self.record_tried_or_incompatible_tm(m_incompat.group(1), episode_number=episode_number)
         for m_tag in re.finditer(
             r"\[Move (?:taught|already known) in menu:\s*([A-Z0-9♀♂.'-]+)\s+(?:learned|knows)\s+([A-Z][A-Z0-9 -]{2,14})\]",
             text,
@@ -579,10 +588,32 @@ class PartyInventoryState(StrategistArtifact):
         self.last_defeat_healing_bag_empty = bool(self.healing_bag_empty)
         self.learned_move_since_defeat = False
 
+    def record_tried_or_incompatible_tm(
+        self,
+        tm_name: Optional[str],
+        episode_number: Optional[int] = None,
+    ) -> None:
+        norm = self.normalize_item_name(tm_name)
+        if not norm or not re.match(r"^(?:TM|HM)\s*\d+$", norm):
+            return
+        if not hasattr(self, "tried_or_incompatible_tms") or self.tried_or_incompatible_tms is None:
+            self.tried_or_incompatible_tms = []
+        if norm not in self.tried_or_incompatible_tms:
+            self.tried_or_incompatible_tms.append(norm)
+            if episode_number is not None:
+                self.last_written = int(episode_number)
+
+    def unused_bag_tms(self) -> List[str]:
+        tried = set(getattr(self, "tried_or_incompatible_tms", ()) or ())
+        out: List[str] = []
+        for it in (self.items or ()):
+            norm = self.normalize_item_name(it)
+            if norm and re.match(r"^TM\s*\d+$", norm) and norm not in tried and norm not in out:
+                out.append(norm)
+        return out
+
     def needs_post_defeat_preparation(self) -> bool:
         if self.last_defeat_episode is None:
-            return False
-        if not self.healing_bag_empty:
             return False
         if (
             self.active_pokemon_level is not None
@@ -591,6 +622,8 @@ class PartyInventoryState(StrategistArtifact):
         ):
             return False
         if self.learned_move_since_defeat:
+            return False
+        if getattr(self, "last_defeat_healing_bag_empty", False) and not self.healing_bag_empty:
             return False
         return True
 
@@ -1067,6 +1100,14 @@ class PartyInventoryState(StrategistArtifact):
         notes = getattr(report, "notes", None) or ""
         task_str = getattr(report, "task", None) or ""
         self.update_learned_moves_from_text(notes, episode_number=episode_number)
+        if (
+            "is not compatible" in notes.lower()
+            or "can't learn" in notes.lower()
+            or "cannot learn" in notes.lower()
+            or "No move was taught in menu" in notes
+        ):
+            for m_tm in re.finditer(r"\b(TM\s*\d{1,2})\b", task_str + " " + notes, re.IGNORECASE):
+                self.record_tried_or_incompatible_tm(m_tm.group(1), episode_number=episode_number)
         had_bag_tag = self.update_from_bag_notes(notes, task_str)
         if "No healing item was used in menu" in notes:
             self.mark_healing_bag_empty()

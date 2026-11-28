@@ -250,7 +250,9 @@ def guide_block(guide: StrategyGuide, gmap: GlobalMap, episode: int,
 
 
 def record_events(guide: StrategyGuide, gmap: GlobalMap, warps: Sequence[Tuple], episode: int,
-                  parameters: Optional[dict] = None) -> List[GuideEvent]:
+                  parameters: Optional[dict] = None,
+                  episode_status: Optional[str] = None,
+                  step_from: int = 0) -> List[GuideEvent]:
     events = []
     for _, source, _, destination, _ in warps:
         source, destination = gmap.resolve(source, (0, 0))[0], gmap.resolve(destination, (0, 0))[0]
@@ -263,6 +265,35 @@ def record_events(guide: StrategyGuide, gmap: GlobalMap, warps: Sequence[Tuple],
         events.append(event)
         log_info(f"Strategy guide: the player {trigger} ({event.place}); {len(event.rules)} rule(s) apply.",
                  parameters)
+    if episode_status == "lost_battle" and gmap.current:
+        dest_seg = gmap.resolve(gmap.segment, (0, 0))[0]
+        defeat_seg: Optional[int] = None
+        for d in reversed(getattr(gmap, "defeats", ())):
+            if int(d.get("step", 0)) >= step_from:
+                defeat_seg = gmap.resolve(d["segment"], (0, 0))[0]
+                break
+        if defeat_seg is None and getattr(gmap, "defeats", ()):
+            defeat_seg = gmap.resolve(gmap.defeats[-1]["segment"], (0, 0))[0]
+        if defeat_seg is not None and defeat_seg != dest_seg:
+            trigger = door_trigger(gmap, defeat_seg, dest_seg)
+            if trigger == EXITED_BUILDING and (
+                not events or events[-1].trigger != EXITED_BUILDING or events[-1].segment != dest_seg
+            ):
+                event = GuideEvent(
+                    episode,
+                    trigger,
+                    gmap.place_label(defeat_seg),
+                    gmap.place_label(dest_seg),
+                    tuple(r.id for r in guide.rules_for(trigger)),
+                    dest_seg,
+                )
+                guide.record_event(event, episode_number=episode)
+                events.append(event)
+                log_info(
+                    f"Strategy guide: the player {trigger} ({event.place}) after blacking out; "
+                    f"{len(event.rules)} rule(s) apply.",
+                    parameters,
+                )
     return events
 
 
@@ -331,11 +362,14 @@ def _parse_reflection(guide: StrategyGuide):
 
 def reflect_on_defeat(guide: StrategyGuide, task: str, goal: str, where: str, digest: str, battle: str,
                       images: List[Any], vlm_call, game: str, episode: int,
-                      parameters: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+                      parameters: Optional[dict] = None,
+                      party_block: str = "",
+                      knowledge_block: str = "") -> Optional[Dict[str, Any]]:
     # Not every defeat has battle frames, and the inference layer rejects images=[], so the key is left out.
     frames = (DEFEAT_FRAMES_LINE if images else DEFEAT_NO_FRAMES_LINE)
     prompt = (P.DEFEAT_REFLECTION_PROMPT.replace("[GAME]", game).replace("[TASK]", task).replace("[GOAL]", goal)
               .replace("[WHERE]", where).replace("[DIGEST]", digest).replace("[BATTLE]", battle)
+              .replace("[PARTY_BLOCK]", party_block).replace("[KNOWLEDGE_BLOCK]", knowledge_block)
               .replace("[FRAMES]", frames)
               .replace("[TIPS]", _rules_text(guide, (BATTLE,))).replace("[MAX_CHANGES]", str(MAX_CHANGES))
               .replace("[MAX_TIPS]", str(MAX_BATTLE_TIPS)))

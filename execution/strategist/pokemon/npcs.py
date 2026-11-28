@@ -1035,6 +1035,26 @@ class NPCRegistry(StrategistArtifact):
             )
             if min_dist > max_same_segment_dist:
                 return False
+            seg_cells = g.segments[seg] if 0 <= seg < len(g.segments) else {}
+            if seg_cells and min_dist >= 2:
+                keep_water = all(
+                    seg_cells.get(q) is not None and "water" in (seg_cells[q].tags or ())
+                    for q in keep_by_seg[seg]
+                )
+                drop_water = all(
+                    seg_cells.get(q) is not None and "water" in (seg_cells[q].tags or ())
+                    for q in drop_by_seg[seg]
+                )
+                keep_land = all(
+                    seg_cells.get(q) is None or "water" not in (seg_cells[q].tags or ())
+                    for q in keep_by_seg[seg]
+                )
+                drop_land = all(
+                    seg_cells.get(q) is None or "water" not in (seg_cells[q].tags or ())
+                    for q in drop_by_seg[seg]
+                )
+                if (keep_water and drop_land) or (keep_land and drop_water):
+                    return False
         return True
 
     def _merge_look_and_npc(self, keep: NPC, drop: NPC, max_same_segment_dist: int = NEAR) -> NPC:
@@ -1364,7 +1384,7 @@ class NPCRegistry(StrategistArtifact):
         if not frame_sources:
             return []
         y_off = self._p["y_offset"]
-        allowed_tags = {"npc", "ground", "ground decoration", "tall grass", "unknown"}
+        allowed_tags = {"npc", "ground", "ground decoration", "tall grass", "water", "unknown"}
         by_dir: Dict[str, Dict[str, Any]] = {}
         for frame, identified in frame_sources:
             level = S.black_level(frame)
@@ -1394,6 +1414,25 @@ class NPCRegistry(StrategistArtifact):
                     if (best is not None and best[0] <= self._p["auto"]
                             and self.looks[best[1]].kind_hint != "object"
                             and S.complete_sprite(mask) and int(mask.sum()) >= 50):
+                        score = int(mask.sum())
+                    elif (
+                        S.complete_sprite(mask)
+                        and int(mask.sum()) >= 42
+                        and (
+                            self.tagged_squares.get((rseg, tsq), False)
+                            or any(
+                                self.look_of(n).kind_hint != "object"
+                                and self.last_seen(g, n) is not None
+                                and self.last_seen(g, n)[0] == rseg
+                                and self.last_seen(g, n)[1] in (
+                                    tsq,
+                                    (rpos[0] + 2 * cell[0], rpos[1] + 2 * cell[1]),
+                                    (rpos[0] + 3 * cell[0], rpos[1] + 3 * cell[1]),
+                                )
+                                for n in self.live_npcs()
+                            )
+                        )
+                    ):
                         score = int(mask.sum())
                 if score <= 0:
                     continue
@@ -2089,7 +2128,7 @@ class NPCRegistry(StrategistArtifact):
                 if seen is not None:
                     conv.segment, conv.square = rseg, rsq
                     conv.target = seen[1]
-                if conv.led_to == "battle" and npc.kind in ("unknown", "person"):
+                if (conv.led_to == "battle" or conv.outcome == "battle") and npc.kind in ("unknown", "person"):
                     npc.kind = "trainer"
                 elif npc.kind == "unknown" and npc_model.is_routine_service_text(conv.text):
                     npc.kind = "person"
@@ -2155,17 +2194,34 @@ class NPCRegistry(StrategistArtifact):
                 by_seg.setdefault(rseg, []).append(s)
             for rseg, sights in by_seg.items():
                 squares = list({self.place(gmap, s)[1] for s in sights})
-                if _spread(squares) <= NEAR:
+                seg_cells = gmap.segments[rseg] if 0 <= rseg < len(gmap.segments) else {}
+                water_squares = [
+                    q for q in squares
+                    if seg_cells.get(q) is not None and "water" in (seg_cells[q].tags or ())
+                ]
+                land_squares = [q for q in squares if q not in water_squares]
+                has_water_land_split = bool(
+                    water_squares
+                    and land_squares
+                    and min(_manhattan(wq, lq) for wq in water_squares for lq in land_squares) >= 2
+                )
+                if _spread(squares) <= NEAR and not has_water_land_split:
                     continue
                 clusters: List[Set[Cell]] = []
                 remaining = set(squares)
+                water_set = set(water_squares)
                 while remaining:
                     seed = remaining.pop()
                     comp = {seed}
                     queue = [seed]
+                    seed_in_water = seed in water_set
                     while queue:
                         cur = queue.pop()
-                        neighbours = {q for q in remaining if _manhattan(cur, q) <= NEAR}
+                        neighbours = {
+                            q for q in remaining
+                            if _manhattan(cur, q) <= NEAR
+                            and (not has_water_land_split or (q in water_set) == seed_in_water)
+                        }
                         if neighbours:
                             comp |= neighbours
                             remaining -= neighbours

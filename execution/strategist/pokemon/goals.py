@@ -456,7 +456,18 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
             desc_low = (subtree.root.description or "").lower()
             if any(
                 kw in desc_low
-                for kw in ("restock", "potion", "shop", "mart", "department", "train", "level", "explore the facility")
+                for kw in (
+                    "restock",
+                    "potion",
+                    "shop",
+                    "mart",
+                    "department",
+                    "train",
+                    "level",
+                    "explore the facility",
+                    "teach",
+                    "tm",
+                )
             ):
                 return closed
         prompt = (_goal_prompt(P.GOAL_CHECK_PROMPT, game, path, subtree, notepad, current,

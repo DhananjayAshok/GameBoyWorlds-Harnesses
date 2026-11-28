@@ -4436,6 +4436,7 @@ Press: <one of up, down, left, right, confirm, back>
         self._quantity_adjusted_in_box: bool = False
         self._completed_tm_hm_party_attempt: bool = False
         self._last_move_teaching_outcome: Optional[Tuple[str, str, str]] = None
+        self._last_incompatible_tm: Optional[str] = None
         self._overworld_menu_session: bool = bool(is_start_menu)
         self._tm_hm_scrolled_in_opening: bool = False
         super().__init__(env, task, max_steps, is_start_menu=is_start_menu, **kwargs)
@@ -5188,6 +5189,10 @@ Press: <one of up, down, left, right, confirm, back>
                 notes_lines.append(f"[Move taught in menu: {m_poke} learned {m_move}]")
             else:
                 notes_lines.append(f"[Move already known in menu: {m_poke} knows {m_move}]")
+        elif self._last_incompatible_tm:
+            notes_lines.append(
+                f"[TM/HM incompatible with party in menu: {self._last_incompatible_tm} cannot be learned by any current party Pokemon]"
+            )
         elif self._task_wants_move_teaching():
             notes_lines.append("[No move was taught in menu: menu closed without teaching the move to any party Pokemon]")
         if (
@@ -5648,10 +5653,58 @@ Press: <one of up, down, left, right, confirm, back>
                 if self._last_truncated:
                     return self._finish(MENU_TRUNCATED, "truncated")
                 if reached_party:
-                    self.press_outcomes[-1] = (
-                        "confirm (confirmed USE and YES to open the party selection screen — "
-                        "select an ABLE party Pokemon with confirm to teach the move)"
-                    )
+                    cur_party_fr = self._get_state()["core"]["current_frame"]
+                    compat_list = read_party_menu_compatibility(cur_party_fr)
+                    able_slots = [(idx, name) for idx, name, st in compat_list if st == "ABLE"]
+                    learned_slots = [(idx, name) for idx, name, st in compat_list if st == "LEARNED"]
+                    if able_slots:
+                        chosen_poke = self._auto_select_able_party_member_and_advance()
+                        if self._last_terminated:
+                            return self._finish(MENU_TERMINATED, "terminated")
+                        if self._last_truncated:
+                            return self._finish(MENU_TRUNCATED, "truncated")
+                        if chosen_poke:
+                            cur_after_tm = self._get_state()["core"]["current_frame"]
+                            self._scan_move_learning_frame(cur_after_tm)
+                            if read_party_move_forget_list(cur_after_tm) is not None:
+                                self.press_outcomes[-1] = (
+                                    f"confirm (confirmed USE and YES, selected {chosen_poke}, and confirmed YES to delete an older move — choose which move to forget)"
+                                )
+                            else:
+                                self.press_outcomes[-1] = (
+                                    f"confirm (confirmed USE and YES, and taught the move to {chosen_poke})"
+                                )
+                        else:
+                            self.press_outcomes[-1] = (
+                                "confirm (confirmed USE and YES to open the party selection screen — "
+                                "select an ABLE party Pokemon with confirm to teach the move)"
+                            )
+                    elif compat_list and not able_slots:
+                        tm_code = self._active_menu_item or self._pending_bag_item or ""
+                        if learned_slots:
+                            _, l_poke = learned_slots[0]
+                            if self._party_state is not None and tm_code:
+                                self._party_state.record_tried_or_incompatible_tm(tm_code)
+                            back_rec = self._take_action(MenuAction, menu_action="back")
+                            drop_prefix_crops(captured_dialogue_crops([back_rec]), self.dialogue_crops)
+                            self._completed_tm_hm_party_attempt = True
+                            self.press_outcomes[-1] = (
+                                f"confirm (opened party screen: {l_poke} already knows {tm_code}; backed out to item menu)"
+                            )
+                        else:
+                            if self._party_state is not None and tm_code:
+                                self._party_state.record_tried_or_incompatible_tm(tm_code)
+                            self._last_incompatible_tm = tm_code
+                            back_rec = self._take_action(MenuAction, menu_action="back")
+                            drop_prefix_crops(captured_dialogue_crops([back_rec]), self.dialogue_crops)
+                            if not any(
+                                self._bag_target_matches(it) and it != tm_code
+                                for it in self._seen_bag_items
+                            ):
+                                self._completed_tm_hm_party_attempt = True
+                            self.press_outcomes[-1] = (
+                                f"confirm (opened party screen: all party Pokemon are NOT ABLE to learn {tm_code}; backed out to item menu)"
+                            )
             after_frame = self._get_state()["core"]["current_frame"]
             if press == "back" and is_start_menu_screen(after_frame) and not has_menu_cursor(after_frame):
                 for _ in range(2):
@@ -6538,6 +6591,12 @@ Press: <one of a, b, start, up, down, left, right>
                     self._no_displacement_directional_presses += 1
                 self._last_was_turn_at_place = True
                 outcome_label = f"{press} (turned to face {press} at {before_place[1]} — press {press} again to step {press})"
+        elif was_free and still_free and press in ("a", "b"):
+            cur_p = self._current_map_place()
+            facing_now = getattr(self._env, "facing", None)
+            outcome_label = f"{press} (no dialogue or interaction triggered at {cur_p[1] if cur_p else 'current tile'})"
+            if cur_p is not None and facing_now in DIRECTIONS and facing_now in self._blocked_at_place.get(cur_p, ()):
+                self._no_displacement_directional_presses += 1
         self.press_outcomes.append(outcome_label)
         return True
 

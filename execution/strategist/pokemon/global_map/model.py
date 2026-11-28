@@ -2341,6 +2341,101 @@ class GlobalMap(StrategistArtifact):
                                 for t, a, pa, b, pb in self.warps
                             ]
                             healed += 1
+        for target, seg in enumerate(self.segments):
+            if not seg or target in self.merged_into:
+                continue
+            warp_doors = set()
+            for _, a, pa, b, pb in self.warps:
+                ra, rpa = self.resolve(a, pa)
+                rb, rpb = self.resolve(b, pb)
+                if ra == rb:
+                    continue
+                if ra == target:
+                    warp_doors.add(self._door_at(ra, rpa))
+                if rb == target:
+                    warp_doors.add(self._door_at(rb, rpb))
+            door_cells = sorted(
+                [d for d in warp_doors if d in seg and is_door(seg[d])],
+                key=lambda g: (seg[g].first_seen, seg[g].last_seen),
+            )
+            if len(door_cells) <= 1:
+                continue
+            for i, d1 in enumerate(door_cells):
+                if d1 not in seg or not is_door(seg[d1]):
+                    continue
+                for d2 in door_cells[i + 1:]:
+                    if d2 not in seg or not is_door(seg[d2]):
+                        continue
+                    if seg[d1].hashes != seg[d2].hashes or None in seg[d1].hashes:
+                        continue
+                    if max(abs(d1[0] - d2[0]), abs(d1[1] - d2[1])) > DOOR_SNAP_REACH:
+                        continue
+                    dests_1 = {
+                        self.resolve(b, pb)[0]
+                        for _, a, pa, b, pb in self.warps
+                        if self.resolve(a, pa)[0] == target and self._door_at(target, self.resolve(a, pa)[1]) == d1
+                    } | {
+                        self.resolve(a, pa)[0]
+                        for _, a, pa, b, pb in self.warps
+                        if self.resolve(b, pb)[0] == target and self._door_at(target, self.resolve(b, pb)[1]) == d1
+                    }
+                    dests_2 = {
+                        self.resolve(b, pb)[0]
+                        for _, a, pa, b, pb in self.warps
+                        if self.resolve(a, pa)[0] == target and self._door_at(target, self.resolve(a, pa)[1]) == d2
+                    } | {
+                        self.resolve(a, pa)[0]
+                        for _, a, pa, b, pb in self.warps
+                        if self.resolve(b, pb)[0] == target and self._door_at(target, self.resolve(b, pb)[1]) == d2
+                    }
+                    same_dest = False
+                    for s1 in dests_1:
+                        for s2 in dests_2:
+                            if s1 == s2:
+                                same_dest = True
+                            else:
+                                ov = self.overlap(max(s1, s2), min(s1, s2))
+                                if ov and ov.get("matches", 0) >= 60 and ov.get("agreement", 0.0) >= 0.9:
+                                    same_dest = True
+                    if not same_dest:
+                        continue
+                    canonical, aliased = (d2, d1) if seg[d2].last_seen >= seg[d1].last_seen else (d1, d2)
+                    nb_grounds = [
+                        seg[nb]
+                        for ox, oy in DIRECTIONS.values()
+                        for nb in [(aliased[0] + ox, aliased[1] + oy)]
+                        if nb in seg and seg[nb].kind == WALKABLE and not is_door(seg[nb])
+                    ]
+                    nb_obs = [
+                        seg[nb]
+                        for ox, oy in DIRECTIONS.values()
+                        for nb in [(aliased[0] + ox, aliased[1] + oy)]
+                        if nb in seg and seg[nb].kind == BLOCKED and not is_door(seg[nb])
+                    ]
+                    if nb_grounds:
+                        ref = nb_grounds[0]
+                        seg[aliased] = MapCell(
+                            WALKABLE, ("ground",), ref.hashes, ref.first_seen, ref.last_seen, ref.pixels
+                        )
+                    elif nb_obs:
+                        ref = nb_obs[0]
+                        seg[aliased] = MapCell(
+                            BLOCKED, ("obstacle",), ref.hashes, ref.first_seen, ref.last_seen, ref.pixels
+                        )
+                        self.visits[target].pop(aliased, None)
+                    else:
+                        continue
+                    self.warps = [
+                        (
+                            t,
+                            (target if self.resolve(a, pa)[0] == target and self._door_at(target, self.resolve(a, pa)[1]) == aliased else a),
+                            (canonical if self.resolve(a, pa)[0] == target and self._door_at(target, self.resolve(a, pa)[1]) == aliased else pa),
+                            (target if self.resolve(b, pb)[0] == target and self._door_at(target, self.resolve(b, pb)[1]) == aliased else b),
+                            (canonical if self.resolve(b, pb)[0] == target and self._door_at(target, self.resolve(b, pb)[1]) == aliased else pb),
+                        )
+                        for t, a, pa, b, pb in self.warps
+                    ]
+                    healed += 1
         return healed
 
     def _heal_unwarped_segment_splits(self) -> int:
