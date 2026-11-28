@@ -272,7 +272,10 @@ def has_bottom_dialogue_box(frame: np.ndarray) -> bool:
 
 
 def _evaluate_cutscene_frame_change(
-    earlier: np.ndarray, later: np.ndarray, ignore_player_box: bool = False
+    earlier: np.ndarray,
+    later: np.ndarray,
+    ignore_player_box: bool = False,
+    seen_frames: Optional[List[np.ndarray]] = None,
 ) -> Tuple[bool, bool]:
     """Return (is_changing, is_screen_wide) between two overworld frames."""
     if earlier is None or later is None or earlier.shape != later.shape:
@@ -379,7 +382,12 @@ def _evaluate_cutscene_frame_change(
     if int(diff.sum()) < CUTSCENE_DIFF_MIN_PIXELS:
         return False, False
 
-    t_min = diff[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+    t_raw = diff[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+    t_min = t_raw.copy()
+    b_in_a_h = np.zeros_like(diff)
+    a_in_b_h = np.zeros_like(diff)
+    b_in_a_v = np.zeros_like(diff)
+    a_in_b_v = np.zeros_like(diff)
     for d in range(1, CUTSCENE_MAX_TILE_SHIFT + 1):
         if d < n_cols:
             diff_l = np.ones_like(diff)
@@ -397,6 +405,10 @@ def _evaluate_cutscene_frame_change(
             tl = diff_l[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             tr = diff_r[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             t_min = np.minimum(t_min, np.minimum(tl, tr))
+            b_in_a_h[:, d:] |= np.abs(b[:, d:] - a[:, :-d]) <= CUTSCENE_DIFF_THRESHOLD
+            b_in_a_h[:, :-d] |= np.abs(b[:, :-d] - a[:, d:]) <= CUTSCENE_DIFF_THRESHOLD
+            a_in_b_h[:, d:] |= np.abs(a[:, d:] - b[:, :-d]) <= CUTSCENE_DIFF_THRESHOLD
+            a_in_b_h[:, :-d] |= np.abs(a[:, :-d] - b[:, d:]) <= CUTSCENE_DIFF_THRESHOLD
         if d < n_rows:
             diff_u = np.ones_like(diff)
             diff_u[d:, :] = np.abs(b[d:, :] - a[:-d, :]) > CUTSCENE_DIFF_THRESHOLD
@@ -413,27 +425,68 @@ def _evaluate_cutscene_frame_change(
             tu = diff_u[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             td = diff_d[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
             t_min = np.minimum(t_min, np.minimum(tu, td))
+            b_in_a_v[d:, :] |= np.abs(b[d:, :] - a[:-d, :]) <= CUTSCENE_DIFF_THRESHOLD
+            b_in_a_v[:-d, :] |= np.abs(b[:-d, :] - a[d:, :]) <= CUTSCENE_DIFF_THRESHOLD
+            a_in_b_v[d:, :] |= np.abs(a[d:, :] - b[:-d, :]) <= CUTSCENE_DIFF_THRESHOLD
+            a_in_b_v[:-d, :] |= np.abs(a[:-d, :] - b[d:, :]) <= CUTSCENE_DIFF_THRESHOLD
+
+    dh = diff & ~(b_in_a_h & a_in_b_h)
+    dv = diff & ~(b_in_a_v & a_in_b_v)
+    th = dh[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+    tv = dv[:n_rows, :n_cols].reshape(ty, TILE_SIZE, tx, TILE_SIZE).sum(axis=(1, 3))
+    t_min = np.minimum(t_min, np.minimum(th, tv))
 
     sig_tiles = t_min >= CUTSCENE_TILE_MIN_PIXELS
     n_sig_tiles = int(sig_tiles.sum())
     sig_sum = int(t_min[sig_tiles].sum())
     changing = sig_sum >= CUTSCENE_DIFF_MIN_PIXELS
     if not changing and not ignore_player_box:
-        player_tiles = t_min[7:10, 8:10]
+        player_tiles = t_raw[7:10, 8:10]
         if int(player_tiles[player_tiles >= CUTSCENE_TILE_MIN_PIXELS].sum()) >= CUTSCENE_PLAYER_SPIN_MIN_PIXELS:
             changing = True
     screen_wide = changing and (
         n_sig_tiles >= CUTSCENE_SCREEN_WIDE_MIN_TILES
         or sig_sum >= CUTSCENE_SCREEN_WIDE_MIN_PIXELS
     )
+    if changing and not screen_wide and seen_frames:
+        prior_frames = [
+            _grey_frame(fr).astype(int) if fr.ndim == 3 or fr.dtype != int else fr
+            for fr in seen_frames[:-1]
+            if fr is not None
+        ]
+        if prior_frames:
+            t_novel = t_min.copy()
+            for iy in range(ty):
+                for ix in range(tx):
+                    if t_novel[iy, ix] < CUTSCENE_TILE_MIN_PIXELS:
+                        continue
+                    bt = b_tiles[iy, ix]
+                    if any(
+                        int(
+                            (
+                                np.abs(bt - h[iy * TILE_SIZE:(iy + 1) * TILE_SIZE, ix * TILE_SIZE:(ix + 1) * TILE_SIZE])
+                                > CUTSCENE_DIFF_THRESHOLD
+                            ).sum()
+                        )
+                        == 0
+                        for h in prior_frames
+                    ):
+                        t_novel[iy, ix] = 0
+            novel_sig = t_novel >= CUTSCENE_TILE_MIN_PIXELS
+            changing = int(t_novel[novel_sig].sum()) >= CUTSCENE_DIFF_MIN_PIXELS
     return changing, screen_wide
 
 
 def is_cutscene_frame_changing(
-    earlier: np.ndarray, later: np.ndarray, ignore_player_box: bool = False
+    earlier: np.ndarray,
+    later: np.ndarray,
+    ignore_player_box: bool = False,
+    seen_frames: Optional[List[np.ndarray]] = None,
 ) -> bool:
     """Return True if sprite movement, emote animation, or box transitions changed between frames."""
-    changing, _ = _evaluate_cutscene_frame_change(earlier, later, ignore_player_box=ignore_player_box)
+    changing, _ = _evaluate_cutscene_frame_change(
+        earlier, later, ignore_player_box=ignore_player_box, seen_frames=seen_frames
+    )
     return changing
 
 

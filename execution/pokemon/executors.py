@@ -194,7 +194,7 @@ def drop_prefix_crops(crops: List[Any], kept: Optional[List[Any]] = None) -> Lis
 INTERACT_SETTLE_WAIT = 2
 INTERACT_POST_DIALOGUE_SETTLE_WAIT = 4
 INTERACT_MAX_CUTSCENE_WAIT = 30
-INTERACT_POST_MOTION_WAIT = 8
+INTERACT_POST_MOTION_WAIT = 5
 INTERACT_POST_WARP_BANNER_WAIT = 6
 PURE_DIFF_MAX_CUTSCENE_WAIT = 10
 INTERACT_MODAL_MAX_PRESSES = 8
@@ -289,8 +289,10 @@ def settle_overworld_free_roam(
     post_motion_remaining = 0
     saw_fade = False
     saw_overlay_or_fade = False
+    saw_emote_or_dialogue = False
     saw_activity = False
     pure_move_settle = not record_dialogue_settled and not stop_on_overlay
+    seen_frames: List[np.ndarray] = []
 
     def _is_overlay(fr) -> bool:
         return (
@@ -306,19 +308,25 @@ def settle_overworld_free_roam(
         fade_open = is_blank_or_fade_frame(frame)
         if fade_open:
             saw_fade = True
-        if stop_on_overlay:
-            box_open = has_emote_bubble(frame) or fade_open
-        else:
-            box_open = (
-                has_bottom_dialogue_box(frame)
-                or (include_top_box and has_top_dialogue_box(frame) and not has_menu_cursor(frame))
-                or has_emote_bubble(frame)
-                or fade_open
+        emote_or_box_open = (
+            has_emote_bubble(frame)
+            or (
+                not stop_on_overlay
+                and (
+                    has_bottom_dialogue_box(frame)
+                    or (include_top_box and has_top_dialogue_box(frame) and not has_menu_cursor(frame))
+                )
             )
+        )
+        if emote_or_box_open:
+            saw_emote_or_dialogue = True
+        box_open = emote_or_box_open or fade_open
         if box_open:
             saw_activity = True
             saw_overlay_or_fade = True
-        if pure_move_settle and not saw_overlay_or_fade and waited >= min(max_cutscene_wait, PURE_DIFF_MAX_CUTSCENE_WAIT):
+        elif frame is not None and not seen_frames:
+            seen_frames.append(frame)
+        if pure_move_settle and not box_open and not saw_emote_or_dialogue and waited >= min(max_cutscene_wait, PURE_DIFF_MAX_CUTSCENE_WAIT):
             break
         if waited >= settle_wait and not box_open and post_motion_remaining <= 0:
             break
@@ -332,24 +340,33 @@ def settle_overworld_free_roam(
         fade_now = is_blank_or_fade_frame(before_frame) or is_blank_or_fade_frame(after_frame)
         if fade_now:
             saw_fade = True
-        overlay_or_emote_now = (
-            has_emote_bubble(after_frame)
-            or fade_now
+        emote_or_dialogue_now = (
+            has_emote_bubble(before_frame)
+            or has_emote_bubble(after_frame)
             or (not stop_on_overlay and has_bottom_dialogue_box(after_frame))
             or (not stop_on_overlay and include_top_box and has_top_dialogue_box(after_frame) and not has_menu_cursor(after_frame))
         )
+        if emote_or_dialogue_now:
+            saw_emote_or_dialogue = True
+        overlay_or_emote_now = emote_or_dialogue_now or fade_now
         if overlay_or_emote_now:
             saw_overlay_or_fade = True
-        frame_changing = is_cutscene_frame_changing(before_frame, after_frame)
-        if frame_changing and is_screen_wide_cutscene_change(before_frame, after_frame):
+        elif after_frame is not None:
+            seen_frames.append(after_frame)
+        frame_changing = is_cutscene_frame_changing(before_frame, after_frame, seen_frames=seen_frames)
+        screen_wide = frame_changing and is_screen_wide_cutscene_change(before_frame, after_frame)
+        if screen_wide:
             saw_overlay_or_fade = True
         active_now = frame_changing or overlay_or_emote_now
         if active_now:
             saw_activity = True
             if saw_fade and has_bottom_location_banner(after_frame):
                 post_motion_remaining = max(post_motion_remaining, post_warp_banner_wait)
-            elif pure_move_settle and not saw_overlay_or_fade:
-                post_motion_remaining = max(post_motion_remaining, 1)
+            elif pure_move_settle and not saw_emote_or_dialogue:
+                if fade_now or screen_wide:
+                    post_motion_remaining = max(post_motion_remaining, post_motion_wait)
+                else:
+                    post_motion_remaining = max(post_motion_remaining - 1, 1)
             else:
                 post_motion_remaining = max(post_motion_remaining, post_motion_wait)
         elif post_motion_remaining > 0:
