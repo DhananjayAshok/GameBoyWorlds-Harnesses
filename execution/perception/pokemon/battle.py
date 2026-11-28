@@ -1264,6 +1264,7 @@ GEN1_SCROLL_ARROW_SIGNATURES = {
 
 def read_tile_text(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> str:
     """Read a contiguous uppercase/digit text string from 8x8 tiles on row ty in [tx_start, tx_end)."""
+    img = _grey_frame(img)
     y0 = ty * TILE_SIZE
     if img.shape[0] < y0 + TILE_SIZE:
         return ""
