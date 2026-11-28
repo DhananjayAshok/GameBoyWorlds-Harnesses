@@ -367,8 +367,6 @@ def is_npc_head_overhang_floor_cell(
     below_top = {below_q[q] for q in ("top_left", "top_right") if q in below_q}
     if "npc" in below_top:
         return True
-    if cell[1] != min(Y_RANGE) or below_q:
-        return False
     if quarter_images is not None:
         cell_imgs = quarter_images.get(cell, {})
         walkable_arrays = [
@@ -383,6 +381,8 @@ def is_npc_head_overhang_floor_cell(
             for q in npc_bottom_qs
         ):
             return True
+    if cell[1] != min(Y_RANGE) or below_q:
+        return False
     if (
         global_map is not None
         and getattr(global_map, "current", None)
@@ -1497,6 +1497,8 @@ def _gmap_blocked_sets(global_map: Optional[Any]) -> Tuple[set, Dict[Cell, set]]
             if si < len(getattr(global_map, "blocked_cells", ()))
             else set()
         )
+        if hasattr(global_map, "stationary_npc_squares"):
+            b_cells |= set(global_map.stationary_npc_squares(si))
         b_moves = (
             {k: set(v) for k, v in global_map.segment_blocked_moves(si).items()}
             if hasattr(global_map, "segment_blocked_moves")
@@ -1519,6 +1521,8 @@ def has_offscreen_front_target(
     global_map: Optional[Any],
     cell: Cell,
     direction: str,
+    *,
+    include_direct: bool = True,
 ) -> bool:
     if (
         global_map is None
@@ -1528,12 +1532,17 @@ def has_offscreen_front_target(
     ):
         return False
     try:
-        _, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
+        si, (px, py) = global_map.resolve(global_map.segment, global_map.pos)
         seg = global_map.current
     except Exception:  # noqa: BLE001
         return False
     if not seg or (px, py) not in seg:
         return False
+    stationary_npcs = (
+        set(global_map.stationary_npc_squares(si))
+        if hasattr(global_map, "stationary_npc_squares")
+        else set()
+    )
     dx, dy = DIRECTIONS[direction]
     start = (px + cell[0], py + cell[1])
     first = (start[0] + dx, start[1] + dy)
@@ -1542,7 +1551,7 @@ def has_offscreen_front_target(
         return False
     f_kind = getattr(fc, "kind", None)
     f_tags = set(getattr(fc, "tags", ()))
-    if f_kind == "occupied" or bool(f_tags & FRONT_TARGET_TAGS):
+    if include_direct and (f_kind == "occupied" or first in stationary_npcs or bool(f_tags & FRONT_TARGET_TAGS)):
         return True
     if f_kind == BLOCKED:
         second = (start[0] + 2 * dx, start[1] + 2 * dy)
@@ -1550,7 +1559,7 @@ def has_offscreen_front_target(
         if sc is not None:
             s_kind = getattr(sc, "kind", None)
             s_tags = set(getattr(sc, "tags", ()))
-            if s_kind == "occupied" or bool(s_tags & FRONT_TARGET_TAGS):
+            if s_kind == "occupied" or second in stationary_npcs or bool(s_tags & FRONT_TARGET_TAGS):
                 return True
         perp = ((1, 0), (-1, 0)) if direction in ("up", "down") else ((0, 1), (0, -1))
         for ox, oy in perp:
@@ -1563,6 +1572,7 @@ def has_offscreen_front_target(
                 and nb2 is not None
                 and (
                     getattr(nb2, "kind", None) == "occupied"
+                    or (second[0] + ox, second[1] + oy) in stationary_npcs
                     or bool(set(getattr(nb2, "tags", ())) & FRONT_TARGET_TAGS)
                 )
             ):

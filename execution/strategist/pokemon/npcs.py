@@ -343,6 +343,8 @@ class NPCRegistry(StrategistArtifact):
 
     def begin_episode(self, episode: int, gmap: GlobalMap) -> None:
         self._gmap, self._episode = gmap, episode
+        if hasattr(gmap, "attach_npcs"):
+            gmap.attach_npcs(self)
         self._tracks = {}
         self._forget_screen()
         self._facing, self._open, self._last_closed = self.last_facing, None, None
@@ -2374,8 +2376,11 @@ class NPCRegistry(StrategistArtifact):
     def map_people(self, gmap: GlobalMap, segment: int, upto_step: Optional[int] = None) -> List[PersonMark]:
         upto = float("inf") if upto_step is None else upto_step
         live = [n for n in self.live_npcs() if self.look_of(n).kind_hint != "object"]
-        now = self._episode if upto_step is None else max(
-            (s.episode for n in live for s in n.sightings if s.map_step <= upto), default=0)
+        now = (
+            (self._episode or max((s.episode for n in live for s in n.sightings), default=0))
+            if upto_step is None
+            else max((s.episode for n in live for s in n.sightings if s.map_step <= upto), default=0)
+        )
         on_screen = set(self.on_screen(gmap).values()) if upto_step is None else set()
         marks = []
         for npc in sorted(live, key=lambda n: n.id):

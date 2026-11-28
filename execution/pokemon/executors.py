@@ -1691,6 +1691,15 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             )
         )
 
+    def _task_targets_front_entity(self) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:person|npc|nurse|clerk|trainer|guard|sign(?:post)?|counter|desk|table|pc|computer|machine|item|ball|talk|interact|speak|heal|approach)\b",
+                self._task,
+                re.IGNORECASE,
+            )
+        )
+
     def _can_step_from_current(self, direction: str) -> Optional[bool]:
         kinds, identified = self._live_perception()
         if kinds is None:
@@ -1712,8 +1721,9 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             has_offscreen_front_target,
         )
 
+        include_direct = self._task_targets_front_entity()
         gmap = getattr(self._env, "_map", None)
-        if has_offscreen_front_target(gmap, (0, 0), direction):
+        if has_offscreen_front_target(gmap, (0, 0), direction, include_direct=include_direct):
             return True
         if kinds is None and identified is None:
             kinds, identified = self._live_perception()
@@ -1721,18 +1731,19 @@ class OffScreenMoveExecutor(GridMoveExecutor):
         dx, dy = DIRECTIONS[direction]
         first = (dx, dy)
         second = (2 * dx, 2 * dy)
-        if _is_npc_target_cell(first, identified, people):
+        if include_direct and _is_npc_target_cell(first, identified, people):
             return True
         if kinds is not None and kinds.get(first) == BLOCKED and _is_npc_target_cell(second, identified, people):
             return True
         if identified is not None:
-            first_tags = {
-                getattr(identified.get((first[0], first[1], q)), "tag", None)
-                for q in QUARTERS
-                if (first[0], first[1], q) in identified
-            }
-            if first_tags & FRONT_TARGET_TAGS:
-                return True
+            if include_direct:
+                first_tags = {
+                    getattr(identified.get((first[0], first[1], q)), "tag", None)
+                    for q in QUARTERS
+                    if (first[0], first[1], q) in identified
+                }
+                if first_tags & FRONT_TARGET_TAGS:
+                    return True
             if kinds is not None and kinds.get(first) == BLOCKED:
                 second_tags = {
                     getattr(identified.get((second[0], second[1], q)), "tag", None)
@@ -1887,10 +1898,14 @@ class OffScreenMoveExecutor(GridMoveExecutor):
             has_offscreen_front_target,
         )
 
+        include_direct_front = self._task_targets_front_entity()
         on_edge_coords = [c for c in coords if c in cells]
         if on_edge_coords:
             preferred = [c for c in on_edge_coords if c in open_cells]
-            front_targets = [c for c in on_edge_coords if has_offscreen_front_target(gmap, c, direction)]
+            front_targets = [
+                c for c in on_edge_coords
+                if has_offscreen_front_target(gmap, c, direction, include_direct=include_direct_front)
+            ]
             if not preferred and front_targets:
                 preferred = front_targets
             if not preferred and open_cells:
@@ -2065,7 +2080,9 @@ Location: <(x, y) or Not Found>
             if (
                 target not in open_cells
                 and open_cells
-                and not has_offscreen_front_target(gmap, target, direction)
+                and not has_offscreen_front_target(
+                    gmap, target, direction, include_direct=self._task_targets_front_entity()
+                )
             ):
                 axis = 0 if direction in ("up", "down") else 1
                 adjacent_open = [c for c in open_cells if abs(c[axis] - target[axis]) <= self.MAX_EDGE_ALIGNMENT_SHIFT]

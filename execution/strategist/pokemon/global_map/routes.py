@@ -37,10 +37,12 @@ def walked_squares(gmap: GlobalMap, segment: int) -> set:
         if (a[0] == b[0]) != (a[1] == b[1]) and abs(a[0] - b[0]) + abs(a[1] - b[1]) <= MAX_WALK_FILL:
             sx, sy = (b[0] > a[0]) - (b[0] < a[0]), (b[1] > a[1]) - (b[1] < a[1])
             walked |= {(a[0] + sx * i, a[1] + sy * i) for i in range(abs(b[0] - a[0]) + abs(b[1] - a[1]))}
+    stat_npcs = gmap.stationary_npc_squares(segment) if hasattr(gmap, "stationary_npc_squares") else set()
     cur_pos = gmap.pos if gmap.segment == segment else None
     return {
         g for g in walked
         if g not in emp_blocked
+        and g not in stat_npcs
         and (
             g == cur_pos
             or g not in seg
@@ -111,6 +113,7 @@ def path_in_segment(
         else (blocked_moves or {})
     )
     blocked_targets = blocked_target_cells(gmap, segment, eff_moves)
+    stat_npcs = gmap.stationary_npc_squares(segment) if hasattr(gmap, "stationary_npc_squares") else set()
     best: Dict[Cell, int] = {start: 0}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
     heap = [(0, start)]
@@ -146,6 +149,8 @@ def path_in_segment(
                     continue
             elif is_door(c):
                 continue
+            elif nxt in stat_npcs and c.kind == WALKABLE:
+                step = STEP_COSTS[OCCUPIED]
             elif c.kind in STEP_COSTS:
                 step = STEP_COSTS[c.kind]
             else:

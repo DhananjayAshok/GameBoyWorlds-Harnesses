@@ -607,6 +607,7 @@ class PokemonStrategist:
         self.npcs = self._load_or_default(NPCRegistry, lambda: NPCRegistry(game, name)) if npc_registry else None
         if self.npcs is not None:
             self.npcs.attach_model(self._vlm_caller)
+            self.global_map.attach_npcs(self.npcs)
         self._map_placed = True
         # How people are described in the prompt: see npc_map.WHERE_NOTES.
         self._people_where = "here"

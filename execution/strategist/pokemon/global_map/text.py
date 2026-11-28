@@ -145,6 +145,7 @@ def _mapped_paths_from_start(
         else (blocked_moves or {})
     )
     blocked_targets = blocked_target_cells(gmap, gmap.segment, eff_moves)
+    stat_npcs = gmap.stationary_npc_squares(gmap.segment) if hasattr(gmap, "stationary_npc_squares") else set()
     best: Dict[Cell, int] = {start: 0}
     previous: Dict[Cell, Optional[Tuple[Cell, str, str]]] = {start: None}
     heap = [(0, start)]
@@ -177,6 +178,8 @@ def _mapped_paths_from_start(
                 landing = seg.get(nxt)
                 if landing is None or landing.kind not in STEP_COSTS:
                     continue
+            elif nxt in stat_npcs and c.kind == WALKABLE:
+                step = STEP_COSTS[OCCUPIED]
             elif c.kind in STEP_COSTS:
                 step = STEP_COSTS[c.kind]
             else:
@@ -221,6 +224,11 @@ def project_route_next_leg(
 
     seg = gmap.current if gmap is not None else {}
     px, py = (gmap.pos if (gmap is not None and getattr(gmap, "pos", None) is not None) else (0, 0))
+    stat_npcs = (
+        gmap.stationary_npc_squares(gmap.segment)
+        if (gmap is not None and hasattr(gmap, "stationary_npc_squares"))
+        else set()
+    )
     cur: Cell = (0, 0)
     for d, m in moves:
         if d not in DIRECTIONS:
@@ -248,8 +256,9 @@ def project_route_next_leg(
         if local_kinds is not None and local_kinds.get(nxt) == BLOCKED:
             break
         if seg:
-            mc = seg.get((px + nxt[0], py + nxt[1]))
-            if mc is not None and mc.kind == OCCUPIED and nxt != goal_rel:
+            abs_nxt = (px + nxt[0], py + nxt[1])
+            mc = seg.get(abs_nxt)
+            if ((mc is not None and mc.kind == OCCUPIED) or abs_nxt in stat_npcs) and nxt != goal_rel:
                 break
         cur = nxt
     target = goal_rel if (goal_rel is not None and in_bounds(goal_rel)) else cur

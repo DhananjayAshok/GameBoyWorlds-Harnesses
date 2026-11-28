@@ -251,8 +251,41 @@ class GlobalMap(StrategistArtifact):
     """Segments of global grid, the player's place on them, and the bookkeeping to explain both."""
 
     # Set by MappingEnvironment to the tile recognizer's palette-independent hash; not saved.
-    _TRANSIENT = ("canonical_hash", "_seg_index_cache", "_overlap_cache")
+    _TRANSIENT = ("canonical_hash", "_seg_index_cache", "_overlap_cache", "_npcs")
     canonical_hash: Optional[Callable[[np.ndarray], Optional[str]]] = None
+    _npcs: Optional[Any] = None
+
+    def attach_npcs(self, npcs: Optional[Any]) -> None:
+        self._npcs = npcs
+
+    def stationary_npc_squares(self, segment: Optional[int] = None) -> set:
+        npcs = getattr(self, "_npcs", None)
+        if npcs is None or not hasattr(npcs, "map_people"):
+            return set()
+        si = self.segment if segment is None else segment
+        try:
+            si = self.resolve(si, (0, 0))[0]
+            seg = self.segments[si] if 0 <= si < len(self.segments) else {}
+            visits = self.visits[si] if 0 <= si < len(self.visits) else {}
+            cur_pos = (
+                self.resolve(self.segment, self.pos)[1]
+                if getattr(self, "pos", None) is not None and self.resolve(self.segment, self.pos)[0] == si
+                else None
+            )
+            out: set = set()
+            for mark in npcs.map_people(self, si):
+                if getattr(mark, "stale", False) or getattr(mark, "earlier", None):
+                    continue
+                sq = getattr(mark, "square", None)
+                if sq is None or sq == cur_pos or visits.get(sq, 0) > 0:
+                    continue
+                c = seg.get(sq)
+                if c is not None and is_door(c):
+                    continue
+                out.add(sq)
+            return out
+        except Exception:  # noqa: BLE001
+            return set()
 
     def _cell_hashes(self, quarters: Dict[str, np.ndarray]) -> Tuple[Optional[str], ...]:
         hash_of = self.canonical_hash or cell_key
@@ -352,6 +385,16 @@ class GlobalMap(StrategistArtifact):
             ):
                 c.kind = WALKABLE
                 c.tags = ("ground",)
+                restored += 1
+            elif (
+                c is not None
+                and c.kind == OCCUPIED
+                and "ground" in c.tags
+                and getattr(c, "prior", None) is not None
+                and c.prior[0] == WALKABLE
+            ):
+                c.kind = WALKABLE
+                c.tags = tuple(t for t in c.tags if t != "npc") or ("ground",)
                 restored += 1
         if 0 <= si < len(getattr(self, "blocked_moves", ())):
             seg_moves = self.blocked_moves[si]
@@ -3205,7 +3248,7 @@ class GlobalMap(StrategistArtifact):
                 quarter_tags, quarter_descriptions, quarter_images, seg_hashes_by_cell
             )
             for g, c in seg.items():
-                if g not in quarter_tags or c.kind == OCCUPIED:
+                if g not in quarter_tags or (c.kind == OCCUPIED and "player" in c.tags):
                     continue
                 new_kind, new_tags = classify_cell_from_quarters(
                     g,
