@@ -437,7 +437,8 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
                 subgoal_every: int = 5, explore: str = "(none)",
                 knowledge_block: str = "",
                 has_unentered_terminus_door: bool = False,
-                has_unvisited_pokecenter_in_area: bool = False) -> List[Tuple[GoalPath, str]]:
+                has_unvisited_pokecenter_in_area: bool = False,
+                has_pending_post_defeat_prep: bool = False) -> List[Tuple[GoalPath, str]]:
     closed: List[Tuple[GoalPath, str]] = []
     subtree = goals.frontier()
     checked_active = False
@@ -451,6 +452,13 @@ def check_goals(goals: GoalTree, digest: str, notepad: str, vlm_caller: VLMCalle
             and "visit the city" in (subtree.root.description or "").lower()
         ):
             return closed
+        if has_pending_post_defeat_prep and subtree.root.source in ("defeat", "excursion"):
+            desc_low = (subtree.root.description or "").lower()
+            if any(
+                kw in desc_low
+                for kw in ("restock", "potion", "shop", "mart", "department", "train", "level", "explore the facility")
+            ):
+                return closed
         prompt = (_goal_prompt(P.GOAL_CHECK_PROMPT, game, path, subtree, notepad, current,
                                knowledge_block=knowledge_block)
                   .replace("[DIGEST]", digest))

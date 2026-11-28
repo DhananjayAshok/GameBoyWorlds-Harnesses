@@ -120,6 +120,11 @@ class PartyInventoryState(StrategistArtifact):
             self.record_learned_move(raw_m, raw_p)
         self.active_move_names: Dict[int, str] = {}
         self.active_move_types: Dict[int, str] = {}
+        self.active_pokemon_level: Optional[int] = None
+        self.last_defeat_episode: Optional[int] = None
+        self.last_defeat_party_level: Optional[int] = None
+        self.last_defeat_healing_bag_empty: bool = False
+        self.learned_move_since_defeat: bool = False
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -131,6 +136,16 @@ class PartyInventoryState(StrategistArtifact):
             self.active_move_names = {}
         if not hasattr(self, "active_move_types") or self.active_move_types is None:
             self.active_move_types = {}
+        if not hasattr(self, "active_pokemon_level"):
+            self.active_pokemon_level = None
+        if not hasattr(self, "last_defeat_episode"):
+            self.last_defeat_episode = None
+        if not hasattr(self, "last_defeat_party_level"):
+            self.last_defeat_party_level = None
+        if not hasattr(self, "last_defeat_healing_bag_empty"):
+            self.last_defeat_healing_bag_empty = False
+        if not hasattr(self, "learned_move_since_defeat"):
+            self.learned_move_since_defeat = False
 
     @staticmethod
     def normalize_move_name(move_name: Optional[str]) -> str:
@@ -173,8 +188,13 @@ class PartyInventoryState(StrategistArtifact):
                     if norm_poke and not ex_holder:
                         self.learned_move_holders[existing] = norm_poke
                     return False
-        if norm_move not in self.learned_moves:
+        is_new = norm_move not in self.learned_moves
+        if is_new:
             self.learned_moves.append(norm_move)
+            if getattr(self, "last_defeat_episode", None) is not None and (
+                episode_number is None or episode_number > self.last_defeat_episode
+            ):
+                self.learned_move_since_defeat = True
         if norm_poke:
             self.learned_move_holders[norm_move] = norm_poke
         if episode_number is not None:
@@ -522,6 +542,78 @@ class PartyInventoryState(StrategistArtifact):
             self.healing_exhausted = True
         if is_status_heal_item_name(norm) and not self.has_status_heal_item and self.bag_complete:
             self.status_heal_exhausted = True
+
+    LEVEL_GROW_PATTERN = re.compile(
+        r"\bgrew\s+to\s+level\s+(\d{1,3})\b",
+        re.IGNORECASE,
+    )
+    PLAYER_LEVEL_TAG_PATTERN = re.compile(
+        r"\[Active Pokemon level seen in (?:battle|menu):\s*(\d{1,3})\]",
+        re.IGNORECASE,
+    )
+    CALL_PLAYER_LEVEL_PATTERN = re.compile(
+        r"(?:\b(?:my|our|active(?:\s+pokemon)?)\s+[A-Za-z0-9_.'♀♂-]+\s*\(\s*Lv\.?\s*(\d{1,3})\s*\)"
+        r"|\b(?:my|our|active(?:\s+pokemon)?)\s+(?:Lv\.?|L|level)\s*(\d{1,3})\b)",
+        re.IGNORECASE,
+    )
+
+    def record_active_level(
+        self,
+        level: Optional[int],
+        episode_number: Optional[int] = None,
+    ) -> None:
+        if level is None:
+            return
+        lvl = int(level)
+        if 1 <= lvl <= 100:
+            if self.active_pokemon_level is None or lvl >= self.active_pokemon_level:
+                self.active_pokemon_level = lvl
+                if episode_number is not None:
+                    self.last_written = episode_number
+
+    def record_defeat(self, episode_number: Optional[int] = None) -> None:
+        if episode_number is not None:
+            self.last_defeat_episode = int(episode_number)
+            self.last_written = int(episode_number)
+        self.last_defeat_party_level = self.active_pokemon_level
+        self.last_defeat_healing_bag_empty = bool(self.healing_bag_empty)
+        self.learned_move_since_defeat = False
+
+    def needs_post_defeat_preparation(self) -> bool:
+        if self.last_defeat_episode is None:
+            return False
+        if not self.healing_bag_empty:
+            return False
+        if (
+            self.active_pokemon_level is not None
+            and self.last_defeat_party_level is not None
+            and self.active_pokemon_level > self.last_defeat_party_level
+        ):
+            return False
+        if self.learned_move_since_defeat:
+            return False
+        return True
+
+    @classmethod
+    def extract_player_level_from_text(cls, text: str) -> Optional[int]:
+        if not text:
+            return None
+        best: Optional[int] = None
+        for m in cls.PLAYER_LEVEL_TAG_PATTERN.finditer(text):
+            val = int(m.group(1))
+            if 1 <= val <= 100 and (best is None or val >= best):
+                best = val
+        for m in cls.LEVEL_GROW_PATTERN.finditer(text):
+            val = int(m.group(1))
+            if 1 <= val <= 100 and (best is None or val >= best):
+                best = val
+        for m in cls.CALL_PLAYER_LEVEL_PATTERN.finditer(text):
+            raw = m.group(1) or m.group(2)
+            if raw:
+                val = int(raw)
+                if 1 <= val <= 100 and (best is None or val >= best):
+                    best = val
+        return best
 
     def record_full_heal(self, episode_number: Optional[int] = None, *, preserve_max_hp: bool = False) -> None:
         self.fought_since_heal = 0
@@ -950,7 +1042,11 @@ class PartyInventoryState(StrategistArtifact):
             and not has_remaining_heal
         ):
             self.mark_healing_bag_empty()
+        lvl = self.extract_player_level_from_text(notes)
+        if lvl is not None:
+            self.record_active_level(lvl, episode_number=episode_number)
         if getattr(report, "termination_reason", None) == "battle_lost":
+            self.record_defeat(episode_number=episode_number)
             self.record_full_heal(episode_number=episode_number)
             return
         hp = self.extract_player_hp_from_text(notes)
@@ -1104,7 +1200,37 @@ class PartyInventoryState(StrategistArtifact):
 
         self.update_learned_moves_from_text(digest, episode_number=getattr(record, "n", None))
 
-        if self.is_real_battle_loss(record) or self.is_healing_digest(digest):
+        lvl = self.extract_player_level_from_text(digest)
+        if lvl is None and getattr(record, "supervisor_report", None) is not None:
+            for ex in record.supervisor_report.executor_reports:
+                if ex.executor_name == "CombatExecutor":
+                    for call in ex.vlm_call_log:
+                        if isinstance(call, ExecutorVLMCallRecord) and call.tag in (
+                            "combat_step",
+                            "combat_move",
+                            "battle_step",
+                            "battle_move",
+                        ):
+                            found_l = self.extract_player_level_from_text(str(call.response))
+                            if found_l is not None:
+                                lvl = found_l
+        if lvl is None and strategist_calls:
+            for c in strategist_calls:
+                if c.stage == "defeat_reflection":
+                    idx = c.prompt.find("The battle, as the player fought it:")
+                    end = c.prompt.find("The first image is the battle screen")
+                    if idx != -1:
+                        lvl = self.extract_player_level_from_text(
+                            c.prompt[idx:end if end != -1 else len(c.prompt)]
+                        )
+        if lvl is not None:
+            self.record_active_level(lvl, episode_number=getattr(record, "n", None))
+
+        if self.is_real_battle_loss(record):
+            self.record_defeat(episode_number=getattr(record, "n", None))
+            self.record_full_heal(episode_number=record.n)
+            return
+        if self.is_healing_digest(digest):
             self.record_full_heal(episode_number=record.n)
             return
 

@@ -37,7 +37,8 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  read_bag_cursor_row, read_bag_cursor_row_index,
                                                  read_bag_item_list,
                                                  read_bag_item_quantities, read_battle_hud_hp,
-                                                 read_battle_hud_status, read_dialogue_box_lines,
+                                                 read_battle_hud_level, read_battle_hud_status,
+                                                 read_battle_opponent_hud_level, read_dialogue_box_lines,
                                                  read_menu_cursor_item_name,
                                                  read_battle_opponent_hud_name,
                                                  read_move_menu_cursor_slot,
@@ -45,6 +46,7 @@ from execution.perception.pokemon.battle import (has_bottom_dialogue_box, has_bo
                                                  read_move_menu_type,
                                                  read_party_menu_compatibility,
                                                  read_party_menu_cursor_slot, read_party_menu_hp,
+                                                 read_party_menu_level,
                                                  read_party_menu_members, read_party_menu_status,
                                                  read_move_learning_dialogue_status,
                                                  read_party_move_forget_list, read_quantity_selector_value,
@@ -2349,7 +2351,7 @@ class CombatExecutor(PolicyExecutor):
 The image is the current battle screen.
 [HISTORY]
 Choose what to do next:
-- fight: attack, and say which of the four moves to use (1 is the top one; use your strongest non-resisted damaging move with PP left rather than non-damaging accuracy/stat moves against lower-level opponents you can defeat directly; if a move was already shown to be "not very effective" or had no effect against the current opponent and another damaging move with PP left is available that is not resisted, switch to that non-resisted damaging move rather than repeating the resisted move, even if a general battle tip prefers the resisted move)
+- fight: attack, and say which of the four moves to use (1 is the top one; use your strongest non-resisted damaging move with PP left rather than non-damaging accuracy/stat moves against lower-level opponents you can defeat directly, and prefer STAB damaging moves over low-power non-STAB utility HMs like CUT when neither is resisted; if the opponent is using an escalating multi-turn attack like ROLLOUT or FURY CUTTER that doubles in power each consecutive hit and you cannot knock it out in one hit, use an accuracy-lowering move like SMOKESCREEN, SAND-ATTACK, or FLASH immediately if available and not yet applied; if a move was already shown to be "not very effective" or had no effect against the current opponent and another damaging move with PP left is available that is not resisted, switch to that non-resisted damaging move rather than repeating the resisted move, even if a general battle tip prefers the resisted move)
 - progress: press through battle text, or continue when there is no choice to make
 - run: try to escape. This never works against another trainer
 - bag: open the bag to use an item; choose this in a trainer battle whenever your active Pokemon's HP is at or below 50% of max HP (do not gamble on knocking out a healthy opponent first when your HP is at or below 50%), unless the opponent's HP bar is already at critical red (nearly empty) and you can finish it off immediately on this turn with a damaging move, or a note below says the bag has no usable item
@@ -2469,6 +2471,8 @@ Press: <one of up, down, left, right, confirm, back>
         self._current_opponent_name: Optional[str] = None
         self._resisted_moves_for_opponent: Dict[int, str] = {}
         self._immune_moves_for_opponent: Dict[int, str] = {}
+        self._opponent_escalating_move: Optional[str] = None
+        self._opponent_accuracy_lowered: int = 0
         self._seen_bag_items: List[str] = list(party_state.items) if party_state is not None else []
         self._bag_item_quantities: Dict[str, Optional[int]] = (
             dict(party_state.quantities) if party_state is not None else {}
@@ -2757,18 +2761,54 @@ Press: <one of up, down, left, right, confirm, back>
             parts.append(f"dismissed {stat_dismisses} stat box{'es' if stat_dismisses > 1 else ''}")
         return (", then " + " and ".join(parts)) if parts else ""
 
+    ACCURACY_REDUCTION_MOVE_NAMES = (
+        "SMOKESCREEN",
+        "SMOKESCR",
+        "SAND-ATTACK",
+        "SAND ATTACK",
+        "FLASH",
+        "KINESIS",
+        "MUD-SLAP",
+    )
+
+    LOW_POWER_UTILITY_HM_MOVES = (
+        "CUT",
+        "ROCK SMASH",
+        "WHIRLPOOL",
+    )
+
     def _update_opponent_tracking(self, frame: Optional[np.ndarray] = None, texts: Optional[List[str]] = None) -> None:
         if texts:
             joined = "\n".join(texts)
             if re.search(r"\b(?:sent\s+out|fainted!|about\s+to\s+use)\b", joined, re.IGNORECASE):
                 self._resisted_moves_for_opponent.clear()
                 self._immune_moves_for_opponent.clear()
+                self._opponent_escalating_move = None
+                self._opponent_accuracy_lowered = 0
+            m_esc = re.search(
+                r"\b(?:Enemy|Wild|Foe)\s+[A-Z0-9♀♂.'-]+\s+used\s+(ROLLOUT|FURY\s+CUTTER|RAGE|BIDE)!",
+                joined,
+                re.IGNORECASE,
+            )
+            if m_esc:
+                self._opponent_escalating_move = " ".join(m_esc.group(1).upper().split())
+            if re.search(
+                r"\b(?:Enemy|Wild|Foe)\s+[A-Z0-9♀♂.'-]+(?:'s|’s)?\s+accuracy\s+fell!",
+                joined,
+                re.IGNORECASE,
+            ):
+                self._opponent_accuracy_lowered += 1
         if frame is not None:
+            lvl = read_battle_hud_level(frame) or read_party_menu_level(frame)
+            if lvl is not None and self._party_state is not None:
+                self._party_state.record_active_level(lvl)
             opp = read_battle_opponent_hud_name(frame)
             if opp:
                 if self._current_opponent_name and opp != self._current_opponent_name:
                     self._resisted_moves_for_opponent.clear()
                     self._immune_moves_for_opponent.clear()
+                    self._opponent_escalating_move = None
+                    self._opponent_accuracy_lowered = 0
                 self._current_opponent_name = opp
 
     def _record_move_effectiveness(self, move_slot: Optional[int], texts: List[str]) -> str:
@@ -3294,6 +3334,8 @@ Press: <one of up, down, left, right, confirm, back>
                 details: List[str] = []
                 if s in self._move_types:
                     details.append(f"type: {self._move_types[s]}")
+                if m_name in self.LOW_POWER_UTILITY_HM_MOVES:
+                    details.append("low-power utility HM — prefer STAB damaging moves when unresisted")
                 if s in self._move_pp:
                     details.append(f"PP: {self._move_pp[s][0]}/{self._move_pp[s][1]}")
                 elif s in self._zero_pp_slots:
@@ -3305,6 +3347,22 @@ Press: <one of up, down, left, right, confirm, back>
                 detail_str = f" [{', '.join(details)}]" if details else ""
                 move_Descs.append(f"Move {s}: {m_name}{detail_str}")
             lines.append(f"Known active Pokemon moves: {'; '.join(move_Descs)}.")
+        if self._opponent_escalating_move and not is_battle_opponent_critical_hp(cur_frame):
+            acc_slots = [
+                f"Move {s} ({self._move_names[s]})"
+                for s in sorted(self._move_names)
+                if s not in self._zero_pp_slots
+                and any(
+                    self._move_names[s] == a or self._move_names[s].startswith(a[:7])
+                    for a in self.ACCURACY_REDUCTION_MOVE_NAMES
+                )
+            ]
+            if acc_slots and self._opponent_accuracy_lowered < 2:
+                lines.append(
+                    f"Note: Opponent is using escalating multi-turn attack {self._opponent_escalating_move} "
+                    f"(power doubles on every consecutive hit) — use {', '.join(acc_slots)} immediately to lower "
+                    f"the opponent's accuracy and break the {self._opponent_escalating_move} chain before it snowballs."
+                )
         if self._immune_moves_for_opponent or self._resisted_moves_for_opponent:
             bad_parts: List[str] = []
             for s in sorted(set(self._immune_moves_for_opponent) | set(self._resisted_moves_for_opponent)):
@@ -3467,6 +3525,24 @@ Press: <one of up, down, left, right, confirm, back>
                 last_list = [part.strip() for part in raw.split(",") if part.strip()]
         return last_list
 
+    def _last_seen_player_level(self) -> Optional[int]:
+        last_lvl: Optional[int] = None
+        for step in self.report.steps:
+            if isinstance(step, EnvironmentStepRecord):
+                for frame in (step.frame_before, step.frame_after):
+                    found_l = read_battle_hud_level(frame) or read_party_menu_level(frame)
+                    if found_l is not None and (last_lvl is None or found_l >= last_lvl):
+                        last_lvl = found_l
+        if last_lvl is not None:
+            return last_lvl
+        if self._party_state is not None:
+            for call in self.report.vlm_call_log:
+                if isinstance(call, ExecutorVLMCallRecord) and call.tag in (self.STEP_TAG, self.MOVE_TAG):
+                    found_l = self._party_state.extract_player_level_from_text(str(call.response))
+                    if found_l is not None and (last_lvl is None or found_l >= last_lvl):
+                        last_lvl = found_l
+        return last_lvl
+
     def _last_seen_player_hp(self) -> Optional[Tuple[int, int]]:
         last_hud: Optional[Tuple[int, int]] = None
         for step in self.report.steps:
@@ -3589,8 +3665,14 @@ Press: <one of up, down, left, right, confirm, back>
                 self.battle_lost = True
         self.report.termination_reason = reason
         notes_lines = list(self.dialogue_text)
+        last_lvl = self._last_seen_player_level()
+        if last_lvl is not None:
+            if self._party_state is not None:
+                self._party_state.record_active_level(last_lvl)
+            notes_lines.append(f"[Active Pokemon level seen in battle: {last_lvl}]")
         if reason == "battle_lost":
             if self._party_state is not None:
+                self._party_state.record_defeat()
                 self._party_state.record_full_heal()
         else:
             last_hp = self._last_seen_player_hp()

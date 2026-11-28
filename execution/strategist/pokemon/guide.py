@@ -109,19 +109,73 @@ class StrategyGuide(StrategistArtifact):
         for seed in self.missing_seeds(seeds):
             self.add_rule(seed["trigger"], seed["rule"], "seed", episode, episode_number=episode)
 
-    def active_event(self, gmap: GlobalMap, episode: int,
-                     goal_completed_since_entry: bool = False) -> Optional[GuideEvent]:
-        if not self.events:
-            return None
-        event = self.events[-1]
+    def _is_event_active(
+        self,
+        event: GuideEvent,
+        gmap: GlobalMap,
+        episode: int,
+        goal_completed_since_entry: bool = False,
+        party_needs_town_heal: bool = True,
+    ) -> bool:
+        if episode - event.episode >= ACTIVE_EPISODES:
+            return False
         here = gmap.resolve(gmap.segment, (0, 0))[0]
-        if episode - event.episode >= ACTIVE_EPISODES or (
-                event.segment is not None and gmap.resolve(event.segment, (0, 0))[0] != here):
-            return None
+        if event.segment is not None and gmap.resolve(event.segment, (0, 0))[0] != here:
+            return False
         if event.trigger == ENTERED_BUILDING and (
-                getattr(event, "completed_goal", False) or goal_completed_since_entry):
-            return None
-        return event
+            getattr(event, "completed_goal", False) or goal_completed_since_entry
+        ):
+            return False
+        if event.trigger == NEW_TOWN:
+            if not party_needs_town_heal:
+                return False
+            if gmap.info(here).kind == BUILDING:
+                return False
+        return True
+
+    def active_events(
+        self,
+        gmap: GlobalMap,
+        episode: int,
+        goal_completed_since_entry: bool = False,
+        party_needs_town_heal: bool = True,
+    ) -> List[GuideEvent]:
+        if not self.events:
+            return []
+        out: List[GuideEvent] = []
+        last_ev = self.events[-1]
+        if self._is_event_active(
+            last_ev,
+            gmap,
+            episode,
+            goal_completed_since_entry=goal_completed_since_entry,
+            party_needs_town_heal=party_needs_town_heal,
+        ):
+            out.append(last_ev)
+        if not any(e.trigger == NEW_TOWN for e in out) and party_needs_town_heal:
+            for ev in reversed(self.events[:-1]):
+                if ev.trigger == NEW_TOWN:
+                    if self._is_event_active(
+                        ev,
+                        gmap,
+                        episode,
+                        goal_completed_since_entry=goal_completed_since_entry,
+                        party_needs_town_heal=party_needs_town_heal,
+                    ):
+                        out.insert(0, ev)
+                    break
+        return out
+
+    def active_event(self, gmap: GlobalMap, episode: int,
+                     goal_completed_since_entry: bool = False,
+                     party_needs_town_heal: bool = True) -> Optional[GuideEvent]:
+        events = self.active_events(
+            gmap,
+            episode,
+            goal_completed_since_entry=goal_completed_since_entry,
+            party_needs_town_heal=party_needs_town_heal,
+        )
+        return events[0] if events else None
 
     @update
     def mark_goal_completed(self, gmap: GlobalMap) -> bool:
@@ -172,15 +226,27 @@ class StrategyGuide(StrategistArtifact):
 
 
 def guide_block(guide: StrategyGuide, gmap: GlobalMap, episode: int,
-                goal_completed_since_entry: bool = False) -> str:
-    event = guide.active_event(gmap, episode, goal_completed_since_entry=goal_completed_since_entry)
-    if event is None or not guide.rules_for(event.trigger):
-        return ""
-    lines = [f"\nYour strategy guide: the player {event.trigger} ({event.place}) in episode "
-             f"{event.episode}, so these rules of yours apply. Follow them only if your current goal does not "
-             f"already give a clear next step or require leaving this building:"]
-    lines += [f"- {r.text}" for r in guide.rules_for(event.trigger)]
-    return "\n".join(lines) + "\n"
+                goal_completed_since_entry: bool = False,
+                party_needs_town_heal: bool = True) -> str:
+    events = guide.active_events(
+        gmap,
+        episode,
+        goal_completed_since_entry=goal_completed_since_entry,
+        party_needs_town_heal=party_needs_town_heal,
+    )
+    blocks: List[str] = []
+    for event in events:
+        rules = guide.rules_for(event.trigger)
+        if not rules:
+            continue
+        lines = [
+            f"\nYour strategy guide: the player {event.trigger} ({event.place}) in episode "
+            f"{event.episode}, so these rules of yours apply. Follow them only if your current goal does not "
+            f"already give a clear next step or require leaving this building:"
+        ]
+        lines += [f"- {r.text}" for r in rules]
+        blocks.append("\n".join(lines))
+    return ("\n".join(blocks) + "\n") if blocks else ""
 
 
 def record_events(guide: StrategyGuide, gmap: GlobalMap, warps: Sequence[Tuple], episode: int,

@@ -1528,6 +1528,87 @@ def _read_status_code_on_row(img: np.ndarray, ty: int, tx_start: int, tx_end: in
     return None
 
 
+HUD_LEVEL_PREFIX_SIGNATURES = {
+    (0, 0, 24, 88, 24, 88, 30, 0),
+}
+
+
+def _read_hud_level_on_row(img: np.ndarray, ty: int, tx_start: int, tx_end: int) -> Optional[int]:
+    y0 = ty * TILE_SIZE
+    if img.shape[0] < y0 + TILE_SIZE:
+        return None
+    max_tx = min(tx_end, img.shape[1] // TILE_SIZE)
+    for tx in range(tx_start, max_tx - 1):
+        tile = img[y0:y0 + TILE_SIZE, tx * TILE_SIZE:(tx + 1) * TILE_SIZE]
+        if float((tile >= LIGHT_BACKGROUND).mean()) < 0.45:
+            continue
+        if _tile_row_signature(tile) not in HUD_LEVEL_PREFIX_SIGNATURES:
+            continue
+        digits: List[str] = []
+        for dtx in range(tx + 1, min(tx + 4, max_tx)):
+            dtile = img[y0:y0 + TILE_SIZE, dtx * TILE_SIZE:(dtx + 1) * TILE_SIZE]
+            if float((dtile >= LIGHT_BACKGROUND).mean()) < 0.45:
+                break
+            dsig = _tile_row_signature(dtile)
+            if dsig in HUD_DIGIT_TEMPLATES:
+                digits.append(str(HUD_DIGIT_TEMPLATES[dsig]))
+            else:
+                break
+        if digits:
+            val = int("".join(digits))
+            if 1 <= val <= 100:
+                return val
+    return None
+
+
+def read_battle_hud_level(frame: np.ndarray) -> Optional[int]:
+    """Return the active player Pokemon's level (1..100) from the battle HUD at tile row 8, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if read_battle_hud_hp(img) is None:
+        return None
+    return _read_hud_level_on_row(img, ty=8, tx_start=12, tx_end=19)
+
+
+def read_battle_opponent_hud_level(frame: np.ndarray) -> Optional[int]:
+    """Return the opponent Pokemon's level (1..100) from the top-left battle HUD at tile row 1, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if read_battle_opponent_hud_name(img) is None:
+        return None
+    return _read_hud_level_on_row(img, ty=1, tx_start=3, tx_end=12)
+
+
+def read_party_menu_level(frame: np.ndarray) -> Optional[int]:
+    """Return the selected (or lead) Pokemon's level (1..100) from the party menu screen, or None."""
+    if frame is None:
+        return None
+    img = _grey_frame(frame)
+    if not is_party_menu_screen(img):
+        return None
+    target_slot_ty = 1
+    for slot_ty in (1, 3, 5, 7, 9, 11):
+        found_cursor = False
+        for cursor_ty in (slot_ty - 1, slot_ty):
+            if 0 <= cursor_ty < 12 and is_cursor_tile(
+                img[cursor_ty * TILE_SIZE:(cursor_ty + 1) * TILE_SIZE, :TILE_SIZE]
+            ):
+                if _read_tile_hp_fraction(img, ty=slot_ty, slash_tx=16) is not None:
+                    target_slot_ty = slot_ty
+                    found_cursor = True
+                    break
+        if found_cursor:
+            break
+    for check_ty in (target_slot_ty - 1, target_slot_ty, target_slot_ty + 1):
+        if 0 <= check_ty < 13:
+            lvl = _read_hud_level_on_row(img, ty=check_ty, tx_start=6, tx_end=18)
+            if lvl is not None:
+                return lvl
+    return None
+
+
 def read_battle_hud_status(frame: np.ndarray) -> Optional[str]:
     """Return the active Pokemon's status code ('PSN', 'BRN', 'PAR', 'SLP', 'FRZ'), '' if healthy, or None if HUD not visible."""
     if frame is None:

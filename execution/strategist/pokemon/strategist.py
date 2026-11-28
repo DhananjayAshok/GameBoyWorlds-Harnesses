@@ -979,6 +979,22 @@ class PokemonStrategist:
                     ep.summary = sanitize_false_loss_summary(ep.summary)
                 if not self._had_saved_party_artifact:
                     self._record_party_episode(ep, archive.strategist_calls)
+                else:
+                    digest = ep.supervisor_report.digest if getattr(ep, "supervisor_report", None) else ""
+                    lvl = self.party.extract_player_level_from_text(digest)
+                    if lvl is None and archive.strategist_calls:
+                        for c in archive.strategist_calls:
+                            if c.stage == "defeat_reflection":
+                                idx = c.prompt.find("The battle, as the player fought it:")
+                                end = c.prompt.find("The first image is the battle screen")
+                                if idx != -1:
+                                    lvl = self.party.extract_player_level_from_text(
+                                        c.prompt[idx:end if end != -1 else len(c.prompt)]
+                                    )
+                    if lvl is not None:
+                        self.party.record_active_level(lvl, episode_number=ep.n)
+                    if self.party.is_real_battle_loss(ep):
+                        self.party.record_defeat(episode_number=ep.n)
                 if n in keep_from:
                     episodes.append(ep)
             except Exception as e:  # noqa: BLE001
@@ -1212,6 +1228,8 @@ class PokemonStrategist:
         if min_entered_dist is not None and min_entered_dist < 35:
             return None
         if min_entered_dist is None:
+            if len(unentered_candidates) > 1 or self._unvisited_pokemon_center_door_in_area() is not None:
+                return None
             has_known_gym = any(
                 "gym" in (gmap.info(s).name or "").lower()
                 for s in range(len(gmap.segments))
@@ -1345,12 +1363,24 @@ class PokemonStrategist:
         candidates.sort(key=lambda c: (c["path_steps"] is None, c["path_steps"] or c["steps"], c["steps"]))
         return candidates[0]
 
+    def _needs_post_gym_defeat_preparation(self) -> bool:
+        gmap = self.global_map
+        if not gmap.current:
+            return False
+        if not self.party.needs_post_defeat_preparation():
+            return False
+        has_gym_defeat = any(
+            "gym" in (gmap.info(gmap.resolve(d["segment"], d["pos"])[0]).name or "").lower()
+            for d in getattr(gmap, "defeats", ())
+        )
+        return has_gym_defeat
+
     def _post_gym_defeat_unvisited_door_in_area(self) -> Optional[Dict[str, Any]]:
         from execution.strategist.pokemon.global_map.routes import _snap, compress_moves, path_in_segment, walked_squares
-        from execution.strategist.pokemon.global_map.text import project_route_next_leg, sector
+        from execution.strategist.pokemon.global_map.text import frontier_targets, project_route_next_leg, sector
 
         gmap = self.global_map
-        if not gmap.current or not self._healing_bag_empty:
+        if not self._needs_post_gym_defeat_preparation():
             return None
         cur_seg, (px, py) = gmap.resolve(gmap.segment, gmap.pos)
         if gmap.info(cur_seg).kind == "building":
@@ -1358,15 +1388,24 @@ class PokemonStrategist:
         subtree = self.goals.frontier()
         if subtree is None:
             return None
-        desc_lower = (subtree.root.description or "").lower()
-        if not any(kw in desc_lower for kw in ("gym", "leader")):
+        path = self.goals.path_to(subtree) or ()
+        path_text = " ".join(path).lower()
+        if not any(kw in path_text for kw in ("gym", "leader")):
             return None
-        has_gym_defeat = any(
-            "gym" in (gmap.info(gmap.resolve(d["segment"], d["pos"])[0]).name or "").lower()
-            for d in getattr(gmap, "defeats", ())
-        )
-        if not has_gym_defeat:
+        seg = gmap.segments[cur_seg]
+        if not seg:
             return None
+        doors_here = gmap.reachable_door_list(cur_seg)
+        pc_cells: List[Tuple[int, int]] = []
+        gym_cells: List[Tuple[int, int]] = []
+        for d in doors_here:
+            leads_to = d.get("leads_to")
+            if leads_to is not None:
+                lname = (gmap.info(gmap.resolve(leads_to, (0, 0))[0]).name or "").lower()
+                if "center" in lname and "mart" not in lname:
+                    pc_cells.extend(d.get("cells") or [])
+                elif "gym" in lname:
+                    gym_cells.extend(d.get("cells") or [])
         walked = walked_squares(gmap, cur_seg)
         seg_blocked = self._current_segment_blocked_moves()
         local = (
@@ -1383,7 +1422,7 @@ class PokemonStrategist:
             else None
         )
         candidates: List[Dict[str, Any]] = []
-        for d in gmap.reachable_door_list(cur_seg):
+        for d in doors_here:
             if d.get("leads_to") is not None:
                 continue
             cells = d.get("cells") or []
@@ -1391,6 +1430,39 @@ class PokemonStrategist:
                 continue
             goal_cell = min(cells, key=lambda g: abs(g[0] - px) + abs(g[1] - py))
             dx, dy = goal_cell[0] - px, goal_cell[1] - py
+            is_mart = False
+            for dc in cells:
+                for ox in range(-3, 4):
+                    for oy in range(-1, 2):
+                        if (ox, oy) == (0, 0):
+                            continue
+                        nb = (dc[0] + ox, dc[1] + oy)
+                        c = seg.get(nb)
+                        if c is not None and "sign" in c.tags:
+                            label = (
+                                gmap.cell_facility_sign_label(cur_seg, nb)
+                                if hasattr(gmap, "cell_facility_sign_label")
+                                else None
+                            )
+                            if label == "Poké Mart sign":
+                                is_mart = True
+                                break
+                    if is_mart:
+                        break
+                if is_mart:
+                    break
+            in_town_hub = True
+            if pc_cells or gym_cells:
+                hub_dists = [
+                    abs(goal_cell[0] - hc[0]) + abs(goal_cell[1] - hc[1])
+                    for hc in (pc_cells + gym_cells)
+                ]
+                in_town_hub = min(hub_dists) <= 32
+                if gym_cells and pc_cells:
+                    min_pc_y = min(c[1] for c in pc_cells)
+                    min_gym_y = min(c[1] for c in gym_cells)
+                    if min_gym_y >= min_pc_y and goal_cell[1] < min_pc_y - 8:
+                        in_town_hub = False
             snapped = _snap(gmap, cur_seg, goal_cell, walked)
             found = (
                 path_in_segment(gmap, cur_seg, (px, py), snapped, walked, blocked_moves=seg_blocked)
@@ -1405,6 +1477,9 @@ class PokemonStrategist:
                 else None
             )
             candidates.append({
+                "kind": "door",
+                "is_mart": is_mart,
+                "in_town_hub": in_town_hub,
                 "dx": dx,
                 "dy": dy,
                 "steps": abs(dx) + abs(dy),
@@ -1414,10 +1489,36 @@ class PokemonStrategist:
                 "path_moves": path_moves,
                 "next_leg": next_leg,
             })
-        if not candidates:
-            return None
-        candidates.sort(key=lambda c: (c["path_steps"] is None, c["path_steps"] or c["steps"], c["steps"]))
-        return candidates[0]
+        if candidates:
+            candidates.sort(
+                key=lambda c: (
+                    not c["is_mart"],
+                    not c["in_town_hub"],
+                    c["path_steps"] is None,
+                    c["path_steps"] or c["steps"],
+                    c["steps"],
+                )
+            )
+            best = candidates[0]
+            if best["in_town_hub"] or best["is_mart"]:
+                return best
+        targets, _ = frontier_targets(gmap, local, blocked_moves=seg_blocked)
+        if targets:
+            t0 = targets[0]
+            return {
+                "kind": "frontier",
+                "is_mart": False,
+                "in_town_hub": True,
+                "dx": t0["dx"],
+                "dy": t0["dy"],
+                "steps": t0["steps"],
+                "sector": t0["sector"],
+                "cell": (px + t0["dx"], py + t0["dy"]),
+                "path_steps": t0.get("path_steps"),
+                "path_moves": t0.get("path_moves"),
+                "next_leg": t0.get("next_leg"),
+            }
+        return candidates[0] if candidates else None
 
     def _sync_excursion_goal(self, n: int) -> None:
         from execution.strategist.pokemon.global_map.text import frontier_targets
@@ -1519,6 +1620,26 @@ class PokemonStrategist:
                 if path is None:
                     return
 
+        if subtree.root.source == "excursion" and "restock Potions" in (subtree.root.description or ""):
+            if not self._needs_post_gym_defeat_preparation():
+                self.goals.set_status(
+                    path,
+                    "complete",
+                    "Restocked healing items or improved party readiness after the Gym defeat.",
+                    episode_number=n,
+                )
+                next_sub = self.goals.frontier()
+                if next_sub is not None:
+                    next_path = self.goals.path_to(next_sub)
+                    if next_path is not None:
+                        self.goals.set_frontier(next_path, n, episode_number=n)
+                subtree = self.goals.frontier()
+                if subtree is None:
+                    return
+                path = self.goals.path_to(subtree)
+                if path is None:
+                    return
+
         post_defeat_door = self._post_gym_defeat_unvisited_door_in_area()
         if post_defeat_door is not None:
             sdx, sdy = post_defeat_door["dx"], post_defeat_door["dy"]
@@ -1528,17 +1649,29 @@ class PokemonStrategist:
                 if post_defeat_door.get("path_moves")
                 else ""
             )
-            shop_desc = (
-                f"Enter the unentered town building doorway at ({sdx}, {sdy}) to explore the facility "
-                f"and restock Potions or supplies before re-challenging the Gym Leader"
-            )
-            shop_details = (
-                f"Your bag has 0 healing items (`healing_bag_empty`) after losing a Gym battle, and there is an "
-                f"unentered building doorway in this town at relative ({sdx}, {sdy}) ({ssteps} steps {ssec} from "
-                f"current position {cur_pos}, `NOT entered yet`){sroute}. Walk to and enter ({sdx}, {sdy}) to "
-                f"check if it is a Poké Mart or Department Store where you can buy Potions (or obtain an item/clue) "
-                f"before returning to the Gym."
-            )
+            if post_defeat_door.get("kind") == "frontier":
+                shop_desc = (
+                    f"Explore the unmapped town street at ({sdx}, {sdy}) to uncover town shop or facility "
+                    f"doorways and restock Potions or supplies before re-challenging the Gym Leader"
+                )
+                shop_details = (
+                    f"Your bag has 0 healing items (`healing_bag_empty`) and your party has not gained levels or "
+                    f"supplies since losing the Gym battle. Walk {ssteps} steps {ssec} to ({sdx}, {sdy}){sroute} "
+                    f"to uncover unmapped town building doorways (such as a Poké Mart or Department Store) and "
+                    f"restock Potions before returning to the Gym."
+                )
+            else:
+                shop_desc = (
+                    f"Enter the unentered town building doorway at ({sdx}, {sdy}) to explore the facility "
+                    f"and restock Potions or supplies before re-challenging the Gym Leader"
+                )
+                shop_details = (
+                    f"Your bag has 0 healing items (`healing_bag_empty`) after losing a Gym battle, and there is an "
+                    f"unentered building doorway in this town at relative ({sdx}, {sdy}) ({ssteps} steps {ssec} from "
+                    f"current position {cur_pos}, `NOT entered yet`){sroute}. Walk to and enter ({sdx}, {sdy}) to "
+                    f"check if it is a Poké Mart or Department Store where you can buy Potions (or obtain an item/clue) "
+                    f"before returning to the Gym."
+                )
             if subtree.root.source == "excursion" and "restock Potions" in (subtree.root.description or ""):
                 if subtree.root.description != shop_desc or subtree.root.details != shop_details:
                     self.goals.edit(
@@ -1740,12 +1873,21 @@ class PokemonStrategist:
                     if post_defeat_door.get("path_moves")
                     else ""
                 )
-                shop_note = (
-                    f"- Post-defeat preparation priority: Your bag has 0 healing items (`healing_bag_empty`) after "
-                    f"losing in the Gym, and the building doorway at ({sdx}, {sdy}) ({post_defeat_door['steps']} steps "
-                    f"{post_defeat_door['sector']}){s_route} is `NOT entered yet`. Walk to and enter ({sdx}, {sdy}) "
-                    f"to explore the building and buy Potions or obtain supplies BEFORE returning to the Gym."
-                )
+                if post_defeat_door.get("kind") == "frontier":
+                    shop_note = (
+                        f"- Post-defeat preparation priority: Your bag has 0 healing items (`healing_bag_empty`) and "
+                        f"your party has not gained levels or supplies since losing in the Gym. Walk to the unmapped "
+                        f"town street frontier at ({sdx}, {sdy}) ({post_defeat_door['steps']} steps "
+                        f"{post_defeat_door['sector']}){s_route} to uncover town shop/facility doorways and buy "
+                        f"Potions BEFORE returning to the Gym."
+                    )
+                else:
+                    shop_note = (
+                        f"- Post-defeat preparation priority: Your bag has 0 healing items (`healing_bag_empty`) after "
+                        f"losing in the Gym, and the building doorway at ({sdx}, {sdy}) ({post_defeat_door['steps']} steps "
+                        f"{post_defeat_door['sector']}){s_route} is `NOT entered yet`. Walk to and enter ({sdx}, {sdy}) "
+                        f"to explore the building and buy Potions or obtain supplies BEFORE returning to the Gym."
+                    )
                 notepad_text = f"{notepad_text}\n{shop_note}".strip() if notepad_text else shop_note
         terminus = self._route_terminus_unentered_door()
         if unvisited_pc is None and terminus is not None and not self._is_party_hp_low():
@@ -1769,8 +1911,18 @@ class PokemonStrategist:
                 .replace("[PARTY_BLOCK]", self._party_status_block())
                 .replace("[NOTEPAD]", notepad_text or "(empty)")
                 .replace("[KNOWLEDGE_BLOCK]", self._knowledge_context_block())
-                .replace("[GUIDE]", guide_block(self.guide, self.global_map, self.start_episode + self._episodes_run,
-                                                goal_completed_since_entry=self._goal_completed_since_building_entry())))
+                .replace("[GUIDE]", guide_block(
+                    self.guide,
+                    self.global_map,
+                    self.start_episode + self._episodes_run,
+                    goal_completed_since_entry=self._goal_completed_since_building_entry(),
+                    party_needs_town_heal=(
+                        self._fought_since_heal > 0
+                        or self._fled_since_heal > 0
+                        or self._is_party_hp_low()
+                        or self._unvisited_pokemon_center_door_in_area() is not None
+                    ),
+                )))
 
     def _map_opening_screen(self, frame: np.ndarray) -> None:
         free = self._env.get_info()["pokemon_core"]["agent_state"] == AgentState.FREE_ROAM
@@ -2085,6 +2237,10 @@ class PokemonStrategist:
         defeat = gmap.defeats[-1] if gmap.defeats else None
         where = gmap.defeat_route(defeat) if defeat is not None else "not known"
         battle, images = self._battle_log(report)
+        lvl = self.party.extract_player_level_from_text(battle)
+        if lvl is not None:
+            self.party.record_active_level(lvl, episode_number=n)
+        self.party.record_defeat(episode_number=n)
         answer = reflect_on_defeat(self.guide, task, frontier_text(self.goals), where, report.digest, battle,
                                    images, self._vlm_caller("defeat_reflection"), self._game, n, self._parameters)
         if answer is None:
@@ -2092,7 +2248,24 @@ class PokemonStrategist:
             return
         place = f" ({gmap.area_label(gmap.resolve(defeat['segment'], defeat['pos'])[0])})" if defeat else ""
         self._remember_all([f"The player lost a battle in episode {n}{place}: {answer['wrong']}"], n)
-        prepares = answer.get("prepares") or ([answer["prepare"]] if answer.get("prepare") else [])
+        prepares = list(answer.get("prepares") or ([answer["prepare"]] if answer.get("prepare") else []))
+        is_gym_defeat = (
+            "gym" in (where or "").lower()
+            or "gym" in (frontier_text(self.goals) or "").lower()
+            or "leader" in (frontier_text(self.goals) or "").lower()
+        )
+        if is_gym_defeat and self._healing_bag_empty:
+            has_restock_or_train = any(
+                any(
+                    kw in p.lower()
+                    for kw in ("potion", "restock", "shop", "mart", "department", "train", "level")
+                )
+                for p in prepares
+            )
+            if not has_restock_or_train:
+                prepares.append(
+                    "Explore unentered town buildings and shops to restock Potions or train your party to a higher level before re-challenging the Gym Leader."
+                )
         if prepares:
             frontier = self.goals.frontier()
             if frontier is not None:
@@ -2395,6 +2568,7 @@ class PokemonStrategist:
                 knowledge_block=self._knowledge_context_block(),
                 has_unentered_terminus_door=(self._route_terminus_unentered_door() is not None),
                 has_unvisited_pokecenter_in_area=(self._unvisited_pokemon_center_door_in_area() is not None),
+                has_pending_post_defeat_prep=self._needs_post_gym_defeat_preparation(),
             )
             self._sync_excursion_goal(n)
         summary, town = self._review(report.digest, fallback_summary=supervisor_summary)
