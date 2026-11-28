@@ -614,9 +614,10 @@ class PokemonPlayThroughSupervisor(Supervisor):
             self._task or "",
             re.IGNORECASE,
         ):
-            if self._npcs is not None and hasattr(self._npcs, "people_here"):
+            npc_reg = getattr(gmap, "_npcs", None) or getattr(self._env, "_npcs", None)
+            if npc_reg is not None and hasattr(npc_reg, "people_here"):
                 try:
-                    for _, sq in self._npcs.people_here(gmap):
+                    for _, sq in npc_reg.people_here(gmap):
                         if strictly_beyond(sq):
                             offscreen_entity_cells.add(sq)
                 except Exception:  # noqa: BLE001
