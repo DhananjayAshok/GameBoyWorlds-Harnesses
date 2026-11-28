@@ -4450,6 +4450,22 @@ Press: <one of up, down, left, right, confirm, back>
             and (self._overworld_menu_session or is_overworld_menu_or_ui_screen(frame))
         ):
             return AgentState.IN_MENU
+        if (
+            eff == AgentState.IN_DIALOGUE
+            and (
+                self._overworld_menu_session
+                or is_overworld_menu_or_ui_screen(frame)
+                or is_tm_hm_startup_dialogue_frame(frame)
+            )
+            and (
+                is_overworld_menu_or_ui_screen(frame)
+                or is_tm_hm_startup_dialogue_frame(frame)
+                or is_gen1_item_list_screen(frame)
+                or is_item_use_subbox_screen(frame)
+                or is_party_menu_screen(frame)
+            )
+        ):
+            return AgentState.IN_MENU
         return eff
 
     def _fail(self, code: int, reason: str, notes: Optional[str] = None) -> int:
@@ -4834,7 +4850,7 @@ Press: <one of up, down, left, right, confirm, back>
     def _advance_tm_hm_use_to_party_screen(self) -> bool:
         if self._current_call is None:
             self._begin_scripted("advance TM/HM startup prompts to party selection screen")
-        for _ in range(12):
+        for _ in range(20):
             if self._last_terminated or self._last_truncated:
                 return False
             cur_frame = self._get_state()["core"]["current_frame"]

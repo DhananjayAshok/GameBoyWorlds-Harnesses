@@ -934,7 +934,7 @@ def has_right_aligned_ui_box(frame: np.ndarray) -> bool:
 
 
 def is_overworld_menu_or_ui_screen(frame: np.ndarray) -> bool:
-    """Return True if the screen displays an overworld or full-screen menu/UI layout (party, Pack, Start menu, top box, or modal preview)."""
+    """Return True if the screen displays an overworld or full-screen menu/UI layout (party, Pack, Start menu, Gen 1 item list, top box, or modal preview)."""
     if frame is None:
         return False
     img = _grey_frame(frame)
@@ -946,6 +946,8 @@ def is_overworld_menu_or_ui_screen(frame: np.ndarray) -> bool:
         or is_party_menu_screen(img)
         or is_pack_screen(img)
         or is_start_menu_screen(img)
+        or is_gen1_item_list_screen(img)
+        or is_item_use_subbox_screen(img)
     )
 
 
