@@ -65,7 +65,13 @@ def complete_sprite(mask: np.ndarray) -> bool:
     rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
     if len(rows) == 0 or len(cols) == 0:
         return False
-    return bool(rows[0] <= 3 and rows[-1] >= 12 and cols[-1] - cols[0] + 1 >= 8 and mask.sum() >= 30)
+    return bool(
+        rows[0] <= 4
+        and rows[-1] >= 12
+        and rows[-1] - rows[0] + 1 >= 11
+        and cols[-1] - cols[0] + 1 >= 8
+        and mask.sum() >= 30
+    )
 
 
 def character_window_score(window: Optional[np.ndarray], level: int) -> int:
@@ -158,7 +164,7 @@ def full_window_ok(identified: Dict[Tuple[int, int, str], Any], cell: Cell) -> b
     if counts.get("npc", 0) == 4:
         return True
     walkable = (counts.get("ground", 0) + counts.get("ground decoration", 0)
-                + counts.get("tall grass", 0) + counts.get("unknown", 0))
+                + counts.get("tall grass", 0) + counts.get("water", 0) + counts.get("unknown", 0))
     if counts.get("npc", 0) >= 3 and walkable >= 1:
         return True
     tl = identified.get((cell[0], cell[1], "top_left"))

@@ -628,6 +628,43 @@ class TileRecognizer(StrategistArtifact):
         self._shade_aliases[tile_hash] = candidates[0]
         return candidates[0]
 
+    def _water_shift_match(self, piece: np.ndarray) -> Optional[Tile]:
+        if piece is None or piece.size == 0 or not self.tiles:
+            return None
+        arr = np.squeeze(np.asarray(piece))
+        if arr.shape != (8, 8):
+            return None
+        for tile in self.tiles:
+            if tile.tag != "water" or tile.image is None:
+                continue
+            warr = np.squeeze(np.asarray(tile.image))
+            if warr.shape != (8, 8) or not any(len(np.unique(warr[r, :])) >= 2 for r in range(8)):
+                continue
+            for shift in range(1, 8):
+                if np.array_equal(np.roll(warr, shift, axis=1), arr):
+                    return tile
+        return None
+
+    def _reconcile_water_shift_tiles(self) -> None:
+        water_tiles: List[Tuple[Tile, np.ndarray]] = []
+        for tile in getattr(self, "tiles", ()):
+            if tile.tag == "water" and tile.image is not None:
+                warr = np.squeeze(np.asarray(tile.image))
+                if warr.shape == (8, 8) and any(len(np.unique(warr[r, :])) >= 2 for r in range(8)):
+                    water_tiles.append((tile, warr))
+        if not water_tiles:
+            return
+        for tile in getattr(self, "tiles", ()):
+            if tile.tag in ("ground", "ground decoration", "obstacle", "unknown") and tile.image is not None:
+                arr = np.squeeze(np.asarray(tile.image))
+                if arr.shape != (8, 8):
+                    continue
+                for wtile, warr in water_tiles:
+                    if any(np.array_equal(np.roll(warr, shift, axis=1), arr) for shift in range(1, 8)):
+                        tile.tag = "water"
+                        tile.description = wtile.description or "water"
+                        break
+
     def _resolve_screen(self, pieces: Dict[TileKey, np.ndarray]) -> Dict[TileKey, Optional[Tile]]:
         found: Dict[TileKey, Optional[Tile]] = {}
         pending: Dict[TileKey, Tuple[str, np.ndarray]] = {}
@@ -643,6 +680,10 @@ class TileRecognizer(StrategistArtifact):
             if tile is not None:
                 found[key] = tile
                 recoloured.add(tile_hash)
+            else:
+                wtile = self._water_shift_match(piece)
+                if wtile is not None:
+                    found[key] = wtile
         if len(recoloured) >= self.SHADE_SCREEN_EVIDENCE:
             for key, (tile_hash, piece) in pending.items():
                 if found[key] is None:
@@ -841,6 +882,7 @@ class TileRecognizer(StrategistArtifact):
             elif new_tag == "item" and (not tile.description or not ITEM_BALL_DESC_PATTERN.search(tile.description)):
                 tile.description = "Poke Ball on the ground"
             tile.tag = new_tag
+        self._reconcile_water_shift_tiles()
 
     @update
     def _add_tiles(self, tiles: List[Tile]) -> None:
@@ -853,3 +895,4 @@ class TileRecognizer(StrategistArtifact):
             tile.tag = new_tag
             self.tiles.append(tile)
             self._by_hash[tile.hash] = tile
+        self._reconcile_water_shift_tiles()

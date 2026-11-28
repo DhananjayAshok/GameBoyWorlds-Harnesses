@@ -2395,6 +2395,18 @@ def describe_target_reachability(
     else:
         goals = list(approach_cells(kinds, target, identified=identified, people=people))
     if not goals:
+        if _is_npc_target_cell(target, identified, people) and (abs(target[0]) + abs(target[1])) >= 2:
+            if target[0] == 0 or target[1] == 0:
+                return (
+                    " [separated by impassable water/obstacle — no adjacent walkable tile from here, "
+                    "and player is already on the aligned tile (0, 0) without triggering a challenge; "
+                    "cannot be triggered or interacted with by turning or pressing A across water — move on]"
+                )
+            return (
+                " [separated by impassable water/obstacle — no adjacent walkable tile from here; "
+                "if stepping onto the aligned walkway tile did not trigger a trainer challenge, "
+                "cannot be triggered or interacted with from this path]"
+            )
         return " [no walkable approach tile adjacent on current screen]"
     path = shortest_path(kinds, (0, 0), goals, people=people)
     if path is not None:

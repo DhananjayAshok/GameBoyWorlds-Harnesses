@@ -494,6 +494,8 @@ class NPCRegistry(StrategistArtifact):
         crowded = {i for i, a in enumerate(detections) for j, b in enumerate(detections)
                    if i != j and _manhattan(a["square"], b["square"]) <= 2}
 
+        rseg_now, _ = gmap.resolve(segment, pos)
+        seg_cells_now = gmap.segments[rseg_now] if 0 <= rseg_now < len(gmap.segments) else {}
         pairs = []
         for i, det in enumerate(detections):
             for track in live.values():
@@ -507,7 +509,24 @@ class NPCRegistry(StrategistArtifact):
                     if not (0 <= track.view < len(views)):
                         track.view = 0
                     view = views[track.view]
-                    pairs.append((moved, S.mask_distance(det["mask"], view.key)[0], i, track.id))
+                    dist = S.mask_distance(det["mask"], view.key)[0]
+                    if moved > 0:
+                        min_v_dist = min(
+                            (S.mask_distance(det["mask"], v.key)[0] for v in views if not v.partial),
+                            default=dist,
+                        )
+                        if min_v_dist > self._p["maybe"]:
+                            continue
+                        _, r_det_sq = gmap.resolve(segment, det["square"])
+                        _, r_trk_sq = gmap.resolve(track.segment, track.square)
+                        det_mc = seg_cells_now.get(r_det_sq)
+                        trk_mc = seg_cells_now.get(r_trk_sq)
+                        if det_mc is not None and trk_mc is not None:
+                            det_water = "water" in (det_mc.tags or ())
+                            trk_water = "water" in (trk_mc.tags or ())
+                            if det_water != trk_water:
+                                continue
+                    pairs.append((moved, dist, i, track.id))
         pairs.sort()
         assigned: Dict[int, int] = {}
         taken: Set[int] = set()
@@ -679,13 +698,27 @@ class NPCRegistry(StrategistArtifact):
 
     def _static_at(self, segment: int, square: Cell, busy: Set[str]) -> Optional[NPC]:
         gmap = self._gmap
+        rseg, rsq = gmap.resolve(segment, square)
+        seg_cells = gmap.segments[rseg] if 0 <= rseg < len(gmap.segments) else {}
+        sq_in_water = seg_cells.get(rsq) is not None and "water" in (seg_cells[rsq].tags or ())
         for npc in self.live_npcs():
-            if npc.id in busy:
+            if npc.id in busy or self.look_of(npc).kind_hint == "object":
                 continue
             seen = self.last_seen(gmap, npc)
-            if seen is None or seen[0] != segment or seen[1] != square:
+            if seen is None or seen[0] != rseg:
                 continue
-            if len({self.place(gmap, s) for s in npc.sightings}) == 1:
+            places = {self.place(gmap, s) for s in npc.sightings}
+            if seen[1] == rsq and (len(places) == 1 or npc.kind == "trainer" or sq_in_water):
+                return npc
+            if (rseg, rsq) in places and (npc.kind == "trainer" or sq_in_water):
+                return npc
+            if (
+                sq_in_water
+                and npc.kind == "trainer"
+                and _manhattan(seen[1], rsq) <= NEAR
+                and seg_cells.get(seen[1]) is not None
+                and "water" in (seg_cells[seen[1]].tags or ())
+            ):
                 return npc
         return None
 
@@ -1145,6 +1178,11 @@ class NPCRegistry(StrategistArtifact):
                 recent_in_ray = any(0 <= step_cap - s.map_step <= 32 for s in other_sights_in_seg)
                 if recent_in_ray and (not other.conversations or not npc.conversations):
                     npc = self._merge_look_and_npc(npc, other, max_same_segment_dist=4)
+        target_views = [
+            s.view for s in npc.sightings
+            if self.place(g, s) == (rseg, rtarget) and (max_step is None or s.map_step == step_cap)
+        ]
+        conv_view = target_views[-1] if target_views else (npc.sightings[-1].view if npc.sightings else 0)
         for s in npc.sightings:
             s_seg, s_sq = self.place(g, s)
             if (
@@ -1153,6 +1191,24 @@ class NPCRegistry(StrategistArtifact):
                 and (max_step is None or 0 <= max_step - s.map_step <= 32)
             ):
                 s.segment, s.square = rseg, rtarget
+            elif s_seg == rseg and s_sq in empty_ray_squares and s.map_step > step_cap and conv_view > 0 and s.view == 0:
+                s.view = conv_view
+        for rsq in sorted(empty_ray_squares):
+            m = self.maybe_squares.get((rseg, rsq))
+            if (
+                m is not None
+                and m.verdict != "nothing"
+                and m.last_step > step_cap
+                and not any(
+                    self.place(g, os) == (rseg, rsq)
+                    for other in self.live_npcs()
+                    for os in other.sightings
+                )
+            ):
+                ep_m = m.seen[0] if m.seen else self._episode
+                npc.sightings.append(Sighting(ep_m, m.last_step, rseg, rsq, conv_view, (0, 0), -1, False))
+                self.stats["sightings"] += 1
+                m.verdict, m.crop = "person", None
         return npc
 
     def _link_or_track_cell(self, cell: Cell, window: np.ndarray, mask: np.ndarray,
@@ -2124,10 +2180,22 @@ class NPCRegistry(StrategistArtifact):
                     npc.conversations.append(conv.id)
                 if conv.id in self.unattributed:
                     self.unattributed.remove(conv.id)
-                seen = self.last_seen(gmap, npc)
-                if seen is not None:
+                seg_sights = [s for s in npc.sightings if self.place(gmap, s)[0] == rseg]
+                if seg_sights:
+                    best_s = min(
+                        seg_sights,
+                        key=lambda s: (
+                            abs(s.map_step - conv.map_step_start),
+                            _manhattan(self.place(gmap, s)[1], rsq),
+                        ),
+                    )
                     conv.segment, conv.square = rseg, rsq
-                    conv.target = seen[1]
+                    conv.target = self.place(gmap, best_s)[1]
+                else:
+                    seen = self.last_seen(gmap, npc)
+                    if seen is not None:
+                        conv.segment, conv.square = rseg, rsq
+                        conv.target = seen[1]
                 if (conv.led_to == "battle" or conv.outcome == "battle") and npc.kind in ("unknown", "person"):
                     npc.kind = "trainer"
                 elif npc.kind == "unknown" and npc_model.is_routine_service_text(conv.text):
@@ -2467,12 +2535,68 @@ class NPCRegistry(StrategistArtifact):
                      else "; only ever seen in part (hidden, for example in tall grass)")
         return when
 
+    def _across_barrier_note(
+        self,
+        gmap: GlobalMap,
+        segment: int,
+        square: Cell,
+        talks: List[Conversation],
+    ) -> str:
+        seg_cells = gmap.segments[segment] if 0 <= segment < len(gmap.segments) else {}
+        if not seg_cells:
+            return ""
+        _, rpos = gmap.resolve(gmap.segment, gmap.pos)
+        if _manhattan(square, rpos) < 2:
+            return ""
+        mcell = seg_cells.get(square)
+        sq_in_water = mcell is not None and "water" in (mcell.tags or ())
+        cardinal_nbs = [seg_cells.get((square[0] + dx, square[1] + dy)) for dx, dy in DIRECTIONS.values()]
+        if any(nb is not None and getattr(nb, "kind", None) == WALKABLE for nb in cardinal_nbs):
+            return ""
+        if not sq_in_water and not all(nb is not None and getattr(nb, "kind", None) == "blocked" for nb in cardinal_nbs):
+            return ""
+        for dx, dy in DIRECTIONS.values():
+            mid_c = seg_cells.get((square[0] + dx, square[1] + dy))
+            far_c = seg_cells.get((square[0] + 2 * dx, square[1] + 2 * dy))
+            if (
+                mid_c is not None
+                and getattr(mid_c, "kind", None) == "blocked"
+                and "water" not in (mid_c.tags or ())
+                and "interactable object" in (mid_c.tags or ())
+                and far_c is not None
+                and getattr(far_c, "kind", None) == WALKABLE
+            ):
+                return ""
+        visits = gmap.visits[segment] if 0 <= segment < len(getattr(gmap, "visits", ())) else {}
+        aligned_walked = False
+        for dx, dy in DIRECTIONS.values():
+            for k in (2, 3, 4):
+                cand = (square[0] + k * dx, square[1] + k * dy)
+                cand_c = seg_cells.get(cand)
+                if cand_c is None or getattr(cand_c, "kind", None) != WALKABLE:
+                    continue
+                if all(
+                    seg_cells.get((square[0] + j * dx, square[1] + j * dy)) is not None
+                    and getattr(seg_cells.get((square[0] + j * dx, square[1] + j * dy)), "kind", None) == "blocked"
+                    for j in range(1, k)
+                ):
+                    if visits.get(cand, 0) > 0 or cand == rpos:
+                        aligned_walked = True
+                    break
+        if talks or aligned_walked:
+            return (
+                "; separated by impassable water/obstacle — no adjacent walkable tile, "
+                "and aligned walkway tile already walked without triggering a challenge"
+            )
+        return "; separated by impassable water/obstacle — no adjacent walkable tile"
+
     def people_block(self, gmap: GlobalMap, max_people: int = 8, max_chars: int = 1800, where: str = "here") -> str:
         # where: "here" when the current screen was placed, else a key of npc_map.WHERE_NOTES.
+        rseg = gmap.resolve(gmap.segment, gmap.pos)[0]
         here = [(npc, square) for npc, square in self.people_here(gmap)
                 if self._episode - self.last_seen(gmap, npc)[2].episode <= STALE_EPISODES
                 and self.look_of(npc).kind_hint != "object"]
-        maybe = [] if where == "away" else self.unconfirmed(gmap, gmap.resolve(gmap.segment, gmap.pos)[0])
+        maybe = [] if where == "away" else self.unconfirmed(gmap, rseg)
         signs = [] if where == "away" else self.signs_here(gmap)
         if not here and not maybe and not signs:
             return ""
@@ -2482,7 +2606,7 @@ class NPCRegistry(StrategistArtifact):
         for npc, square in here[:max_people]:
             dx, dy = square[0] - px, square[1] - py
             when = self.when_seen(gmap, npc, square)
-            talks = self._talks_in(gmap, npc, gmap.resolve(gmap.segment, gmap.pos)[0])
+            talks = self._talks_in(gmap, npc, rseg)
             if talks:
                 last = talks[-1]
                 heard = last.summary or last.text[:160].strip().replace("\n", " ")
@@ -2490,6 +2614,7 @@ class NPCRegistry(StrategistArtifact):
                 status = f"talked to here (episode {last.episode}){said}"
             else:
                 status = "not talked to yet"
+            status += self._across_barrier_note(gmap, rseg, square, talks)
             seen_info = self.last_seen(gmap, npc)
             facing = self.sighting_facing(self.look_of(npc), seen_info[2]) if seen_info is not None else None
             facing_note = f", facing {facing}" if facing else ""
@@ -2595,13 +2720,15 @@ class NPCRegistry(StrategistArtifact):
             if cell in remembered:
                 status = ("remembered here, not recognised on this frame: may have moved; " if self.seen_whole(npc)
                           else "seen only in part (hidden, for example in tall grass); ") + status
+            _, rpos_now = gmap.resolve(gmap.segment, gmap.pos)
+            status += self._across_barrier_note(gmap, segment, (rpos_now[0] + cell[0], rpos_now[1] + cell[1]), talks)
             seen_info = self.last_seen(gmap, npc)
             facing = self.sighting_facing(self.look_of(npc), seen_info[2]) if seen_info is not None else None
             facing_note = f", facing {facing}" if facing else ""
             kind = npc.kind if npc.kind != "unknown" else "person"
             name = (f'who gave the name "{npc.real_name}"' if npc.real_name
                     else f'labelled "{npc.name}" (the label is {LABEL_NOTE})')
-            out[cell] = f'{kind} {name}{facing_note} ({status})'[:320]
+            out[cell] = f'{kind} {name}{facing_note} ({status})'[:480]
         _, rpos = gmap.resolve(gmap.segment, gmap.pos)
         for sign, square in self.signs_here(gmap):
             cell = (square[0] - rpos[0], square[1] - rpos[1])
