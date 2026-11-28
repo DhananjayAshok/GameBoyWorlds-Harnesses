@@ -676,6 +676,31 @@ class InteractionExecutor(PolicyExecutor):
             allowed_facings=allowed_facings,
             preferred_stand_cell=preferred_stand_cell,
         )
+        if not goals and (allowed_facings or preferred_stand_cell is not None):
+            empirical_blocked = set(getattr(self._env, "blocked_cells", None) or ())
+            candidate_Kinds = dict(kinds)
+            probed_goals: Dict[Tuple[int, int], str] = {}
+            for d_name, (dx, dy) in DIRECTIONS.items():
+                cand = (target_cell[0] - dx, target_cell[1] - dy)
+                if not in_bounds(cand) or cand in empirical_blocked:
+                    continue
+                if preferred_stand_cell is not None and cand != preferred_stand_cell:
+                    continue
+                if allowed_facings and d_name not in allowed_facings:
+                    continue
+                if people and cand in people and not str(people[cand] or "").startswith("sign:"):
+                    continue
+                if self.identified is not None and any(
+                    (t := self.identified.get((cand[0], cand[1], q))) is not None
+                    and getattr(t, "tag", None) in ("npc", "water", "ledge", "right_ledge", "left_ledge")
+                    for q in ("top_left", "top_right", "bottom_left", "bottom_right")
+                ):
+                    continue
+                candidate_Kinds[cand] = WALKABLE
+                probed_goals[cand] = d_name
+            if probed_goals:
+                kinds = candidate_Kinds
+                goals = probed_goals
         if not goals:
             return None
         base_avoid = {c for c in parse_avoided_cells(self._task) if in_bounds(c)} | warp_cells(
@@ -777,13 +802,23 @@ class InteractionExecutor(PolicyExecutor):
         shifted_target: Optional[Tuple[int, int]],
         kinds: Optional[Dict[Tuple[int, int], str]],
         people: Optional[Dict[Tuple[int, int], str]],
+        allowed_facings: Optional[set] = None,
     ) -> Optional[str]:
         if shifted_target is None or shifted_target == (0, 0):
             return None
         if shifted_target in self.CARDINAL_DIRECTIONS:
-            return self.CARDINAL_DIRECTIONS[shifted_target]
+            cand_dir = self.CARDINAL_DIRECTIONS[shifted_target]
+            if not allowed_facings or cand_dir in allowed_facings:
+                return cand_dir
+            return None
         if kinds is not None:
-            goals = approach_cells(kinds, shifted_target, identified=self.identified, people=people)
+            goals = approach_cells(
+                kinds,
+                shifted_target,
+                identified=self.identified,
+                people=people,
+                allowed_facings=allowed_facings,
+            )
             if (0, 0) in goals:
                 return goals[(0, 0)]
         return None
@@ -860,7 +895,9 @@ class InteractionExecutor(PolicyExecutor):
                     target_cell = (target_cell[0] - dx, target_cell[1] - dy)
                 info, kinds, people = self._refresh_live_perception()
                 if direction is None:
-                    direction = self._resolve_post_walk_direction(target_cell, kinds, people)
+                    direction = self._resolve_post_walk_direction(
+                        target_cell, kinds, people, allowed_facings=allowed_facings
+                    )
 
         if direction is None:
             if records:
@@ -924,7 +961,9 @@ class InteractionExecutor(PolicyExecutor):
                             target_cell = (cell[0] - dx, cell[1] - dy)
                         info, kinds, people = self._refresh_live_perception()
                         if direction is None:
-                            direction = self._resolve_post_walk_direction(target_cell, kinds, people)
+                            direction = self._resolve_post_walk_direction(
+                                target_cell, kinds, people, allowed_facings=allowed_facings
+                            )
                 if direction is None:
                     return self._fail("target_only_diagonal",
                                       f"Target found at {result['found_cells_str']}, which cannot be faced")

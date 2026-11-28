@@ -26,6 +26,11 @@ FURNITURE_OVERHANG_TOP_TAGS = {"interactable object", "obstacle"}
 OVERHANG_TOP_TAGS = {"interactable object", "obstacle", "npc", "item", "sign"}
 QUARTERS = ("top_left", "top_right", "bottom_left", "bottom_right")
 FURNITURE_OVERHANG_DESC_PATTERN = re.compile(r"\b(?:table|desk|counter|shelf|bookshelf|machine|computer|pc|tv|television|sink|stove|bed)\b", re.IGNORECASE)
+SEATING_QUARTER_DESC_PATTERN = re.compile(
+    r"\b(?:stool|stools|chair|chairs|cushion|cushions|seat|seats)\b"
+    r"(?!.*\b(?:table\s+with|desk\s+with|counter\s+with)\b)",
+    re.IGNORECASE,
+)
 RIDGE_DESCRIPTION_PATTERN = re.compile(
     r"\b(?:ledge|cliff|ridge)\b|rocky\s+fence|horizontal\s+fence",
     re.IGNORECASE,
@@ -623,6 +628,32 @@ def infer_spatial_patterned_floor_cells(
     return inferred
 
 
+def is_walkable_seating_cell(
+    cell: Cell,
+    quarter_tags: Dict[Cell, Dict[str, str]],
+    quarter_descriptions: Optional[Dict[Cell, Dict[str, Optional[str]]]] = None,
+) -> bool:
+    if quarter_descriptions is None:
+        return False
+    cell_q = quarter_tags.get(cell, {})
+    if len(cell_q) < 4:
+        return False
+    tag_set = set(cell_q.values())
+    if "obstacle" not in tag_set or not (tag_set <= {"ground", "ground decoration", "obstacle"}):
+        return False
+    cell_d = quarter_descriptions.get(cell, {})
+    has_seating = False
+    for q in QUARTERS:
+        t = cell_q.get(q)
+        desc = (cell_d.get(q) or "").strip()
+        if t in ("ground", "ground decoration"):
+            continue
+        if not desc or not SEATING_QUARTER_DESC_PATTERN.search(desc):
+            return False
+        has_seating = True
+    return has_seating
+
+
 def is_overhang_floor_cell(
     cell: Cell,
     quarter_tags: Dict[Cell, Dict[str, str]],
@@ -634,6 +665,7 @@ def is_overhang_floor_cell(
         is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images)
         or is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
         or is_npc_head_overhang_floor_cell(cell, quarter_tags, quarter_images=quarter_images, global_map=global_map)
+        or is_walkable_seating_cell(cell, quarter_tags, quarter_descriptions)
     )
 
 
@@ -653,6 +685,8 @@ def is_walkable_pattern_learnable(
         d_map = {(0, 0): quarter_descriptions or {}} if quarter_descriptions is not None else None
         i_map = {(0, 0): quarter_images or {}} if quarter_images is not None else None
         if is_top_overhang_floor_cell((0, 0), q_map, d_map, i_map):
+            return True
+        if is_walkable_seating_cell((0, 0), q_map, d_map):
             return True
         if is_patterned_floor_cell((0, 0), q_map, d_map, i_map, min_ground_quarters=1):
             return True
@@ -700,6 +734,9 @@ def classify_cell_from_quarters(
         return BLOCKED, raw_tags
     if is_top_overhang_floor_cell(cell, quarter_tags, quarter_descriptions, quarter_images):
         tags = tuple(sorted({cell_q[q] for q in ("bottom_left", "bottom_right") if q in cell_q})) or ("ground",)
+        return WALKABLE, tags
+    if is_walkable_seating_cell(cell, quarter_tags, quarter_descriptions):
+        tags = tuple(sorted({t for t in cell_q.values() if t in WALKABLE_TAGS})) or ("ground",)
         return WALKABLE, tags
     if (
         allow_player_overhang and is_player_overhang_floor_cell(cell, quarter_tags, quarter_descriptions)
@@ -1314,13 +1351,14 @@ def approach_cells(
                 continue
             facing = next(d for d, (ox, oy) in DIRECTIONS.items() if (ox, oy) == (-dx, -dy))
             cells[far] = facing
-    if preferred_stand_cell is not None and preferred_stand_cell in cells:
-        return {preferred_stand_cell: cells[preferred_stand_cell]}
+    if preferred_stand_cell is not None:
+        if preferred_stand_cell in cells:
+            return {preferred_stand_cell: cells[preferred_stand_cell]}
+        if not allowed_facings:
+            return {}
     if allowed_facings:
         allowed_set = set(allowed_facings)
-        filtered = {c: f for c, f in cells.items() if f in allowed_set}
-        if filtered:
-            return filtered
+        return {c: f for c, f in cells.items() if f in allowed_set}
     return cells
 
 
